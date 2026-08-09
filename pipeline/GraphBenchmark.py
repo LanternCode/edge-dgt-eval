@@ -1,0 +1,717 @@
+# SPDX-License-Identifier: CC-BY-SA-4.0
+
+import heapq
+import inspect
+import torch
+import random
+import networkx as nx
+import numpy as np
+from ._utils.features import DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES, pairwise_batch_from_adj
+from collections import deque
+from time import perf_counter
+from collections.abc import Sized
+from typing import List, Tuple, Union, Dict, Optional, cast
+from torch.utils.data import DataLoader, Dataset, Subset
+
+
+class GraphBenchmark:
+    """
+    GraphBenchmark: generates random graphs, builds task-ready datasets,
+    provides optional feature extraction and flexible splitting with *optional*
+    packaging into PyTorch DataLoaders.
+
+    Public methods we rely on:
+    - generate_graph(graph_type, num_nodes, directed=False)
+    - extract_features(adj, feature_set)
+    - sample_specs(num_graphs, min_nodes, max_nodes, graph_types=None)
+    - generate_dataset(specs, hooks, prepackage=True, directed=False, seed=None)
+    - make_loaders(dataset, batch_size, ratios=(0.7, 0.2, 0.1), collate_fn=None, seed=None, pin_memory=None)
+
+    When using existing split definitions, ProvidedSplitsTask reads bench.splits and will either:
+    (a) use split masks for a single graph,
+    (b) preserve pre-divided train/val/test sample collections, or
+    (c) combine samples and resplit them via GraphBenchmark.make_loaders(ratios=...)
+
+    New minimal helpers (small, single responsibility):
+      - sample_specs(num_graphs, min_nodes, max_nodes, graph_types)
+      - generate_dataset(specs, hooks, prepackage=True)  # task-agnostic
+      - make_loaders(dataset, batch_size, ratios=(...), collate_fn=None)
+    """
+    def __init__(
+        self,
+        num_graphs: int = 200,
+        min_nodes: int = 6,
+        max_nodes: int = 140,
+        show_progress: bool = False,
+        graph_types: Optional[List[str]] = None,
+        shape_cycle_shapes: Optional[List[str]] = None,
+        shape_cycle_removal_prob: float = 0.30
+    ):
+        self.num_graphs = int(num_graphs)
+        self.min_nodes = int(min_nodes)
+        self.max_nodes = int(max_nodes)
+        self.show_progress = show_progress
+        self.graph_types = graph_types or [
+            'erdos_renyi', 'barabasi_albert', 'watts_strogatz',
+            'random_regular', 'stochastic_block', 'powerlaw_cluster',
+            'random_geometric', 'balanced_tree', 'tree_plus_chords',
+            'shape_cycle',
+        ]
+        
+        # Shape completion settings (used when graph_type == 'shape_cycle')
+        self.shape_cycle_shapes = shape_cycle_shapes or ["triangle", "square", "pentagon", "hexagon"]
+        self.shape_cycle_removal_prob = float(shape_cycle_removal_prob)
+
+        # Warning state tracking
+        self._warned_shapes = set()
+        self._warned_shape_cycle_reroll = False
+        self._warned_generation_errors = set()
+
+    # ------------------------------------------------------------------ #
+    # 1) Graph generators (undirected by default; some families support native directed generation, with optional post-generation orientation via hooks)
+    # ------------------------------------------------------------------ #
+    def generate_graph(self, graph_type: str, num_nodes: int, directed: bool = False, rng=random) -> nx.Graph:
+        """
+        Generates a base topology for a given graph family, dynamically scaling parameters
+        to target an average degree of ~3.5 to ensure a consistent baseline across node counts.
+
+        1. erdos_renyi:
+        - Base: Probability dynamically scaled as p = 3.5 / N.
+        - Directed: Natively supported via NetworkX.
+
+        2. barabasi_albert:
+        - Base: Preferential attachment with m=2 to preserve long tails/hubs.
+        - Directed: Uses Bollobás et al. scale-free model (nx.scale_free_graph)
+        to preserve massive directed hubs (random orientation would flatten the distribution).
+
+        3. watts_strogatz:
+        - Base: Small-world graph with low average degree.
+          For the undirected case, if the sampled `k` is odd, NetworkX uses `k - 1` neighbours.
+        - Directed: Directed analogue of the same construction with mostly local edges and some rewired long-range shortcuts.
+
+        4. random_regular:
+        - Base: Strict 4-regular graph for num_nodes > 4; falls back to a cycle graph for very small graphs.
+        - Directed: Eulerian circuit orientation. Traces a continuous path through an
+        undirected 4-regular base to guarantee exact in-degree=2 and out-degree=2.
+
+        5. stochastic_block:
+        - Base: 2-block partition (50/50 split) with p_in > p_out.
+        - Directed: Natively supported via NetworkX.
+
+        6. powerlaw_cluster:
+        - Base: Holme-Kim model (m=2) combining scale-free hubs with high clustering.
+        - Directed: Custom Directed Triad Formation. Standard directed preferential
+        attachment combined with probabilistic backward links to close directed triangles.
+
+        7. random_geometric:
+        - Base: Spatial transmission radius scaled by area: r = sqrt(3.5 / (N * pi)).
+        - Directed: Spatial K-Nearest Neighbours (K=3). Nodes project directed edges
+        to their closest geographic neighbours (fixed out-degree, variable in-degree).
+
+        8. balanced_tree:
+        - Base: Full tree with random branching factor r in [2, 4].
+        - Directed: Natively supported. Edges strictly point outward from the root.
+
+        9. tree_plus_chords:
+        - Base: Random labelled tree + up to 0.75 * N random chords (subject to valid-pair availability and the retry cap).
+        - Directed: Base tree is directed via BFS outward from root 0; chords are
+        injected as non-reciprocal directed pairs (u -> v), strictly 
+        preventing bidirectional edges if v -> u already exists.
+
+        10. shape_cycle:
+        - Base: Generates multiple incomplete ring topologies (shapes) occupying ~50% of the nodes.
+        The remaining ~50% of nodes form a cycle-free background forest attached to the shapes.
+        - Directed: Natively supported. Shape edges strictly point forward u -> (u+1) % L.
+        Background forest edges are randomly oriented.
+
+        Args:
+            graph_type (str): The family of the graph to generate.
+            num_nodes (int): Target number of nodes (N).
+            directed (bool): Whether to construct a mathematically sound directed topology.
+            rng (random.Random): The random number generator instance to use for isolated topology generation.
+            Defaults to the global `random` module.
+
+        Returns:
+            nx.Graph or nx.DiGraph: The generated base topology.
+        """
+        if graph_type == 'erdos_renyi':
+            p = min(1.0, 3.5 / num_nodes)
+            return nx.erdos_renyi_graph(num_nodes, p, directed=directed, seed=rng)
+
+        elif graph_type == 'barabasi_albert':
+            if directed:
+                G = nx.DiGraph(nx.scale_free_graph(num_nodes, seed=rng))
+                G.remove_edges_from(list(nx.selfloop_edges(G)))
+                return G
+            m = max(1, min(2, num_nodes - 1))
+            return nx.barabasi_albert_graph(num_nodes, m, seed=rng)
+
+        elif graph_type == 'watts_strogatz':
+            if directed:
+                G = nx.DiGraph()
+                G.add_nodes_from(range(num_nodes))
+                k, p = max(1, min(2, num_nodes - 1)), rng.uniform(0.1, 0.5)
+                for u in range(num_nodes):
+                    for offset in range(1, k + 1):
+                        v = (u + offset) % num_nodes
+                        if rng.random() < p:
+                            choices = [n for n in range(num_nodes) if n != u and not G.has_edge(u, n)]
+                            if choices: v = rng.choice(choices)
+                        G.add_edge(u, v)
+                return G
+            k = rng.randint(2, min(num_nodes - 1, 6))
+            p = rng.uniform(0.1, 0.5)
+            return nx.watts_strogatz_graph(num_nodes, k, p, seed=rng)
+
+        elif graph_type == 'random_regular':
+            if num_nodes <= 4:
+                G_base = nx.cycle_graph(num_nodes)
+                return nx.DiGraph(G_base) if directed else G_base
+            
+            if directed:
+                G_und = nx.random_regular_graph(4, num_nodes, seed=rng)
+                G_dir = nx.DiGraph()
+                for c in nx.connected_components(G_und):
+                    sub = G_und.subgraph(c)
+                    G_dir.add_edges_from(nx.eulerian_circuit(sub))
+                return G_dir
+            return nx.random_regular_graph(4, num_nodes, seed=rng)
+
+        elif graph_type == 'stochastic_block':
+            sizes = [num_nodes // 2, num_nodes - num_nodes // 2]
+            p_in, p_out = rng.uniform(0.1, 0.5), rng.uniform(0.01, 0.1)
+            probs = [[p_in, p_out], [p_out, p_in]]
+            return nx.stochastic_block_model(sizes, probs, directed=directed, seed=rng)
+
+        elif graph_type == 'powerlaw_cluster':
+            if directed:
+                G = nx.DiGraph(nx.scale_free_graph(num_nodes, seed=rng))
+                G.remove_edges_from(list(nx.selfloop_edges(G)))
+                p_triad, new_edges = rng.uniform(0.1, 0.5), []
+                for u, v in list(G.edges()):
+                    if rng.random() < p_triad:
+                        in_neighbors = [w for w in G.predecessors(v) if w != u and not G.has_edge(u, w)]
+                        if in_neighbors:
+                            new_edges.append((u, rng.choice(in_neighbors)))
+                G.add_edges_from(new_edges)
+                return G
+            m, p = max(1, min(2, num_nodes - 1)), rng.uniform(0.1, 0.5)
+            return nx.powerlaw_cluster_graph(num_nodes, m, p, seed=rng)
+
+        elif graph_type == 'random_geometric':
+            if directed:
+                G = nx.DiGraph()
+                G.add_nodes_from(range(num_nodes))
+                pos = {i: (rng.random(), rng.random()) for i in range(num_nodes)}
+                nx.set_node_attributes(G, pos, 'pos')
+                for i in range(num_nodes):
+                    dists = [(j, (pos[i][0] - pos[j][0]) ** 2 + (pos[i][1] - pos[j][1]) ** 2) for j in range(num_nodes) if i != j]
+                    for j, _ in heapq.nsmallest(3, dists, key=lambda x: x[1]): 
+                        G.add_edge(i, j)
+                return G
+            radius = np.sqrt(3.5 / (num_nodes * np.pi))
+            return nx.random_geometric_graph(num_nodes, radius, seed=rng)
+
+        elif graph_type == 'balanced_tree':
+            r = rng.randint(2, 4)
+            h = 0
+            while (r**(h+1) - 1) // (r - 1) < num_nodes:
+                h += 1
+            G = nx.balanced_tree(r, h, create_using=nx.DiGraph if directed else nx.Graph)
+            return G.subgraph(list(G.nodes)[:num_nodes]).copy()
+
+        elif graph_type == 'tree_plus_chords':
+            T = nx.random_labeled_tree(num_nodes, seed=rng)
+            G = nx.DiGraph() if directed else nx.Graph()
+            G.add_nodes_from(range(num_nodes))
+            if directed:
+                G.add_edges_from(nx.bfs_edges(T, 0))
+            else:
+                G.add_edges_from(T.edges())
+
+            k, added, attempts = int(round(0.75 * num_nodes)), 0, 0
+            while added < k and attempts < k * 10:
+                u, v = rng.randint(0, num_nodes - 1), rng.randint(0, num_nodes - 1)
+                if u != v and not G.has_edge(u, v) and (not directed or not G.has_edge(v, u)):
+                    G.add_edge(u, v)
+                    added += 1
+                attempts += 1
+            return G
+
+        elif graph_type == 'shape_cycle':
+            shape_to_len = {'triangle': 3, 'square': 4, 'pentagon': 5, 'hexagon': 6}
+
+            # 1. Validation & Selection
+            valid_shapes = []
+            for s in self.shape_cycle_shapes:
+                if shape_to_len.get(s, 999) <= num_nodes:
+                    valid_shapes.append(s)
+                else:
+                    if s not in self._warned_shapes:
+                        if s in shape_to_len:
+                            print(f"[WARN] '{s}' requires {shape_to_len[s]} nodes but N={num_nodes}; skipping this shape.")
+                        else:
+                            print(f"[WARN] '{s}' is an undefined shape; skipping.")
+                        self._warned_shapes.add(s)
+
+            if not valid_shapes:
+                # Edge case: The requested num_nodes is too small for any of the configured shapes.
+                fallback_types = [t for t in getattr(self, 'graph_types', []) if t != 'shape_cycle']
+                
+                if fallback_types:
+                    if not self._warned_shape_cycle_reroll:
+                        print(f"[WARN] num_nodes={num_nodes} is too small for any valid shapes. Re-rolling to a different graph family.")
+                        self._warned_shape_cycle_reroll = True
+                    
+                    new_type = rng.choice(fallback_types)
+                    return self.generate_graph(new_type, num_nodes, directed=directed, rng=rng)
+                else:
+                    # No other graph families available to fall back on. Exit the pipeline.
+                    raise ValueError(
+                        f"[DATASET GENERATOR] Cannot generate 'shape_cycle' with N={num_nodes}. "
+                        f"The smallest configured shape requires more nodes, and no alternative "
+                        f"graph families are available in `graph_types` to fall back on. "
+                        f"The pipeline will now exit."
+                    )
+            else:
+                shape = rng.choice(valid_shapes)
+                L = shape_to_len[shape]
+
+            # 2. Allocation (~50% shape nodes, ~50% background nodes)
+            num_shapes = max(1, (num_nodes // 2) // L)
+            nodes = list(range(num_nodes))
+            rng.shuffle(nodes)
+
+            shape_nodes_list = nodes[:num_shapes * L]
+            bg_nodes = nodes[num_shapes * L:]
+
+            A_full = np.zeros((num_nodes, num_nodes), dtype=np.uint8)
+            A_obs = np.zeros((num_nodes, num_nodes), dtype=np.uint8)
+
+            def add_edge(mat, u, v):
+                mat[u, v] = 1
+                if not directed:
+                    mat[v, u] = 1
+
+            # 3. Build Core Shapes (Guaranteed at least one dropped edge per shape)
+            for i in range(num_shapes):
+                cyc = shape_nodes_list[i * L : (i + 1) * L]
+                
+                # Write perfect shape to A_full
+                for j in range(L):
+                    add_edge(A_full, cyc[j], cyc[(j + 1) % L])
+
+                # Determine drops for A_obs
+                edges = [(cyc[j], cyc[(j + 1) % L]) for j in range(L)]
+                drop_idx = rng.randrange(L)
+                
+                kept_edges = []
+                for j, (u, v) in enumerate(edges):
+                    if j == drop_idx:
+                        continue  # Dropped
+                    if rng.random() >= self.shape_cycle_removal_prob:
+                        kept_edges.append((u, v))
+
+                # Ensure at least one edge survives so the shape is not wiped
+                if not kept_edges:
+                    safe_idx = (drop_idx + 1) % L
+                    kept_edges.append(edges[safe_idx])
+
+                for u, v in kept_edges:
+                    add_edge(A_obs, u, v)
+
+            # 4. Build Background Forest (Cycle-free attachment)
+            active_pool = shape_nodes_list.copy()
+            for u in bg_nodes:
+                if rng.random() < 0.04:
+                    continue  # Small chance to remain completely isolated
+
+                v = rng.choice(active_pool)
+                # Randomly assign direction of the single connecting edge
+                if directed and rng.random() < 0.5:
+                    A_obs[u, v] = 1
+                else:
+                    A_obs[v, u] = 1
+                    if not directed:
+                        A_obs[u, v] = 1
+
+                active_pool.append(u)  # Now available for other bg nodes to attach to
+
+            # 5. Compile Metadata
+            G = nx.DiGraph() if directed else nx.Graph()
+            G.add_nodes_from(range(num_nodes))
+            I, J = np.where((A_obs if directed else np.triu(A_obs, 1)) > 0)
+            G.add_edges_from(zip(I.tolist(), J.tolist()))
+
+            G.graph['complete_adj'] = A_full.astype(np.float32)
+            G.graph['shape_nodes'] = sorted(shape_nodes_list)
+            G.graph['shape_type'] = shape
+            G.graph['skip_organic_mutation'] = True
+
+            return G
+
+        else:
+            raise ValueError(f"Unknown graph type: {graph_type}")
+
+    # ------------------------------------------------------------------ #
+    # 2) Sampling, dataset building, optional packaging (no redundancy)
+    # ------------------------------------------------------------------ #
+    def sample_specs(
+        self,
+        num_graphs: int,
+        min_nodes: int,
+        max_nodes: int,
+        graph_types: Optional[List[str]] = None,
+    ) -> List[Tuple[str, int]]:
+        gtypes = graph_types or self.graph_types
+        sizes = np.random.randint(min_nodes, max_nodes + 1, size=num_graphs)
+        return [(random.choice(gtypes), int(N)) for N in sizes]
+
+    def generate_dataset(
+        self,
+        specs: List[Tuple[str, int]],     # e.g. produced by bench.sample_specs(...)
+        hooks,
+        prepackage: bool = True,
+        directed: bool = False,
+        seed: Optional[int] = None
+    ) -> Dataset:
+        graphs, labels, feats = [], [], []
+        fast_label_fn = self._compile_label_fn(getattr(hooks, "label_fn", None))
+        local_rng = random.Random(seed) if seed is not None else random
+
+        # Deque
+        total = len(specs)
+        recent = deque(maxlen=5) if self.show_progress else None
+        t0 = perf_counter() if self.show_progress else None
+        if self.show_progress:
+            print(
+                f"[generate_dataset] 0/{total} | avg/graph=0.0000s | elapsed=0.00s | recent={list(recent)}",
+                end="\r",
+                flush=True
+            )
+
+        for i, (original_gtype, N) in enumerate(specs, start=1):
+            t_graph = perf_counter() if self.show_progress else None
+
+            # 1) Generate a graph belonging to one of the allowed graph families
+            is_dir = bool(directed)
+            G = None
+            gtype = original_gtype
+
+            # Safeguard to prevent infinite loops
+            attempts = 0
+            max_retries = 20  
+            while attempts < max_retries:
+                try:
+                    G = self.generate_graph(gtype, int(N), directed=is_dir, rng=local_rng)
+                    break
+                except Exception as e:
+                    # Log the exact error only once per graph family
+                    if gtype not in self._warned_generation_errors:
+                        print(f"[WARN] Failed to generate '{gtype}' (N={N}): {e}. Re-rolling graph family.")
+                        self._warned_generation_errors.add(gtype)
+                    
+                    attempts += 1
+                    gtype = local_rng.choice(self.graph_types)
+            
+            if G is None:
+                raise RuntimeError(
+                    f"[DATASET GENERATOR] Aborting: Failed to generate a graph with N={N} "
+                    f"after {max_retries} attempts. Please ensure your `min_nodes` is compatible "
+                    f"with your chosen `graph_types`."
+                )
+
+            # 2) Organic mutation - Randomly drop 10-15% of edges/arrows to break algorithmic perfection
+            # Graph families that implement internal mutation bypass this via `skip_organic_mutation`
+            if not G.graph.get('skip_organic_mutation', False):
+                edges = list(G.edges())
+                drop_count = int(len(edges) * local_rng.uniform(0.10, 0.15))
+                if drop_count > 0:
+                    G.remove_edges_from(local_rng.sample(edges, drop_count))
+
+            # 3) Bottleneck-free connectivity (Proportional Multi-Stitching)
+            ensure_connected = getattr(hooks, "ensure_connected", False)
+            if ensure_connected:
+                Gu = nx.Graph(G)
+                if not nx.is_connected(Gu):
+                    # Sort components by size descending to always attach to the largest body
+                    comps = sorted(list(nx.connected_components(Gu)), key=len, reverse=True)
+                    main_body = list(comps[0])
+
+                    for island in comps[1:]:
+                        island_nodes = list(island)
+                        # Scale bridge edges: 1 connection per 5 nodes in the island (capped at 3)
+                        k_bridges = max(1, min(3, len(island_nodes) // 5 + 1))
+
+                        for _ in range(k_bridges):
+                            u = local_rng.choice(main_body)
+                            v = local_rng.choice(island_nodes)
+                            # Randomise direction if the graph is directed to avoid 1-way choke points
+                            if is_dir and local_rng.random() < 0.5:
+                                G.add_edge(v, u)
+                            else:
+                                G.add_edge(u, v)
+
+                        # Merge the island into the main body for the next iterations
+                        main_body.extend(island_nodes)
+
+            # Lock in Ground Truth (Output of Phase 3)
+            G.remove_edges_from(list(nx.selfloop_edges(G)))
+            if 'complete_adj' in G.graph:
+                A_true = G.graph['complete_adj'].copy()
+                G_true = nx.DiGraph() if is_dir else nx.Graph()
+                G_true.add_nodes_from(G.nodes(data=True))
+                G_true.graph.update(G.graph)
+                I, J = np.where(A_true > 0)
+                G_true.add_edges_from(zip(I.tolist(), J.tolist()))
+                A_true = self._sanitise_adj(A_true, nx.is_directed(G_true))
+                A_obs = self._sanitise_adj(
+                    nx.to_numpy_array(G, dtype=np.float32), nx.is_directed(G)
+                )
+            else:
+                G_true = G.copy()
+                A_true = self._sanitise_adj(
+                    nx.to_numpy_array(G_true, dtype=np.float32), nx.is_directed(G_true)
+                )
+                A_obs = A_true.copy()
+
+            orientation_mode = getattr(hooks, "orientation", None)
+            if orientation_mode == "dag" and not is_dir:
+                raise ValueError(
+                    f"[DATASET GENERATOR] DAG means Directed Acyclic Graph. hooks.orientation={orientation_mode!r} requires directed=True."
+                )
+
+            if orientation_mode:
+                A_obs = self._orient_to_directed(A_obs, mode=orientation_mode)
+
+            if getattr(hooks, "feature_set", False):
+                F_extra = self.extract_features(A_obs, feature_set=hooks.feature_set, directed=is_dir)
+            else:
+                F_extra = {}
+
+            F = {k: (v.astype(np.float32) if v is not None else None) for k, v in F_extra.items()}
+            L = fast_label_fn(A_obs, A_true, G_true).astype(np.float32, copy=False)
+
+            graphs.append(A_obs.astype(np.float32, copy=False))
+            labels.append(L)
+            feats.append(F)
+
+            if self.show_progress:
+                dt_graph = perf_counter() - t_graph
+                recent.append((gtype, int(N), round(dt_graph, 4)))
+                elapsed = perf_counter() - t0
+                avg = elapsed / i
+                print(
+                    f"[Dataset generation] {i}/{total} | avg/graph={avg:.4f}s | elapsed={elapsed:.2f}s | recent={list(recent)}",
+                    end="\n" if i == total else "\r",
+                    flush=True,
+                )
+
+        class _GBBuilt(Dataset):
+            def __init__(self, Gs, Ls, Fs, prepack: bool):
+                if prepack:
+                    self.Gs = [np.array(g, copy=True) for g in Gs]
+                    self.Ls = [np.array(l, copy=True) for l in Ls]
+                    self.Fs = [{k: (np.array(v, copy=True) if v is not None else None) for k, v in f.items()} for f in Fs]
+                else:
+                    self.Gs, self.Ls, self.Fs = Gs, Ls, Fs
+
+            def __len__(self):
+                return len(self.Gs)
+
+            def __getitem__(self, i):
+                return self.Gs[i], self.Ls[i], self.Fs[i]
+
+        return _GBBuilt(graphs, labels, feats, prepackage)
+
+    def make_loaders(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        ratios: Tuple[float, float, float] = (0.7, 0.2, 0.1),
+        collate_fn = None,
+        seed: Optional[int] = None,
+        pin_memory: Optional[bool] = None,
+        num_workers: int = 0
+    ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+        """
+        Split a dataset into train/val/test loaders using integer cut points.
+
+        Zero-sized splits are allowed. Because the split boundaries are computed with
+        floor-style integer truncation, a positive ratio may still produce an empty split
+        on a small dataset.
+        """
+        n = len(cast(Sized, dataset))
+        idx = np.arange(n)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(idx)
+        a = int(ratios[0] * n)
+        b = int((ratios[0] + ratios[1]) * n)
+        tr, va, te = idx[:a], idx[a:b], idx[b:]
+
+        if len(tr) == 0:
+            if float(ratios[0]) == 0.0:
+                print(
+                    "[PIPELINE SPLIT CONFIG] Train ratio is 0.0, so no training will be performed. "
+                    "The reported validation/test metrics are those of a randomly initialised model.",
+                    flush=True
+                )
+            else:
+                print(
+                    f"[PIPELINE SPLIT CONFIG] Train ratio {ratios[0]} rounded down to an empty split on {n} sample(s)."
+                    f"Split boundaries use integer cut points and the test split takes the remainder, so all truncated samples land in test."
+                    f"Increase num_graphs or adjust ratios if this was not intended."
+                    f"(train={len(tr)}, val={len(va)}, test={len(te)})",
+                    flush=True
+                )
+        elif len(va) == 0 and float(ratios[1]) > 0.0:
+            print(
+                f"[PIPELINE SPLIT CONFIG] Val ratio {ratios[1]} rounded down to an empty split on {n} sample(s)."
+                f"Threshold tuning and checkpoint selection will have no data.",
+                flush=True
+            )
+
+        train_ds = Subset(dataset, tr)
+        val_ds   = Subset(dataset, va)
+        test_ds  = Subset(dataset, te)
+
+        # Fall back to cuda check if not explicitly provided
+        pin = torch.cuda.is_available() if pin_memory is None else pin_memory
+        g = None
+        if seed is not None:
+            g = torch.Generator()
+            g.manual_seed(int(seed))
+
+        train_shuffle = len(train_ds) > 0
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=train_shuffle, collate_fn=collate_fn, pin_memory=pin, generator=g, num_workers=num_workers)
+        val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin, num_workers=num_workers)
+        test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin, num_workers=num_workers)
+        return train_loader, val_loader, test_loader
+
+    # ------------------------------------------------------------------ #
+    # 3) Feature extraction (A_obs → features). Non-2D features are allowed.
+    #    Downstream consumers may use 1D node features and/or 2D edge mats.
+    # ------------------------------------------------------------------ #
+    def extract_features(
+            self,
+            adj: np.ndarray,
+            feature_set: Union[bool, List[str]] = False,
+            directed: bool = False
+    ) -> Dict[str, np.ndarray]:
+        if not feature_set:
+            return {}
+
+        if feature_set is True:
+            feature_list = list(DIRECTED_AUTO_FEATURES if directed else UNDIRECTED_AUTO_FEATURES)
+        else:
+            feature_list = list(feature_set)
+
+        deg = adj.sum(axis=1).astype(np.float32, copy=False) if (
+            'degree' in feature_list or 'clustering_coeff' in feature_list
+        ) else None
+
+        feats: Dict[str, np.ndarray] = {}
+        adj_f = adj.astype(np.float32, copy=False)
+        if 'transpose' in feature_list:
+            feats['transpose'] = adj.T
+
+        # Handle explicit requests, e.g., 'power_2', without pulling in all powers
+        need_a3 = 'triangles' in feature_list or 'clustering_coeff' in feature_list
+        requested_powers = {k for k in (2, 3, 4, 5) if f'power_{k}' in feature_list}
+        power_cache: Dict[int, np.ndarray] = {}
+        if requested_powers or need_a3:
+            power_cache[2] = adj_f @ adj_f
+            if 2 in requested_powers:
+                feats['power_2'] = power_cache[2]
+
+            if 3 in requested_powers or need_a3:
+                power_cache[3] = power_cache[2] @ adj_f
+                if 3 in requested_powers:
+                    feats['power_3'] = power_cache[3]
+
+            if 4 in requested_powers or 5 in requested_powers:
+                power_cache[4] = power_cache[2] @ power_cache[2]
+                if 4 in requested_powers:
+                    feats['power_4'] = power_cache[4]
+
+            if 5 in requested_powers:
+                feats['power_5'] = power_cache[4] @ adj_f
+
+        if 'degree' in feature_list:
+            feats['degree'] = deg  # 1D node-wise
+
+        if 'triangles' in feature_list or 'clustering_coeff' in feature_list:
+            A3 = power_cache[3]
+            tri = np.diag(A3) if directed else np.diag(A3) / 2
+            if 'triangles' in feature_list:
+                feats['triangles'] = tri  # 1D node-wise
+            if 'clustering_coeff' in feature_list:
+                possible = deg * (deg - 1) if directed else deg * (deg - 1) / 2
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    feats['clustering_coeff'] = np.where(possible > 0, tri / possible, 0.0)
+
+        # Pairwise link-prediction features (all 2D)
+        want_pairwise = any(
+            k in feature_list for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col', 'twohop')
+        )
+        if want_pairwise:
+            pairwise_keys = [k for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col', 'twohop') if k in feature_list]
+            if pairwise_keys:
+                A_t = torch.as_tensor(adj, dtype=torch.float32)
+                batch = pairwise_batch_from_adj(A_t, pairwise_keys, is_directed=directed)
+                for k, v in batch.items():
+                    feats[k] = v.cpu().numpy().astype(np.float32)
+
+        return feats
+
+    @staticmethod
+    def _orient_to_directed(adj_matrix: np.ndarray, mode: str = "dag") -> np.ndarray:
+        """
+        Orients an adjacency matrix to a directed state.
+        - 'dag': Enforces acyclicity by retaining only the upper triangle (lower ID to higher ID).
+        """
+        if mode == "dag":
+            return np.triu(adj_matrix, 1)
+        else:
+            raise ValueError(f"Unknown orientation mode: {mode}")
+
+    @staticmethod
+    def _compile_label_fn(label_fn):
+        if label_fn is None:
+            return lambda A_obs, *_: np.zeros_like(A_obs, dtype=np.float32)
+
+        sig = inspect.signature(label_fn)
+        params = list(sig.parameters.values())
+        param_names = [p.name for p in params]
+
+        if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+            return label_fn
+
+        mapping = []
+        for p in param_names:
+            p_lower = p.lower()
+            if p_lower in {'a_obs', 'a', 'a_np', 'adj', 'adj_obs'}:
+                mapping.append('A_obs')
+            elif p_lower in {'a_true', 'adj_true'}:
+                mapping.append('A_true')
+            elif p_lower in {'g_true', 'g', '_g', 'graph'}:
+                mapping.append('G_true')
+            else:
+                raise ValueError(f"Unknown parameter '{p}' in label_fn. "
+                                 f"Allowed aliases must map to A_obs, A_true, or G_true.")
+
+        def fast_label_fn(A_obs, A_true, G_true):
+            local_vars = locals()
+            args = [local_vars[m] for m in mapping]
+            return label_fn(*args)
+
+        return fast_label_fn
+    
+    @staticmethod
+    def _sanitise_adj(mat: np.ndarray, is_directed: bool) -> np.ndarray:
+        mat = (mat > 0).astype(np.float32)
+        np.fill_diagonal(mat, 0.0)
+        if not is_directed:
+            mat = np.maximum(mat, mat.T)
+        return mat
+    

@@ -1,0 +1,13 @@
+numpy
+torch
+scikit-learn
+tqdm
+python-louvain
+RDKit
+torch_geometric
+h5py
+pyomo
+coincbc
+transformers
+pandas
+ipython

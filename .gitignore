@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.err
+*.out
+*.gz
+*.edgelist
+*.pt
+.idea/
+.vscode/
+.claude/
+*.jsonl
+*.slm
+*.mat
+*.pth
+data/
+sbatch/
