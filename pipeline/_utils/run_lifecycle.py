@@ -2,6 +2,7 @@
 
 import atexit
 import threading
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -65,6 +66,12 @@ def _finalise_open_run_locked() -> None:
     _ACTIVE_RUN = None
     run.open = False
     _stamp_bundle(run.bundle, run.stages, is_open=False)
+
+    run_meta = run.bundle.setdefault("metadata", {}).setdefault("run", {})
+    run_meta["ended_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    started = run_meta.pop("_started_monotonic", None)
+    if started is not None:
+        run_meta["elapsed_seconds"] = round(time.monotonic() - started, 3)
 
     try:
         run.summary_cb(
@@ -241,5 +248,8 @@ def begin_or_attach_run(
             open=True,
         )
         _stamp_bundle(bundle, _ACTIVE_RUN.stages, is_open=True)
+        run_meta = bundle["metadata"].setdefault("run", {})
+        run_meta["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        run_meta["_started_monotonic"] = time.monotonic()
         return bundle
     

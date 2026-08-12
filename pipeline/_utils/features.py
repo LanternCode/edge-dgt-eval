@@ -73,8 +73,16 @@ def pairwise_batch_from_adj(A_batch: Tensor, keys: Sequence[str], *, is_directed
     if "deg_diff" in keys:
         results["deg_diff"] = (row_deg.view(B, N, 1) - col_deg.view(B, 1, N)).abs()
         
+    if "twohop" in keys:
+        # A^2 yields the exact number of 2-hop paths from i to j
+        results["twohop"] = A01 @ A01
+
     if any(k in keys for k in ("cn", "jaccard")):
-        cn = (A01 @ A01) if is_directed else (A01 @ A01.transpose(-1, -2))
+        # Directed cn and twohop are the same product
+        if is_directed and "twohop" in results:
+            cn = results["twohop"].clone()
+        else:
+            cn = (A01 @ A01) if is_directed else (A01 @ A01.transpose(-1, -2))
         cn.diagonal(dim1=-2, dim2=-1).fill_(0.0)
         
         if "cn" in keys:
@@ -91,12 +99,6 @@ def pairwise_batch_from_adj(A_batch: Tensor, keys: Sequence[str], *, is_directed
         W.diagonal(dim1=-2, dim2=-1).fill_(0.0)
         results["adamic_adar"] = W
 
-    if "twohop" in keys:
-        # A^2 yields the exact number of 2-hop paths from i to j
-        th = A01 @ A01
-        th.diagonal(dim1=-2, dim2=-1).fill_(0.0)
-        results["twohop"] = th
-        
     # Squeeze the batch dimension back out if the user passed a 2D matrix
     if orig_dim == 2:
         return {k: v.squeeze(0) for k, v in results.items()}
@@ -128,43 +130,22 @@ def pairwise_for_pairs(
         row_deg = A01.sum(dim=1)
     if col_deg is None:
         col_deg = A01.sum(dim=0) if is_directed else row_deg
-    Au = Av = cn = None
 
-    needs_twohop = "twohop" in keys
-    needs_cn = any(k in keys for k in ("cn", "jaccard"))
-    needs_aa = "adamic_adar" in keys
-    needs_au = needs_cn or needs_aa or needs_twohop
-    needs_av = needs_cn or needs_aa or needs_twohop
-
-    if needs_au:
-        Au = A01[src]
-
-    if needs_av:
-        Av = A01.t()[dst] if is_directed else A01[dst]
-
-    if needs_cn:
-        cn = (Au * Av).sum(dim=1)  # (M,)
+    # score_pairs_on_demand requests exactly the heavy pairwise keys. Endpoint degrees are computed by the caller itself.
+    Au = A01[src]
+    Av = A01.t()[dst] if is_directed else A01[dst]
+    cn = (Au * Av).sum(dim=1)  # (M,)
 
     for key in keys:
-        if key == "deg_row":
-            results[key] = row_deg[src]
-        elif key == "deg_col":
-            results[key] = col_deg[dst]
-        elif key == "deg_diff":
-            results[key] = (row_deg[src] - col_deg[dst]).abs()
-        elif key == "cn":
+        if key == "cn":
             results[key] = cn
         elif key == "jaccard":
-            d_u = row_deg[src]
-            d_v = col_deg[dst]
-            union = d_u + d_v - cn
+            union = row_deg[src] + col_deg[dst] - cn
             results[key] = torch.where(union > 0, cn / union, torch.zeros_like(union))
         elif key == "adamic_adar":
             invlog = torch.where(row_deg > 1, 1.0 / torch.log(row_deg), torch.zeros_like(row_deg))
             results[key] = ((Au * Av) * invlog.view(1, -1)).sum(dim=1)
-        elif key == "twohop":
-            results[key] = cn if cn is not None else (Au * Av).sum(dim=1)
         else:
-            raise KeyError(f"Unknown key: {key}")
+            raise KeyError(f"Unsupported key for pairwise_for_pairs: {key}")
 
     return results

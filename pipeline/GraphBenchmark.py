@@ -558,15 +558,15 @@ class GraphBenchmark:
                 )
             else:
                 print(
-                    f"[PIPELINE SPLIT CONFIG] Train ratio {ratios[0]} rounded down to an empty split on {n} sample(s)."
-                    f"Split boundaries use integer cut points and the test split takes the remainder, so all truncated samples land in test."
-                    f"Increase num_graphs or adjust ratios if this was not intended."
+                    f"[PIPELINE SPLIT CONFIG] Train ratio {ratios[0]} rounded down to an empty split on {n} sample(s). "
+                    f"Split boundaries use integer cut points and the test split takes the remainder, so all truncated samples land in test. "
+                    f"Increase num_graphs or adjust ratios if this was not intended. "
                     f"(train={len(tr)}, val={len(va)}, test={len(te)})",
                     flush=True
                 )
         elif len(va) == 0 and float(ratios[1]) > 0.0:
             print(
-                f"[PIPELINE SPLIT CONFIG] Val ratio {ratios[1]} rounded down to an empty split on {n} sample(s)."
+                f"[PIPELINE SPLIT CONFIG] Val ratio {ratios[1]} rounded down to an empty split on {n} sample(s). "
                 f"Threshold tuning and checkpoint selection will have no data.",
                 flush=True
             )

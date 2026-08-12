@@ -32,8 +32,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 from .EdgeClassification import (
-    _normalise_feature_spec, _pick_probe_loader, _pos_weight, _reset_pipeline_runtime_state,
+    _format_duration, _normalise_feature_spec, _pick_probe_loader, _pos_weight, _reset_pipeline_runtime_state,
     effective_mask, FeatureRegistry, _task_to_meta_dict, finalise_summary,
     _resolve_loaders, get_optimal_threshold, save_pipeline_checkpoint
 )
@@ -177,7 +178,8 @@ def _assemble_features_for_graph(
         rwse_steps: int = 0,
         build_edge_mats: bool = True,
         append_pairwise: bool = True,
-        is_directed: bool = False
+        is_directed: bool = False,
+        extra_edge_mask: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Build node features X and edge/pairwise features E for a single (possibly padded) graph
@@ -411,30 +413,41 @@ def _assemble_features_for_graph(
     X = X * nm_vec.view(N, 1).to(X.dtype)
 
     # Sanitise and per-graph z-score (edge-wise) combined
+    E_extra = None
     if E.numel():
         E = torch.nan_to_num(E, nan=0.0)
         E_b = E.unsqueeze(0)
-        E_mask_b = em_bool.unsqueeze(0)
-        E = FeatureRegistry.zscore_edges_per_graph(E_b, mask=E_mask_b, is_bhwc=True).squeeze(0)
-        E = E * em_f.unsqueeze(-1)
 
+        if extra_edge_mask is not None:
+            xm_bool = extra_edge_mask.to(device=E.device, dtype=torch.bool)
+            xm_f = xm_bool.to(E.dtype)
+            E_extra = FeatureRegistry.zscore_edges_per_graph(E_b, mask=xm_bool.unsqueeze(0)).squeeze(0)
+            E_extra = E_extra * xm_f.unsqueeze(-1)
+
+        E_mask_b = em_bool.unsqueeze(0)
+        E = FeatureRegistry.zscore_edges_per_graph(E_b, mask=E_mask_b).squeeze(0)
+        E = E * em_f.unsqueeze(-1)
+    elif extra_edge_mask is not None:
+        E_extra = E
+
+    if extra_edge_mask is not None:
+        return X, (E, E_extra)
     return X, E
 
 
 def _redact_supervised_edges(
-    A_in: torch.Tensor, 
-    mask_in: torch.Tensor, 
-    zero_supervised: bool, 
-    is_directed: bool
+    A_in: torch.Tensor,
+    mask_in: torch.Tensor,
+    zero_supervised: bool
 ) -> torch.Tensor:
     """Zeroes out supervised/candidate edges in the adjacency matrix before encoding."""
     if not zero_supervised:
         return A_in
+    
     m = mask_in
     if m.dtype != torch.bool: 
         m = m > 0.5
-    if not is_directed: 
-        m = m | m.transpose(1, 2)
+
     return A_in.masked_fill(m, 0.0)
 
 
@@ -545,8 +558,7 @@ class _SAGEEncoder(nn.Module):
         depth: int,
         out_dim: int,
         dropout: float = 0.1,
-        learnable_layer_norm: bool = True,
-        edge_dim: int = 0
+        learnable_layer_norm: bool = True
     ):
         super().__init__()
         self.self_lins  = nn.ModuleList([nn.Linear(in_dim if i == 0 else hidden, hidden) for i in range(depth)])
@@ -1051,7 +1063,8 @@ def _prepare_features_batch(
     rwse_steps: int = 0,
     build_edge_mats: bool = True,
     append_pairwise: bool = True,
-    is_directed: bool = False
+    is_directed: bool = False,
+    build_local_edge_mats: bool = False
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
     """
     Assemble per-graph node/edge feature tensors for a batched input.
@@ -1064,11 +1077,8 @@ def _prepare_features_batch(
       - In some tasks (e.g. "predict only missing edges"), `mask` is a supervision /
         candidate-edge mask and can legitimately be all-False for an existing node's
         entire row/column (e.g., a fully-connected node has no missing edges)
-
-    Therefore, node validity must be inferred robustly and without user input:
-      1) From `mask` (nodes involved in any masked pair),
-      2) From `A` (nodes that participate in at least one observed edge),
-      3) From optional `_N` metadata in `feats`
+    Due to this, node validity  comes from the `_N` metadata recorded by `collate_fn_pad`
+    for every sample, which is exact regardless of mask semantics.
 
     Args:
         A:
@@ -1131,20 +1141,15 @@ def _prepare_features_batch(
     for b in range(B):
         fdict = feats[b]
         edge_mask_b = mask_bool[b]
-
-        # Node is valid if it appears in any masked pair.
-        # Strengthen node validity using adjacency participation so that valid nodes with
-        # zero supervised pairs (e.g., fully-connected under a "non-edges only" mask) remain valid.
         Ab = A[b]
-        A01 = (Ab > 0.5)
 
-        # Combine the masks before reduction
-        combined_validity = edge_mask_b | A01
-        node_mask_b = combined_validity.any(dim=0) | combined_validity.any(dim=1)
-
+        # collate_fn_pad records the unpadded node count for every sample and pads A with zeros and mask with False
         true_node_count = int(fdict["_N"]) if isinstance(fdict, dict) else 0
-        if true_node_count > 0:
-            node_mask_b = node_mask_b | (seq_idx < true_node_count)
+        node_mask_b = (seq_idx < true_node_count)
+
+        local_mask_b = None
+        if build_local_edge_mats:
+            local_mask_b = (Ab > 0.5) & node_mask_b[:, None] & node_mask_b[None, :]
 
         Xb, Eb = _assemble_features_for_graph(
             Ab, fdict, node_mask_b, edge_mask_b,
@@ -1154,7 +1159,8 @@ def _prepare_features_batch(
             rwse_steps=int(rwse_steps),
             build_edge_mats=bool(build_edge_mats),
             append_pairwise=bool(append_pairwise),
-            is_directed=bool(is_directed)
+            is_directed=bool(is_directed),
+            extra_edge_mask=local_mask_b
         )
 
         X_batch.append(Xb)
@@ -1162,42 +1168,6 @@ def _prepare_features_batch(
         node_mask_batch[b] = node_mask_b
 
     return X_batch, E_batch, node_mask_batch
-
-
-def _prepare_gps_local_edge_features(
-    A: torch.Tensor,
-    feats: List[Dict[str, torch.Tensor]],
-    node_mask: torch.Tensor,
-    schema: Dict[str, Any],
-    is_directed: bool = False
-) -> List[torch.Tensor]:
-    """
-    Assemble edge features for GPS local message passing.
-
-    Decoder edge features are masked by the supervision/candidate mask. GPS local
-    MPNN edge features instead need to be active on the real message-passing edges.
-    """
-    B, _, _ = A.shape
-    local_mask = (A > 0.5) & node_mask[:, :, None] & node_mask[:, None, :]
-
-    E_local_batch: List[torch.Tensor] = []
-    for b in range(B):
-        _, Eb = _assemble_features_for_graph(
-            A[b],
-            feats[b],
-            node_mask[b],
-            local_mask[b],
-            schema=schema,
-            lap_pe_k=0,
-            lap_pe_sign_flip=False,
-            rwse_steps=0,
-            build_edge_mats=True,
-            append_pairwise=True,
-            is_directed=bool(is_directed)
-        )
-        E_local_batch.append(Eb)
-
-    return E_local_batch
 
 
 # --------------------------- Unified Bridge Wrapper ---------------------------
@@ -1377,6 +1347,7 @@ class GraphEdgeClassifier(nn.Module):
                 "Schema-less structural feature inference is unsupported."
             )
 
+        is_gps = self.encoder_type == "gps"
         X_batch, E_batch, node_mask = _prepare_features_batch(
             A, feats, mask, schema=schema,
             lap_pe_k=self._effective_lap_pe_k(),
@@ -1384,14 +1355,14 @@ class GraphEdgeClassifier(nn.Module):
             rwse_steps=self._effective_rwse_steps(),
             build_edge_mats=True,
             append_pairwise=True,
-            is_directed=bool(self.directed)
+            is_directed=bool(self.directed),
+            build_local_edge_mats=is_gps
         )
 
         E_local_batch = None
-        if self.encoder_type == "gps":
-            E_local_batch = _prepare_gps_local_edge_features(
-                A, feats, node_mask, schema=schema, is_directed=bool(self.directed)
-            )
+        if is_gps:
+            E_local_batch = [pair[1] for pair in E_batch]
+            E_batch = [pair[0] for pair in E_batch]
 
         dev = A.device
         Fn = int(X_batch[0].size(1))
@@ -1623,9 +1594,6 @@ class GNNTrainConfig:
     # Sampling
     neg_pos_ratio: Optional[float] = None
 
-    # Memory-saving: score supervised pairs on demand instead of building dense NxN structural features
-    pairwise_on_demand: bool = False
-
     # Tree-specific auxiliary losses (used only in spanning-tree-style tasks)
     use_tree_aux_loss: bool = False
 
@@ -1769,7 +1737,7 @@ def _gnn_eval_split(
     for A, feats, L, mask in loader:
         A = A.to(device)
         mask = mask.to(device)
-        A_enc = _redact_supervised_edges(A, mask, zero_supervised, is_directed)
+        A_enc = _redact_supervised_edges(A, mask, zero_supervised)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
             # Path A: On-demand
@@ -1821,7 +1789,7 @@ def _gnn_eval_split(
 
         # Store Results
         if num_classes > 1:
-            loss = criterion(z_sel, y_sel)
+            loss = criterion(z_sel.float(), y_sel)
             tot_loss += float(loss.cpu()) * y_sel.numel()
             tot_cnt += y_sel.numel()
 
@@ -1952,13 +1920,17 @@ def train_one_gnn(
         task,
         cfg: Union[GNNTrainConfig, SimpleNamespace, dict],
         *,
-        loaders: Optional[Tuple[DataLoader, DataLoader, DataLoader]] = None,
-        feature_schema: Optional[Dict[str, Any]] = None
+        loaders: Tuple[DataLoader, DataLoader, DataLoader],
+        feature_schema: Dict[str, Any]
 ) -> Dict[str, Dict[str, float]]:
     """
     Standard Full-Batch GNN Training Loop.
     Supports Binary (BCE) and Multiclass (CrossEntropy).
+
+    Loaders and the feature schema are runner-owned, set by run_gnn_suite before
+    loader resolution and always passed in.
     """
+    _t_model_start = time.monotonic()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = _coerce_train_cfg(cfg)
 
@@ -1966,33 +1938,8 @@ def train_one_gnn(
     edges_only = bool(getattr(task, "eval_on_existing_edges_only", False))
     num_classes = int(getattr(task, "num_classes", 1))
 
-    # pairwise_on_demand only supports the batch_size of 1
-    on_demand_requested = bool(getattr(cfg, "pairwise_on_demand", False))
-    if on_demand_requested:
-        if int(getattr(cfg, "batch_size", 16)) != 1:
-            print("[WARN] batch_size is unsupported when pairwise_on_demand=True; forcing batch_size=1 locally.", flush=True)
-            cfg.batch_size = 1
-
-    if loaders is None:
-        train_loader, val_loader, test_loader = _resolve_loaders(task, cfg)
-    else:
-        train_loader, val_loader, test_loader = loaders
-
-    hooks = getattr(task, "hooks", None)
+    train_loader, val_loader, test_loader = loaders
     probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
-    if feature_schema is None:
-        if hooks is None:
-            requested_features, custom_types = None, {}
-        else:
-            requested_features, custom_types = _normalise_feature_spec(
-                getattr(hooks, "feature_set", []),
-                directed=is_directed
-            )
-        feature_schema = _infer_feature_schema(
-            [train_loader, val_loader, test_loader],
-            requested_keys=requested_features,
-            custom_types=custom_types
-        )
 
     # Remove 'adj' from edge features
     feature_schema = _strip_adj_from_edge_keys(feature_schema)
@@ -2014,23 +1961,6 @@ def train_one_gnn(
     model.gps_lap_pe_sign_flip = bool(getattr(cfg, "gps_lap_pe_sign_flip", True))
     model.gps_rwse_steps = int(getattr(cfg, "gps_rwse_steps", 16))
     model.feature_schema = feature_schema
-    model.pairwise_on_demand = bool(getattr(cfg, "pairwise_on_demand", False))
-
-    # Edge feature guards
-    if getattr(model, "pairwise_on_demand", False):
-        custom_edges = [k for k in feature_schema.get("edge_keys", [])
-                        if k != "adj" and k not in FeatureRegistry.HEAVY_PAIRWISE_KEYS]
-        if custom_edges:
-            print(f"[WARN] pairwise_on_demand=True utilises a fixed structural feature set. "
-                  f"The following explicit edge features will be dropped: {custom_edges}", flush=True)
-
-        if bool(getattr(cfg, "use_tree_aux_loss", False)):
-            print(
-                "[WARN] use_tree_aux_loss=True is unsupported when pairwise_on_demand=True; "
-                "disabling tree auxiliary loss for this run.",
-                flush=True
-            )
-            cfg.use_tree_aux_loss = False
 
     if num_classes > 1 and bool(getattr(cfg, "use_tree_aux_loss", False)):
         print(
@@ -2047,21 +1977,8 @@ def train_one_gnn(
     with torch.no_grad():
         A0_dev = A0.to(device)
         M0_dev = M0.to(device)
-        A0_enc = _redact_supervised_edges(A0_dev, M0_dev, zero_supervised, is_directed)
-        
-        # Route warmup to the correct decoder to guarantee optimiser parameter tracking
-        if getattr(model, "pairwise_on_demand", False):
-            X_batch, _, node_mask = _prepare_features_batch(
-                A0_enc, feats0, M0_dev, schema=feature_schema,
-                lap_pe_k=model._effective_lap_pe_k(),
-                lap_pe_sign_flip=model._lap_pe_sign_flip_enabled(),
-                rwse_steps=model._effective_rwse_steps(),
-                build_edge_mats=False, append_pairwise=False,
-                is_directed=bool(is_directed)
-            )
-            Z = model.encode_only(A0_enc, X_batch, node_mask)
-        else:
-            _ = model(A0_enc, feats0, M0_dev)
+        A0_enc = _redact_supervised_edges(A0_dev, M0_dev, zero_supervised)
+        _ = model(A0_enc, feats0, M0_dev)
 
     # Optimiser, scaler and scheduler
     optimiser = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
@@ -2085,7 +2002,7 @@ def train_one_gnn(
         )
 
     # Training Loop
-    best_val, best_thr, best_state = -1.0, 0.5, None
+    best_val, best_thr, best_state = -1.0, (None if num_classes > 1 else 0.5), None
     best_val_metrics = None
     last_known_thr = 0.5
 
@@ -2096,76 +2013,39 @@ def train_one_gnn(
         for A, feats, L, mask in train_loader:
             A = A.to(device)
             mask = mask.to(device)
-            A_enc = _redact_supervised_edges(A, mask, zero_supervised, is_directed)
+            A_enc = _redact_supervised_edges(A, mask, zero_supervised)
             optimiser.zero_grad(set_to_none=True)
             logits = None
             prebalanced_binary = False
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
-                # Path A: On-demand
-                if getattr(model, "pairwise_on_demand", False):
-                    X_batch, _, node_mask = _prepare_features_batch(
-                        A_enc, feats, mask, schema=feature_schema,
-                        lap_pe_k=model._effective_lap_pe_k(),
-                        lap_pe_sign_flip=model._lap_pe_sign_flip_enabled(),
-                        rwse_steps=model._effective_rwse_steps(),
-                        build_edge_mats=False, append_pairwise=False,
-                        is_directed=bool(is_directed)
-                    )
-                    Z = model.encode_only(A_enc, X_batch, node_mask)
+                idx = _supervised_indices(mask, A, is_directed, edges_only)
+                if idx.numel() == 0:
+                    continue
 
-                    idx = _supervised_indices(mask, A, is_directed, edges_only)
-                    if idx.numel() == 0:
-                        continue
+                idx_cpu = idx.cpu()
+                if num_classes > 1:
+                    y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]].long().to(device)
+                else:
+                    y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(device=device, dtype=torch.float32)
 
-                    i_idx, j_idx = idx[:, 1], idx[:, 2]
-                    idx_cpu = idx.cpu()
-                    if num_classes > 1:
-                        y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]].long().to(device)
-                    else:
-                        y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(device=device, dtype=torch.float32)
-
+                    if not bool(getattr(cfg, "use_tree_aux_loss", False)):
                         ratio_raw = getattr(cfg, "neg_pos_ratio", None)
                         ratio = None if ratio_raw is None else float(ratio_raw)
                         if ratio is not None and ratio > 0:
                             keep = _balance_binary_negpos(y_sel, ratio)
-                            i_idx = i_idx[keep]
-                            j_idx = j_idx[keep]
+                            idx = idx[keep]
                             y_sel = y_sel[keep]
                             prebalanced_binary = True
 
-                    # After optional pre-balancing, score only the kept supervised pairs
-                    z_sel = model.score_pairs_on_demand(Z, A_enc[0] if A_enc.dim() == 3 else A_enc, i_idx, j_idx)
-
-                # Path B: Full Matrix
-                else:
-                    idx = _supervised_indices(mask, A, is_directed, edges_only)
-                    if idx.numel() == 0:
-                        continue
-
-                    idx_cpu = idx.cpu()
+                if bool(getattr(cfg, "use_tree_aux_loss", False)):
+                    logits = model(A_enc, feats, mask)
                     if num_classes > 1:
-                        y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]].long().to(device)
+                        z_sel = logits[idx[:, 0], idx[:, 1], idx[:, 2], :]
                     else:
-                        y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(device=device, dtype=torch.float32)
-
-                        if not bool(getattr(cfg, "use_tree_aux_loss", False)):
-                            ratio_raw = getattr(cfg, "neg_pos_ratio", None)
-                            ratio = None if ratio_raw is None else float(ratio_raw)
-                            if ratio is not None and ratio > 0:
-                                keep = _balance_binary_negpos(y_sel, ratio)
-                                idx = idx[keep]
-                                y_sel = y_sel[keep]
-                                prebalanced_binary = True
-
-                    if bool(getattr(cfg, "use_tree_aux_loss", False)):
-                        logits = model(A_enc, feats, mask)
-                        if num_classes > 1:
-                            z_sel = logits[idx[:, 0], idx[:, 1], idx[:, 2], :]
-                        else:
-                            z_sel = logits[idx[:, 0], idx[:, 1], idx[:, 2]]
-                    else:
-                        z_sel = model.score_pairs_selected(A_enc, feats, mask, idx)
+                        z_sel = logits[idx[:, 0], idx[:, 1], idx[:, 2]]
+                else:
+                    z_sel = model.score_pairs_selected(A_enc, feats, mask, idx)
 
                 if num_classes > 1:
                     loss = criterion(z_sel, y_sel)
@@ -2194,7 +2074,7 @@ def train_one_gnn(
                     logits, mask, A=A,
                     directed=is_directed, edges_only=edges_only
                 )
-                loss = loss + 1.0 * aux
+                loss = loss + aux
 
             if not torch.isfinite(loss):
                 continue
@@ -2220,12 +2100,12 @@ def train_one_gnn(
         # Switch the print label dynamically to match the dense pipeline
         label = "F1_macro" if "F1_macro" in val_metrics else "f1"
         val_f1 = val_metrics.get(label, 0.0)
-        print(f"[{encoder.upper()}] Ep {epoch} Train loss/edge: {epoch_loss / max(1, epoch_count):.{disp_dec}f} | Val {label}: {val_f1:.{disp_dec}f}")
-
+        avg_loss = (epoch_loss / epoch_count) if epoch_count else float("nan")
+        print(f"[{encoder.upper()}] Ep {epoch} Train loss/edge: {avg_loss:.{disp_dec}f} | Val {label}: {val_f1:.{disp_dec}f}")
         sel_val = float(val_metrics.get("f1", float("nan")))
         if np.isfinite(sel_val) and sel_val > best_val:
             best_val = sel_val
-            best_thr = thr if thr is not None else last_known_thr
+            best_thr = thr if thr is not None else (None if num_classes > 1 else last_known_thr)
             best_val_metrics = dict(val_metrics)
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
@@ -2247,12 +2127,14 @@ def train_one_gnn(
             weight_decay=float(cfg.weight_decay),
             epochs=int(cfg.epochs),
             batch_size=1 if getattr(model, "pairwise_on_demand", False) else int(cfg.batch_size)
-        )
+        ),
+        "elapsed_seconds": round(time.monotonic() - _t_model_start, 3)
     }
     state_to_save = best_state if best_state is not None else {k: v.cpu() for k, v in model.state_dict().items()}
     ckpt_path = save_pipeline_checkpoint(encoder, state_to_save, task, cfg, meta)
 
     return {
+        "elapsed_seconds": meta["elapsed_seconds"],
         "val": best_val_metrics if best_val_metrics is not None else {
             "f1": float("nan")},
         "val_best_metric": best_val if best_val_metrics is not None else float("nan"),
@@ -2267,16 +2149,16 @@ def train_one_gnn_edges(
         task,
         cfg: Union[GNNTrainConfig, SimpleNamespace, dict],
         *,
-        loaders: Optional[Tuple[DataLoader, DataLoader, DataLoader]] = None,
-        feature_schema: Optional[Dict[str, Any]] = None
+        loaders: Tuple[DataLoader, DataLoader, DataLoader],
+        feature_schema: Dict[str, Any]
 ) -> Dict[str, Dict[str, float]]:
     """
-    Single-graph on-demand GNN training. Supports Binary (BCE) and Multiclass (CrossEntropy).
-    Scores all supervised pairs for the graph on demand. This runner is not edge-chunked.
+    On-demand GNN training, one graph at a time. Supports Binary (BCE) and Multiclass (CrossEntropy).
 
-    The feature schema is runner-owned, set by run_gnn_edges_suite before loader
-    resolution and always passed in via feature_schema.
+    Loaders and the feature schema are runner-owned, set by run_gnn_edges_suite before
+    loader resolution and always passed in.
     """
+    _t_model_start = time.monotonic()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = _coerce_train_cfg(cfg)
 
@@ -2289,11 +2171,7 @@ def train_one_gnn_edges(
         print("[WARN] train_one_gnn_edges operates exclusively in on-demand mode and requires batch_size=1; forcing batch_size=1 locally.", flush=True)
         cfg.batch_size = 1
 
-    if loaders is None:
-        train_loader, val_loader, test_loader = _resolve_loaders(task, cfg, batch_size=1)
-    else:
-        train_loader, val_loader, test_loader = loaders
-
+    train_loader, val_loader, test_loader = loaders
     probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
     feature_schema = _strip_adj_from_edge_keys(feature_schema)
 
@@ -2321,16 +2199,10 @@ def train_one_gnn_edges(
         )
         cfg.use_tree_aux_loss = False
 
-    if encoder == "gps":
-        model.lap_pe_k = int(getattr(cfg, "lap_pe_k", 0))
-        model.gps_lap_pe_k = int(getattr(cfg, "gps_lap_pe_k", 16))
-        model.gps_lap_pe_sign_flip = bool(getattr(cfg, "gps_lap_pe_sign_flip", True))
-        model.gps_rwse_steps = int(getattr(cfg, "gps_rwse_steps", 16))
-    else:
-        model.lap_pe_k = 0
-        model.gps_lap_pe_k = 0
-        model.gps_rwse_steps = 0
-
+    model.lap_pe_k = int(getattr(cfg, "lap_pe_k", 0))
+    model.gps_lap_pe_k = int(getattr(cfg, "gps_lap_pe_k", 16))
+    model.gps_lap_pe_sign_flip = bool(getattr(cfg, "gps_lap_pe_sign_flip", True))
+    model.gps_rwse_steps = int(getattr(cfg, "gps_rwse_steps", 16))
     zero_supervised = bool(getattr(cfg, "gnn_zero_supervised", False))
 
     # Warmup
@@ -2338,7 +2210,7 @@ def train_one_gnn_edges(
     with torch.no_grad():
         A0_dev = A0.to(device)
         M0_dev = M0.to(device)
-        A0_enc = _redact_supervised_edges(A0_dev, M0_dev, zero_supervised, is_directed)
+        A0_enc = _redact_supervised_edges(A0_dev, M0_dev, zero_supervised)
         X_batch, _, node_mask = _prepare_features_batch(
             A0_enc, feats0, M0_dev, schema=feature_schema,
             lap_pe_k=model._effective_lap_pe_k(),
@@ -2370,7 +2242,7 @@ def train_one_gnn_edges(
         )
 
     # Training Loop
-    best_val, best_thr, best_state = -1.0, 0.5, None
+    best_val, best_thr, best_state = -1.0, (None if num_classes > 1 else 0.5), None
     best_val_metrics = None
     last_known_thr = 0.5
 
@@ -2381,7 +2253,7 @@ def train_one_gnn_edges(
         for A, feats, L, mask in train_loader:
             A = A.to(device)
             mask = mask.to(device)
-            A_enc = _redact_supervised_edges(A, mask, zero_supervised, is_directed)
+            A_enc = _redact_supervised_edges(A, mask, zero_supervised)
             optimiser.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
@@ -2396,11 +2268,7 @@ def train_one_gnn_edges(
                 )
                 Z = model.encode_only(A_enc, X_batch, node_mask)
 
-                # 2. Positives (Observed) - inlined extraction
-                m = effective_mask(mask, A, is_directed)
-                if edges_only:
-                    m = m & (A > 0.5)
-                idx = torch.nonzero(m, as_tuple=False)
+                idx = _supervised_indices(mask, A, is_directed, edges_only)
                 if idx.numel() == 0:
                     continue
                 i_idx, j_idx = idx[:, 1], idx[:, 2]
@@ -2467,12 +2335,12 @@ def train_one_gnn_edges(
         # Switch the print label dynamically to match the dense pipeline
         label = "F1_macro" if "F1_macro" in val_metrics else "f1"
         val_f1 = val_metrics.get(label, 0.0)
-        print(f"[{encoder.upper()}] Ep {epoch} Train loss/edge: {epoch_loss / max(1, epoch_count):.{disp_dec}f} | Val {label}: {val_f1:.{disp_dec}f}")
-
+        avg_loss = (epoch_loss / epoch_count) if epoch_count else float("nan")
+        print(f"[{encoder.upper()}] Ep {epoch} Train loss/edge: {avg_loss:.{disp_dec}f} | Val {label}: {val_f1:.{disp_dec}f}")
         sel_val = float(val_metrics.get("f1", float("nan")))
         if np.isfinite(sel_val) and sel_val > best_val:
             best_val = sel_val
-            best_thr = thr if thr is not None else last_known_thr
+            best_thr = thr if thr is not None else (None if num_classes > 1 else last_known_thr)
             best_val_metrics = dict(val_metrics)
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
@@ -2494,12 +2362,14 @@ def train_one_gnn_edges(
             weight_decay=float(cfg.weight_decay),
             epochs=int(cfg.epochs),
             batch_size=1 if getattr(model, "pairwise_on_demand", False) else int(cfg.batch_size)
-        )
+        ),
+        "elapsed_seconds": round(time.monotonic() - _t_model_start, 3)
     }
     state_to_save = best_state if best_state is not None else {k: v.cpu() for k, v in model.state_dict().items()}
     ckpt_path = save_pipeline_checkpoint(encoder, state_to_save, task, cfg, meta)
 
     return {
+        "elapsed_seconds": meta["elapsed_seconds"],
         "val": best_val_metrics if best_val_metrics is not None else {
             "f1": float("nan")},
         "val_best_metric": best_val if best_val_metrics is not None else float("nan"),
@@ -2535,18 +2405,12 @@ def run_gnn_suite(
           It does not affect run finalisation, cache clearing, or feature reset.
           
     Feature schema:
-        - Full-matrix mode (pairwise_on_demand=False, default): uses the user-specified
-          feature set from task.hooks.feature_set, as usual.
-        - On-demand mode (pairwise_on_demand=True): discovers all features present in
-          the sample feature dicts via untargeted schema inference. Typed custom declarations
-          in task.hooks.feature_set provide node/edge metadata without narrowing discovery.
-          Node features flow through to the encoder. The decoder's structural pair features (cn, jaccard,
-          adamic_adar, degree stats) are computed on the fly from the adjacency.
+        Uses the user-specified feature set from task.hooks.feature_set.
     """
     canon = _canonicalise_encoders(encoders)
     cfg = _coerce_train_cfg(cfg)
-    cfg.display_decimals = int(display_decimals)
-    cfg.display_truncate = bool(display_truncate)
+    cfg.display_decimals = int(getattr(cfg, "display_decimals", display_decimals))
+    cfg.display_truncate = bool(getattr(cfg, "display_truncate", display_truncate))
 
     install_boundary_hooks()
     base_bundle = begin_or_attach_run(
@@ -2575,18 +2439,12 @@ def run_gnn_suite(
             directed=task.directed
         )
 
-    if bool(getattr(cfg, "pairwise_on_demand", False)):
-        shared_loaders = _resolve_loaders(task, cfg, batch_size=1)
-        shared_feature_schema = _infer_feature_schema(
-            list(shared_loaders), custom_types=custom_types
-        )
-    else:
-        shared_loaders = _resolve_loaders(task, cfg)
-        shared_feature_schema = _infer_feature_schema(
-            list(shared_loaders),
-            requested_keys=requested_features,
-            custom_types=custom_types
-        )
+    shared_loaders = _resolve_loaders(task, cfg)
+    shared_feature_schema = _infer_feature_schema(
+        list(shared_loaders),
+        requested_keys=requested_features,
+        custom_types=custom_types
+    )
 
     for enc in canon:
         print("\n" + "=" * 80)
@@ -2602,6 +2460,9 @@ def run_gnn_suite(
             "raw": out,
         }
         results_target[enc] = entry
+        _elapsed = out.get("raw", {}).get("elapsed_seconds")
+        if _elapsed is not None:
+            print(f"[TIME] Training total: {_format_duration(_elapsed)}")
 
     meta = {
         "task": _task_to_meta_dict(task),
@@ -2649,8 +2510,8 @@ def run_gnn_edges_suite(
     """
     canon = _canonicalise_encoders(encoders)
     cfg = _coerce_train_cfg(cfg)
-    cfg.display_decimals = int(display_decimals)
-    cfg.display_truncate = bool(display_truncate)
+    cfg.display_decimals = int(getattr(cfg, "display_decimals", display_decimals))
+    cfg.display_truncate = bool(getattr(cfg, "display_truncate", display_truncate))
 
     install_boundary_hooks()
     base_bundle = begin_or_attach_run(
@@ -2703,11 +2564,14 @@ def run_gnn_edges_suite(
         }
 
         results_target[enc] = entry
+        _elapsed = out.get("raw", {}).get("elapsed_seconds")
+        if _elapsed is not None:
+            print(f"[TIME] Training total: {_format_duration(_elapsed)}")
 
     meta = {
         "task": _task_to_meta_dict(task),
         "encoders": canon,
-        "suite": "gnn_edge_minibatch",
+        "suite": "gnn_scalability_mode",
     }
     base_bundle.setdefault("metadata", {}).update(meta)
     task._latest_results = base_bundle

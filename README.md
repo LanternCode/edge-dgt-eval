@@ -190,7 +190,7 @@ bundle = run_pipeline_for_task(task, models=["mlp", "deep_mlp", "cnn", "transfor
 ```
 
 Accepted model keys: `mlp`, `deep_mlp`, `cnn`, `transformer`, `rf`.
-Passing GNN keys (`sage`, `gcn`, `gin`, `edge_tx`, `gps`) raises `ValueError` — use the GNN entry points below.
+Passing GNN keys (`sage`, `gcn`, `gin`, `edge_tx`, `gps`) prints a warning and skips them — use the GNN entry points below.
 
 **2. Full-batch GNN models**
 
@@ -275,7 +275,7 @@ The dense and GNN pipelines are **architecturally separate** and intentionally d
 
 ## Supported Graph Families
 
-The built-in `GraphBenchmark` generates synthetic graphs from the following families. Each family dynamically scales parameters to target a consistent baseline average degree (~3.5) across node counts.
+The built-in `GraphBenchmark` generates synthetic graphs from the following families.
 
 | Family | Description | Directed support |
 |--------|-------------|------------------|
@@ -289,6 +289,8 @@ The built-in `GraphBenchmark` generates synthetic graphs from the following fami
 | `balanced_tree` | Full tree with branching factor r ∈ \[2, 4\] | Native (root-outward edges) |
 | `tree_plus_chords` | Random labelled tree + up to 0.75N chord edges | BFS-directed tree + non-reciprocal chords |
 | `shape_cycle` | Incomplete ring topologies (~50% of nodes) + background forest | Forward-directed rings, randomly oriented forest |
+
+Most families hold average degree constant as node count varies: `erdos_renyi`, `random_geometric` and `tree_plus_chords` target ~3.5 explicitly; `barabasi_albert`, `powerlaw_cluster`, `random_regular` and `watts_strogatz` sit around 4; `balanced_tree` and `shape_cycle` around 2. `stochastic_block` is the exception — its `p_in`/`p_out` are drawn from fixed ranges independent of node count, so its average degree grows with graph size (~0.18 x N).
 
 All generated graphs undergo organic mutation (10–15% edge dropout) to break algorithmic perfection. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`.
 
@@ -378,7 +380,6 @@ class TNNTrainConfig:
     supervised_redaction_policy: str = "adj_only"
     threshold_metric: str = "f1"      # "f1" | "bacc" (tuned on the validation split)
     select_by: str = "f1"             # "f1" | "bacc" | "auroc"
-    eval_on_existing_edges_only: bool = False
     tx_force_adj_channel: bool = True
     save_dir: Optional[str] = "saved_checkpoints"
     # ... plus model-specific hyperparameters (mlp_hidden, cnn_hidden, tx_*, etc.)
@@ -409,7 +410,6 @@ class GNNTrainConfig:
     learnable_layer_norm: bool = True
     scheduler: str = "cosine"         # "none" | "cosine"
     neg_pos_ratio: Optional[float] = None
-    pairwise_on_demand: bool = False
     use_tree_aux_loss: bool = False
     save_dir: Optional[str] = "saved_checkpoints"
 ```
@@ -419,11 +419,11 @@ Notes:
 - GNN threshold tuning and checkpoint selection are always F1-based. Dense-only knobs such as `threshold_metric` and `select_by` do not apply.
 - `grad_clip=1.0` keeps gradient clipping enabled by default in the GNN pipeline; set `grad_clip=0.0` to disable it.
 - `learnable_layer_norm=False` switches the GNN encoder LayerNorm modules to the non-affine variant.
-- In `run_gnn_suite(...)`, `lap_pe_k` is the general LapPE request and GPS additionally enforces at least `gps_lap_pe_k` LapPE columns. In Scalable Mode (`run_gnn_edges_suite(...)`), GPS uses `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps`; non-GPS `lap_pe_k` is ignored.
+- `lap_pe_k` is the general LapPE request in both GNN runners, and GPS additionally enforces at least `gps_lap_pe_k` LapPE columns. GPS also uses `gps_lap_pe_sign_flip` and `gps_rwse_steps`.
 - `gps_rwse_steps` controls GPS-owned random-walk structural encodings. These are not part of `hooks.feature_set` and are not requested by `feature_set=True`.
 - `gnn_zero_supervised` controls adjacency redaction uniformly across GNN encoders; GPS derives its model-owned structural processing from that same model-visible adjacency.
 - `neg_pos_ratio` controls negative-to-positive sampling ratio for binary GNN training. `None` (default) disables ratio-based sampling and uses `pos_weight` instead.
-- `use_tree_aux_loss=True` adds tree-specific weights to the loss computation, penalising cycle-forming predictions. Only meaningful for spanning-tree tasks. Automatically disabled in Scalable Mode.
+- `use_tree_aux_loss=True` adds an auxiliary penalty pulling the expected number of predicted edges toward `N-1`. It does not detect cycles or enforce connectivity. Only meaningful for spanning-tree tasks. Automatically disabled in Scalable Mode.
 
 ---
 
@@ -565,14 +565,14 @@ Passed as `_task_mask` to `PatchTransformer.forward()`. Decides which spatial pa
 - `"from_mask"`: only patches overlapping `True` mask entries.
 - `"auto"`: adaptive based on `min_keep_ratio`.
 
-Not an input feature. Only affects which patches the transformer processes.
+Not an input feature. The full patch grid is always embedded and passed to the encoder. The policy controls which patches are attended to, via a key–padding mask. Token count depends only on graph size and patch size, so these policies do not reduce the transformer's sequence length.
 
 ### (C) Mask input channel
 
 A BCHW feature channel named `"mask"`, controlled by `cfg.use_mask_channel`:
 
 - `None` → inferred per model: CNN/Transformer = `True`, MLP/RF = `False`
-- `True` / `False` → explicit override
+- `True` / `False` → explicit override for the neural models; RF never takes the `"mask"` channel and ignores this setting
 
 This is a model input, not a supervision signal.
 
@@ -656,8 +656,6 @@ run_gnn_edges_suite(...)
 
 `run_gnn_edges_suite(...)` is the dedicated Scalable Mode runner and forces `batch_size=1`, so one graph is processed at a time. A task may still contain multiple graphs, which are processed sequentially. The graph encoder operates on the graph as a whole; the memory saving comes from avoiding the dense decoder-side edge-feature representation and computing structural decoder features only for the selected supervised pairs.
 
-`run_gnn_suite(...)` also exposes the `pairwise_on_demand` configuration flag, which uses related reduced decoder mechanics within the standard GNN runner. That configuration is not Scalable Mode and retains the standard runner's own configuration semantics.
-
 ---
 
 ## Output Format
@@ -670,8 +668,8 @@ All three runner entry points return a `bundle` dictionary:
 {
     "results": {
         "<model_key>": {
-            "val":  { "f1": ..., "precision": ..., "recall": ..., ... },
-            "test": { "f1": ..., "precision": ..., "recall": ..., ... },
+            "val":  { "f1": ..., "precision": ..., "recall": ..., ..., "_prob": [...], "_y": [...] },
+            "test": { "f1": ..., "precision": ..., "recall": ..., ..., "_prob": [...], "_y": [...] },
             "thr":  0.42,           # tuned threshold (binary) or None (multiclass)
             "ckpt": "saved_checkpoints/task_name/YYYYMMDD_HHMMSS/model_key.pth",
         },
@@ -684,7 +682,7 @@ All three runner entry points return a `bundle` dictionary:
 }
 ```
 
-In a combined dense → GNN run, both stages write into the same bundle, so `results` contains keys for all models across both pipelines.
+Each metrics dict also carries `_prob` (per-pair predicted probabilities) and `_y` (per-pair integer labels) for the corresponding split, for downstream analysis. The most recent bundle is also attached to the task as `task._latest_results` for the duration of the run; it is cleared when the run is finalised. In a combined dense → GNN run, both stages write into the same bundle, so `results` contains keys for all models across both pipelines.
 
 ### Checkpoint format
 
@@ -760,16 +758,14 @@ All GNN encoders use LayerNorm. The single knob `cfg.learnable_layer_norm` contr
 
 ### Scalable Mode uses a reduced decoder feature path
 
-Scalable Mode is the memory-saving GNN execution strategy used by `run_gnn_edges_suite(...)` and by `run_gnn_suite(...)` when `pairwise_on_demand=True`. In the standard full-matrix GNN path, decoder-side edge features may be represented as a dense `(N, N, Fe)` tensor. Scalable Mode avoids materialising that tensor.
+Scalable Mode is the memory-saving GNN execution strategy used by `run_gnn_edges_suite(...)`. In the standard full-matrix GNN path, decoder-side edge features may be represented as a dense `(N, N, Fe)` tensor. Scalable Mode avoids materialising that tensor.
 
 Technically:
 - The graph is first encoded to produce node embeddings. The normal effective mask then selects the supervised `(i, j)` pairs. For binary tasks, `neg_pos_ratio` may optionally reduce the selected negative pairs before scoring.
 - The decoder computes its structural inputs only for those selected pairs. Its fixed structural feature vector contains endpoint degree statistics together with common-neighbour, Jaccard, and Adamic–Adar statistics derived from the adjacency visible to the model.
 - Node features, including typed custom node features, flow through the encoder. User-supplied edge features outside the fixed Scalable Mode structural set do not reach the decoder.
 
-Scalable Mode forces `batch_size=1`, meaning one graph is processed at a time. This does not restrict the dataset to a single graph. `use_tree_aux_loss=True` is disabled in Scalable Mode. In the dedicated `run_gnn_edges_suite(...)` path, GPS uses `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` as encoder-side structural encodings. Non-GPS `lap_pe_k` is ignored in that runner.
-
-`run_gnn_suite(...)` separately exposes the `pairwise_on_demand` configuration flag, which uses related reduced decoder mechanics without changing the runner into Scalable Mode.
+Scalable Mode forces `batch_size=1`, meaning one graph is processed at a time. This does not restrict the dataset to a single graph. `use_tree_aux_loss=True` is disabled in Scalable Mode. GPS uses `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` as encoder-side structural encodings in both runners.
 
 These differences from full-matrix decoding are intentional and should not be reported as inconsistencies unless observed behaviour contradicts this contract.
 
@@ -779,7 +775,7 @@ Training computes `pos_weight` per-batch for numerical stability. Evaluation rec
 
 ### `run_pipeline_for_task` rejects GNN keys
 
-Passing `sage`, `gcn`, `gin`, `edge_tx`, or `gps` to `run_pipeline_for_task` raises `ValueError`. GNN models require different preprocessing and must be run through `run_gnn_suite` or `run_gnn_edges_suite`. The error is a guard.
+Passing `sage`, `gcn`, `gin`, `edge_tx`, or `gps` to `run_pipeline_for_task` prints a warning and skips that key; the remaining dense models still train. GNN models require different preprocessing and must be run through `run_gnn_suite` or `run_gnn_edges_suite`.
 
 ### Loader caching within a run
 
@@ -946,8 +942,7 @@ When modifying the codebase, verify these before treating a change as complete:
    - Node features, including custom node features, continue to flow through the encoder via schema inference
    - Scalable Mode continues to enforce `batch_size=1`
    - `run_gnn_edges_suite(...)` continues to follow the documented Scalable Mode behaviour
-   - `run_gnn_suite(..., pairwise_on_demand=True)` remains a separate standard-runner configuration and is not described as Scalable Mode
-   - GPS `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` remain active in `run_gnn_edges_suite(...)`; non-GPS `lap_pe_k` remains ignored there
+   - GPS `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` remain active in `run_gnn_edges_suite(...)`
    - `use_tree_aux_loss` remains disabled in Scalable Mode
 
 5. **Run finalisation and state reset remain correct across sequential tasks**

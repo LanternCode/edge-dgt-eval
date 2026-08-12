@@ -109,6 +109,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import networkx as nx
+import time
 from ._utils.features import CANONICAL_FEATURES, DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES, pairwise_batch_from_adj, shortest_path_from_adj
 from ._utils.run_lifecycle import begin_or_attach_run, get_active_run_checkpoint_timestamp, install_boundary_hooks
 from .GraphBenchmark import GraphBenchmark
@@ -371,11 +372,7 @@ def save_pipeline_checkpoint(model_key: str, state_dict: dict, task: Any, cfg: A
     
     timestamp = get_active_run_checkpoint_timestamp()
     if timestamp is None:
-        timestamp = getattr(cfg, "checkpoint_run_timestamp", None)
-        if timestamp is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    setattr(cfg, "checkpoint_run_timestamp", timestamp)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     out_dir = save_root / str(getattr(task, "name", "task")) / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -500,8 +497,6 @@ class FeatureRegistry:
             mb = mask.to(A.device, non_blocking=True)
             if mb.dtype != torch.bool:
                 mb = mb > 0.5
-            if not self.directed:
-                mb = mb | mb.transpose(1, 2)
         else:
             mb = None
 
@@ -765,10 +760,6 @@ class FeatureRegistry:
             'std': self.std.clone() if self.std is not None else None
         }
 
-    @property
-    def in_channels(self) -> int:
-        return len(self.manifest) if self.mean is None else int(self.mean.numel())
-
     def standardise_bchw(self, x: torch.Tensor, keep_idx: Optional[List[int]] = None) -> torch.Tensor:
         """
         x: (B, C_eff, H, W)
@@ -792,54 +783,35 @@ class FeatureRegistry:
         return x_std
 
     @staticmethod
-    def zscore_edges_per_graph(E: torch.Tensor, mask: torch.Tensor | None = None, is_bhwc: bool = False) -> torch.Tensor:
+    def zscore_edges_per_graph(E: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Per-graph, per-channel z-score for edge tensors.
         Args:
-            E: (B, C, N, N) or (B, N, N, C).
+            E: (B, N, N, C).
             mask: optional (B, N, N) boolean mask; True=valid. Broadcast over channels.
         Returns:
             Tensor with same shape as E, z-scored per graph per channel.
         """
-        if is_bhwc:
-            B, H, W, C = E.shape
-            flat = E.reshape(B, H * W, C)
-
-            if mask is not None:
-                if mask.dim() == 4 and mask.size(1) == 1:
-                    mask = mask.squeeze(1)
-                m = mask.view(B, H * W, 1).to(E.dtype)
-
-                count = torch.clamp(m.sum(dim=1, keepdim=True), min=1.0)
-                mean = (flat * m).sum(dim=1, keepdim=True) / count
-                var = ((flat - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
-            else:
-                mean = flat.mean(dim=1, keepdim=True)
-                var = flat.var(dim=1, unbiased=False, keepdim=True)
-
-            std = torch.clamp(var.sqrt(), min=1e-8)
-            return ((flat - mean) / std).view(B, H, W, C)
-
-        B, C, H, W = E.shape
-        flat = E.reshape(B, C, -1)
+        B, H, W, C = E.shape
+        flat = E.reshape(B, H * W, C)
 
         if mask is not None:
             # Accept (B, N, N) or (B, 1, N, N); broadcast over channels.
             if mask.dim() == 4 and mask.size(1) == 1:
                 mask = mask.squeeze(1)
             # Reshape explicitly to match H*W to avoid accidental mismatches.
-            m = mask.reshape(B, 1, H * W).to(device=E.device, dtype=E.dtype).expand_as(flat)
+            m = mask.reshape(B, H * W, 1).to(device=E.device, dtype=E.dtype)
 
             # avoid empty division
-            count = torch.clamp(m.sum(dim=-1, keepdim=True).to(E.dtype), min=1.0)
-            mean = (flat * m).sum(dim=-1, keepdim=True) / count
-            var = ((flat - mean) ** 2 * m).sum(dim=-1, keepdim=True) / count
+            count = torch.clamp(m.sum(dim=1, keepdim=True), min=1.0)
+            mean = (flat * m).sum(dim=1, keepdim=True) / count
+            var = ((flat - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
         else:
-            mean = flat.mean(dim=-1, keepdim=True)
-            var = flat.var(dim=-1, unbiased=False, keepdim=True)
+            mean = flat.mean(dim=1, keepdim=True)
+            var = flat.var(dim=1, unbiased=False, keepdim=True)
 
         std = torch.clamp(var.sqrt(), min=1e-8)
-        return ((flat - mean) / std).reshape(B, C, H, W)
+        return ((flat - mean) / std).reshape(B, H, W, C)
 
     @staticmethod
     def zscore_nodes_per_graph(X: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -1709,7 +1681,7 @@ def _task_to_meta_dict(task):
 # ============================================================
 # 4) Model zoo (same architectures, registry-aware)
 # ============================================================
-class ChunkedMatrixMLPBase(nn.Module):
+class MatrixMLPBase(nn.Module):
     """
     Base class providing GPU-chunked streaming for Matrix MLPs.
     Expects self.net to be defined by subclasses.
@@ -1748,11 +1720,9 @@ class ChunkedMatrixMLPBase(nn.Module):
 
         if x2d.size(0) == 0:
             return torch.empty((0, self.out_dim), device=dev, dtype=dtype)
-
-        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-            # x2d is already built on the device upstream, but we ensure dtype/device matching safely
-            xb = x2d.to(device=dev, dtype=dtype, non_blocking=True)
-            return self.net(xb)
+        
+        xb = x2d.to(device=dev, dtype=dtype, non_blocking=True)
+        return self.net(xb)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x2d, (B, N, _) = self._flatten_edges(x)
@@ -1764,7 +1734,7 @@ class ChunkedMatrixMLPBase(nn.Module):
             return y2d.view(B, N, N, out_dim).permute(0, 3, 1, 2)  # (B, K, N, N)
 
 
-class MatrixFeatureMLP(ChunkedMatrixMLPBase):
+class MatrixFeatureMLP(MatrixMLPBase):
     """Channels-last MLP over per-edge features."""
 
     def __init__(self, in_channels: int, hidden_dim: int = 128, num_classes: int = 1, dropout: float = 0.1):
@@ -1781,9 +1751,8 @@ class MatrixFeatureMLP(ChunkedMatrixMLPBase):
         )
 
 
-class MatrixFeatureDeepMLP(ChunkedMatrixMLPBase):
-    """Deeper MLP with the same chunked, device-safe forward as MatrixFeatureMLP."""
-
+class MatrixFeatureDeepMLP(MatrixMLPBase):
+    """Deeper MLP with the same device-safe forward as MatrixFeatureMLP."""
     def __init__(self, in_channels: int, hidden_dim: int = 256, depth: int = 4,
                  dropout: float = 0.3, num_classes: int = 1):
         super().__init__()
@@ -2170,6 +2139,7 @@ class TNNTrainConfig:
     tx_dropout: float = 0.2
     tx_token_budget: int = 1024  # Transformer token cap (≈ ceil(N/P)^2 )
     tx_token_policy: str = "keep_all"
+    tx_min_keep_ratio: float = 0.0   # used only when tx_token_policy == "auto"
     tx_use_decoder: bool = True
     tx_force_adj_channel: bool = True  # TX keeps 'adj' unless you turn this off
     tx_scheduler: str = "none"  # ["none", "cosine", "step"]
@@ -2194,6 +2164,28 @@ class TNNTrainConfig:
     #   "bacc"  → use balanced accuracy
     #   "auroc" → use AUROC (falls back to F1 if AUROC is undefined)
     select_by: Literal["f1", "bacc", "auroc"] = "f1"
+
+
+def _format_duration(seconds: float) -> str:
+    """Render an elapsed duration as '1d 13h 47m 12s', adding ms under two minutes."""
+    total_ms = int(round(float(seconds) * 1000.0))
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+    d, rem = divmod(total_s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if d or h:
+        parts.append(f"{h}h")
+    if d or h or m:
+        parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    if total_s < 120:
+        parts.append(f"{ms}ms")
+    return " ".join(parts)
 
 
 def _cuda_gc(tag: str = ""):
@@ -2336,6 +2328,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     # ------------------------------------------------------------
     # 0) Unpack loaders & basics
     # ------------------------------------------------------------
+    _t_model_start = time.monotonic()
     train_loader, val_loader, test_loader = loaders
     num_classes = int(getattr(task, "num_classes", 1))
     epochs = int(getattr(cfg, "epochs", 80))
@@ -2476,13 +2469,12 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         ).to(DEVICE)
 
     else:  # transformer
-        # Size TX for the worst-case padded N across all splits
+        # Size TX for the worst-case padded N across all splits.
+        probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
+        A_probe, _, _, _ = next(iter(probe_loader))
+        N_ref = int(A_probe.shape[-1])
         if hasattr(task, "max_nodes") and task.max_nodes is not None:
-            N_ref = int(task.max_nodes)
-        else:
-            probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
-            A_probe, _, _, _ = next(iter(probe_loader))
-            N_ref = int(A_probe.shape[-1])
+            N_ref = max(N_ref, int(task.max_nodes))
 
         budget = _get("tx_token_budget", 1024)
         use_dec = _get("tx_use_decoder", True)
@@ -2576,20 +2568,6 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         loss_sum, denom_sum = 0.0, 0
         for A, feats, L, mask in train_loader:
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(
-                    "cuda",
-                    dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                    enabled=torch.cuda.is_available(),
-            ):
-                logits = forward_logits_common(
-                    A, feats, mask,
-                    registry=registry,
-                    feature_keys=feature_keys,
-                    keep_idx=keep_idx,
-                    model_key=model_key,
-                    model=model,
-                    device=DEVICE,
-                )
 
             # Build an effective train mask on the CPU, then select supervised indices
             m_cpu = effective_mask(mask, A, registry.directed)
@@ -2599,14 +2577,50 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                 m_cpu = m_cpu & (A > 0.5)
 
             if not m_cpu.any():
-                loss, denom = None, 0
-            else:
-                idx_cpu = torch.nonzero(m_cpu, as_tuple=False)  # (E, 3): [b, i, j]
-                dev = logits.device
-                idx = idx_cpu.to(dev, non_blocking=True)
+                continue
 
-                # Binary path: BCE-with-logits (fp32), true mean per edge
-                if num_classes == 1:
+            idx_cpu = torch.nonzero(m_cpu, as_tuple=False)  # (E, 3): [b, i, j]
+
+            with torch.amp.autocast(
+                    "cuda",
+                    dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                    enabled=torch.cuda.is_available()
+            ):
+                if model_key in ("mlp", "deep_mlp"):
+                    A_dev = A.to(DEVICE, non_blocking=True)
+                    m_dev = mask.to(DEVICE, non_blocking=True)
+                    x_bchw = registry.stack_channels_BCHW(
+                        A_dev, feats, m_dev, feature_keys,
+                        include_adj=("adj" in getattr(registry, "manifest", []))
+                    )
+                    x_bchw = x_bchw[:, keep_idx, :, :]
+                    x_bchw_std = registry.standardise_bchw(x_bchw, keep_idx=keep_idx)
+
+                    b_dev = idx_cpu[:, 0].to(DEVICE, non_blocking=True)
+                    i_dev = idx_cpu[:, 1].to(DEVICE, non_blocking=True)
+                    j_dev = idx_cpu[:, 2].to(DEVICE, non_blocking=True)
+                    z_gathered = model._forward_flat(x_bchw_std[b_dev, :, i_dev, j_dev])
+                    logits = None
+                else:
+                    z_gathered = None
+                    logits = forward_logits_common(
+                        A, feats, mask,
+                        registry=registry,
+                        feature_keys=feature_keys,
+                        keep_idx=keep_idx,
+                        model_key=model_key,
+                        model=model,
+                        device=DEVICE
+                    )
+
+            dev = DEVICE if logits is None else logits.device
+            idx = idx_cpu.to(dev, non_blocking=True)
+
+            # Binary path: BCE-with-logits (fp32), true mean per edge
+            if num_classes == 1:
+                if z_gathered is not None:
+                    z_sel = z_gathered.squeeze(-1).to(torch.float32)
+                else:
                     # Normalise logits to (B, H, W)
                     if logits.dim() == 4 and logits.size(1) == 1:
                         z = logits[:, 0, :, :]
@@ -2614,23 +2628,26 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                         z = logits
                     z_sel = z[idx[:, 0], idx[:, 1], idx[:, 2]].to(torch.float32)
 
-                    y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5) \
-                        .to(dev, non_blocking=True).to(torch.float32)
+                y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5) \
+                    .to(dev, non_blocking=True).to(torch.float32)
 
-                    # Stable pos_weight computed from the batch
-                    pw = _pos_weight(y_sel)
+                # Stable pos_weight computed from the batch
+                pw = _pos_weight(y_sel)
 
-                    # Keep logits finite and bounded for stable BCE math
-                    z_sel = torch.nan_to_num(z_sel, nan=0.0, posinf=0.0, neginf=0.0).clamp(-50, 50)
+                # Keep logits finite and bounded for stable BCE math
+                z_sel = torch.nan_to_num(z_sel, nan=0.0, posinf=0.0, neginf=0.0).clamp(-50, 50)
 
-                    # Per-edge reduction=none → mean—this is the true per-edge training loss
-                    loss_elems = torch.nn.functional.binary_cross_entropy_with_logits(
-                        z_sel, y_sel, pos_weight=pw, reduction="none"
-                    )
-                    loss = loss_elems.mean()
-                    denom = int(z_sel.numel())
+                # Per-edge reduction=none → mean—this is the true per-edge training loss
+                loss_elems = torch.nn.functional.binary_cross_entropy_with_logits(
+                    z_sel, y_sel, pos_weight=pw, reduction="none"
+                )
+                loss = loss_elems.mean()
+                denom = int(z_sel.numel())
 
-                # Multi-class path: CE (fp32) over supervised positions selected by effective_mask
+            # Multi-class path: CE (fp32) over supervised positions selected by effective_mask
+            else:
+                if z_gathered is not None:
+                    z_sel = z_gathered.to(torch.float32)
                 else:
                     # Normalise logits to (B, H, W, K)
                     if logits.dim() == 4 and logits.size(1) == num_classes:
@@ -2639,13 +2656,13 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                         z = logits
                     z_sel = z[idx[:, 0], idx[:, 1], idx[:, 2], :].to(torch.float32)
 
-                    y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] \
-                        .to(dev, non_blocking=True).long()
+                y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] \
+                    .to(dev, non_blocking=True).long()
 
-                    loss = criterion(z_sel.float(), y_sel)
-                    denom = int(y_sel.numel())
+                loss = criterion(z_sel, y_sel)
+                denom = int(y_sel.numel())
 
-            if loss is None or denom == 0:
+            if denom == 0:
                 continue
 
             scaler.scale(loss).backward()
@@ -2658,7 +2675,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
             loss_sum += float(loss.detach().to("cpu")) * max(1, denom)
             denom_sum += max(1, denom)
 
-        avg = loss_sum / max(1, denom_sum)
+        avg = (loss_sum / denom_sum) if denom_sum else float("nan")
 
         # Per-epoch Val probe (now capture + print macro-F1)
         val_m = _eval_split(model_key, model, val_loader, registry, edges_only, cfg, feature_keys, keep_idx,
@@ -2710,7 +2727,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     test_m = _eval_split(
         model_key, model, test_loader, registry,
         edges_only, cfg, feature_keys, keep_idx, num_classes,
-        fixed_threshold=thr if thr is not None else None, criterion=criterion
+        fixed_threshold=thr, criterion=criterion
     )
 
     # ---------------------
@@ -2725,11 +2742,12 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         runtime=runtime,
         best_thr=thr
     )
-    
+    meta["elapsed_seconds"] = round(time.monotonic() - _t_model_start, 3)
+
     state_to_save = best_state if best_state is not None else {k: v.cpu() for k, v in model.state_dict().items()}
     ckpt_path = save_pipeline_checkpoint(model_key, state_to_save, task, cfg, meta)
 
-    return val_m, test_m, thr, ckpt_path
+    return val_m, test_m, thr, ckpt_path, meta["elapsed_seconds"]
 
 
 # ---------------------------------------------------------------------
@@ -2792,8 +2810,10 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
             b_dev = b_idx.to(DEVICE, non_blocking=True)
             i_dev = i_idx.to(DEVICE, non_blocking=True)
             j_dev = j_idx.to(DEVICE, non_blocking=True)
-            x_gathered = x_bchw_std[b_dev, :, i_dev, j_dev]  # (E, C_eff)
-            z_sel = model._forward_flat(x_gathered)           # (E, 1) or (E, K)
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
+                x_gathered = x_bchw_std[b_dev, :, i_dev, j_dev]  # (E, C_eff)
+                z_sel = model._forward_flat(x_gathered)           # (E, 1) or (E, K)
 
             if num_classes == 1:
                 z_sel = z_sel.squeeze(-1)  # (E,)
@@ -3019,6 +3039,7 @@ def run_random_forest_for_task(
 
     Supports Binary and Multiclass (inferred from task.num_classes).
     """
+    _t_model_start = time.monotonic()
     train_loader, val_loader, test_loader = loaders
     d = display_decimals
 
@@ -3098,27 +3119,61 @@ def run_random_forest_for_task(
                     continue
 
                 if num_classes > 1:
-                    for i in range(X_c.shape[0]):
-                        if seen_multi < cap:
-                            X_res[seen_multi], y_res[seen_multi] = X_c[i], y_c[i]
-                        else:
-                            j = rng.integers(0, seen_multi + 1)
-                            if j < cap:
-                                X_res[j], y_res[j] = X_c[i], y_c[i]
+                    n_fill = min(int(cap) - seen_multi, X_c.shape[0])
+                    if n_fill > 0:
+                        X_res[seen_multi:seen_multi + n_fill] = X_c[:n_fill]
+                        y_res[seen_multi:seen_multi + n_fill] = y_c[:n_fill]
+                        seen_multi += n_fill
+                    for i in range(n_fill, X_c.shape[0]):
+                        j = rng.integers(0, seen_multi + 1)
+                        if j < cap:
+                            X_res[j], y_res[j] = X_c[i], y_c[i]
                         seen_multi += 1
                 elif is_global_capped_binary:
                     y_c = (y_c > 0.5).astype(np.float32)
-                    for i in range(X_c.shape[0]):
-                        if seen_bin < cap:
-                            X_res[seen_bin], y_res[seen_bin] = X_c[i], y_c[i]
-                        else:
-                            j = rng.integers(0, seen_bin + 1)
-                            if j < cap:
-                                X_res[j], y_res[j] = X_c[i], y_c[i]
+                    n_fill = min(int(cap) - seen_bin, X_c.shape[0])
+                    if n_fill > 0:
+                        X_res[seen_bin:seen_bin + n_fill] = X_c[:n_fill]
+                        y_res[seen_bin:seen_bin + n_fill] = y_c[:n_fill]
+                        seen_bin += n_fill
+                    for i in range(n_fill, X_c.shape[0]):
+                        j = rng.integers(0, seen_bin + 1)
+                        if j < cap:
+                            X_res[j], y_res[j] = X_c[i], y_c[i]
                         seen_bin += 1
                 else:
                     y_c = (y_c > 0.5).astype(np.float32)
-                    for i in range(X_c.shape[0]):
+
+                    # Fast path while both reservoirs are still filling: no random draw is made in that phase, so
+                    # bulk copying retains the same rows in the same order and leaves the RNG stream untouched.
+                    room_pos = int(max_pos) - seen_pos
+                    room_neg = int(max_neg) - seen_neg
+                    start = 0
+                    if room_pos > 0 and room_neg > 0:
+                        pos_i = np.flatnonzero(y_c == 1.0)
+                        neg_i = np.flatnonzero(y_c != 1.0)
+
+                        # Bulk-copy only the prefix before either reservoir fills. Rows after
+                        # that must go through the replacement loop so seen_pos/seen_neg stay exact.
+                        cut = X_c.shape[0]
+                        if pos_i.size > room_pos:
+                            cut = min(cut, int(pos_i[room_pos]))
+                        if neg_i.size > room_neg:
+                            cut = min(cut, int(neg_i[room_neg]))
+
+                        n_pos = int(np.searchsorted(pos_i, cut))
+                        n_neg = int(np.searchsorted(neg_i, cut))
+                        if n_pos > 0:
+                            X_res[seen_pos:seen_pos + n_pos] = X_c[pos_i[:n_pos]]
+                            y_res[seen_pos:seen_pos + n_pos] = y_c[pos_i[:n_pos]]
+                            seen_pos += n_pos
+                        if n_neg > 0:
+                            base = int(max_pos) + seen_neg
+                            X_res[base:base + n_neg] = X_c[neg_i[:n_neg]]
+                            y_res[base:base + n_neg] = y_c[neg_i[:n_neg]]
+                            seen_neg += n_neg
+                        start = cut
+                    for i in range(start, X_c.shape[0]):
                         if (y_c[i] == 1.0):
                             if seen_pos < max_pos:
                                 X_res[seen_pos], y_res[seen_pos] = X_c[i], y_c[i]
@@ -3268,6 +3323,7 @@ def run_random_forest_for_task(
             auprc_mac = float(np.mean(aprs)) if aprs else float("nan")
 
             return None, {
+                "loss/edge": float("nan"),
                 "accuracy": acc, "BAcc_macro": bacc,
                 "F1_macro": f1_mac, "f1": f1_mac,
                 "P_macro": p_mac, "R_macro": r_mac,
@@ -3278,6 +3334,7 @@ def run_random_forest_for_task(
         pr = np.asarray(probs, dtype=np.float64)
         if pr.size == 0:
             return None, {
+                "loss/edge": float("nan"),
                 "precision": float("nan"),
                 "recall": float("nan"),
                 "f1": float("nan"),
@@ -3315,6 +3372,7 @@ def run_random_forest_for_task(
         bacc = 0.5 * (rec + (TN / max(1, TN + FP)))
 
         return (thr if fixed_thr is None else None), {
+            "loss/edge": float("nan"),
             "precision": float(prec),
             "recall": float(rec),
             "f1": float(f1),
@@ -3328,7 +3386,7 @@ def run_random_forest_for_task(
     # --- Val/Test ---
     Xv, yv = _collect_split(val_loader)
     if Xv.shape[0] == 0:
-        thr = 0.5
+        thr = 0.5 if num_classes == 1 else None
         val_m = _empty_metrics()
     else:
         pv = _predict_probas(rf, Xv, num_classes)
@@ -3379,15 +3437,17 @@ def run_random_forest_for_task(
         "threshold_metric": str(threshold_metric),
     }
 
+    meta["elapsed_seconds"] = round(time.monotonic() - _t_model_start, 3)
     ckpt_path = save_pipeline_checkpoint("rf", {"sklearn_model": rf}, task, cfg, meta)
 
-    return {"val": val_m, "test": test_m, "thr": thr, "ckpt": ckpt_path, "model": rf}
+    return {"val": val_m, "test": test_m, "thr": thr, "ckpt": ckpt_path, "model": rf,
+            "elapsed_seconds": meta["elapsed_seconds"]}
 
 
 def print_final_summary_table(
     results: Dict[str, dict],
     task,
-    header: str = "FINAL SUMMARY (Test)",
+    header: Optional[str] = None,
     order: Optional[Sequence[str]] = None,
     display_decimals: int = 4,
     display_truncate: bool = False
@@ -3397,10 +3457,6 @@ def print_final_summary_table(
     and auto-switches between binary and macro metrics. If `order` is provided,
     models are shown in that order with any extras appended.
     """
-    print("\n" + "#" * 80)
-    print(header)
-    print("#" * 80)
-
     num_classes = int(getattr(task, "num_classes", 1))
     disp_dec = int(display_decimals)
     disp_trunc = bool(display_truncate)
@@ -3456,9 +3512,31 @@ def print_final_summary_table(
                 seen.add(k)
         keys = ordered
 
+    def _has_data(d) -> bool:
+        if not d:
+            return False
+        try:
+            return not math.isnan(float(d.get("accuracy", float("nan"))))
+        except Exception:
+            return False
+
+    use_test = any(_has_data(results.get(mk, {}).get("test")) for mk in keys)
+    use_val = (not use_test) and any(_has_data(results.get(mk, {}).get("val")) for mk in keys)
+
+    print("\n" + "#" * 80)
+    if not use_test and not use_val:
+        print("FINAL SUMMARY — no evaluation data in any split; nothing to report.")
+        print("#" * 80)
+        return
+
+    split_name = "Test" if use_test else "Val"
+    print(header if header is not None else f"FINAL SUMMARY ({split_name})")
+    print("#" * 80)
+
     for mk in keys:
         dct = results.get(mk, {})
-        v, t, thr = dct.get("val", {}), dct.get("test", {}), dct.get("thr", None)
+        thr = dct.get("thr", None)
+        t = dct.get("test", {}) if use_test else dct.get("val", {})
 
         has_macro = any(k in t for k in MAC_KEYS)
         has_binary = any(k in t for k in BIN_KEYS)
@@ -3478,7 +3556,7 @@ def print_final_summary_table(
 
             print(
                 f"[{mk.upper()}] thr={thr_s} | "
-                f"Test: F1={_fmt(f1)}  "
+                f"{split_name}: F1={_fmt(f1)}  "
                 f"AUPRC={_fmt(auprc)} [AUROC={_fmt(auroc)}]  "
                 f"Acc={acc_with_optional_bacc(acc, bacc)}  "
                 f"P={_fmt(prec)}  R={_fmt(rec)}  "
@@ -3493,7 +3571,7 @@ def print_final_summary_table(
             bacc_m = _get(t, ["BAcc_macro", "bacc_macro"])
 
             print(
-                f"[{mk.upper()}] Test: F1_macro={_fmt(f1_mac)}  "
+                f"[{mk.upper()}] {split_name}: F1_macro={_fmt(f1_mac)}  "
                 f"AUPRC_macro={_fmt(auprc_m)} [AUC_macro={_fmt(auc_mac)}]  "
                 f"Acc={acc_with_optional_bacc(acc, bacc_m)}  "
                 f"P_macro={_fmt(p_mac)}  R_macro={_fmt(r_mac)}  "
@@ -3517,7 +3595,7 @@ def _preferred_model_order() -> Sequence[str]:
     )
 
 
-def finalise_summary(results: Dict[str, Any], task, header: str = "FINAL SUMMARY (Val → Test)",
+def finalise_summary(results: Dict[str, Any], task, header: Optional[str] = None,
                      display_decimals: int = 4, display_truncate: bool = False) -> None:
     """
     Print a single consolidated summary for a (possibly merged) results mapping.
@@ -3550,7 +3628,7 @@ def _reset_pipeline_runtime_state(task=None) -> None:
     FeatureRegistry._warned_pad_features.clear()
 
     if task is not None:
-        for attr in ("_active_run_loaders", "_active_run_loader_sig", "_active_run_dataset"):
+        for attr in ("_active_run_loaders", "_active_run_loader_sig", "_active_run_dataset", "_latest_results"):
             if hasattr(task, attr):
                 delattr(task, attr)
 
@@ -3658,13 +3736,23 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
         eff_in_ch=None,
     )
 
+    seen_models = set()
+    deduped_models = []
     for mk in models:
+        if mk in seen_models:
+            print(f"[TNN PIPELINE MODEL SELECTION] Duplicate model key {mk!r} ignored.", flush=True)
+            continue
+        seen_models.add(mk)
+        deduped_models.append(mk)
+
+    for mk in deduped_models:
         print("\n" + "=" * 80)
         print(f"Running model: {mk.upper()}")
         print("=" * 80)
+        _model_elapsed = None
 
         if mk in ("mlp", "deep_mlp", "cnn", "transformer"):
-            val_m, test_m, thr, ckpt = train_and_eval_one_model(
+            val_m, test_m, thr, ckpt, elapsed = train_and_eval_one_model(
                 task=task,
                 registry=registry,
                 loaders=(train_loader, val_loader, test_loader),
@@ -3674,6 +3762,7 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
             )
             entry = dict(val=val_m, test=test_m, thr=thr, ckpt=ckpt)
             results[mk] = entry
+            _model_elapsed = elapsed
 
         elif mk == "rf":
             edges_only = bool(getattr(task, "eval_on_existing_edges_only", False))
@@ -3692,13 +3781,16 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
                         thr=rf_out.get("thr"), ckpt=rf_out.get("ckpt"),
                         model=rf_out.get("model"))
             results[mk] = entry
+            _model_elapsed = rf_out.get("elapsed_seconds")
 
         elif mk in ("sage", "gcn", "gin", "edge_tx", "gps"):
-            raise ValueError(
-                f"[TNN PIPELINE MODEL SELECTION] GNN model key {mk!r} is not supported by run_pipeline_for_task. "
-                f"Use run_gnn_suite(..., encoders=[...]) or "
-                f"run_gnn_edges_suite(..., encoders=[...]) instead."
+            print(
+                f"[TNN PIPELINE MODEL SELECTION] GNN model key {mk!r} is not supported by run_pipeline_for_task "
+                f"and will be skipped. Use run_gnn_suite(..., encoders=[...]) or "
+                f"run_gnn_edges_suite(..., encoders=[...]) instead.",
+                flush=True
             )
+            continue
         else:
             raise ValueError(
                 f"Unknown model key: {mk}. "
@@ -3706,6 +3798,8 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
             )
 
         _cuda_gc(f"after-{mk.lower()}")
+        if _model_elapsed is not None:
+            print(f"[TIME] Training total: {_format_duration(_model_elapsed)}")
 
     # Construct the metadata bundle
     meta = {
