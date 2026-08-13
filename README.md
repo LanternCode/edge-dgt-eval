@@ -424,6 +424,7 @@ Notes:
 - `gnn_zero_supervised` controls adjacency redaction uniformly across GNN encoders; GPS derives its model-owned structural processing from that same model-visible adjacency.
 - `neg_pos_ratio` controls negative-to-positive sampling ratio for binary GNN training. `None` (default) disables ratio-based sampling and uses `pos_weight` instead.
 - `use_tree_aux_loss=True` adds an auxiliary penalty pulling the expected number of predicted edges toward `N-1`. It does not detect cycles or enforce connectivity. Only meaningful for spanning-tree tasks. Automatically disabled in Scalable Mode.
+- Summary display formatting is set on the runner call itself, e.g. `run_gnn_suite(..., display_decimals=6, display_truncate=True)`.
 
 ---
 
@@ -533,6 +534,8 @@ Non-square 2D inputs are treated as node features when no explicit custom type i
 |-------|-----------|
 | `"powers"` | `power_2`, `power_3`, `power_4`, `power_5` |
 | `"endpoint_degree"` | `deg_row`, `deg_col` |
+
+`twohop` is a 1D node feature counting unique nodes at exactly graph distance 2 (excluding the source and its direct neighbours; outward reachability when directed). `power_2` is the distinct pairwise length-2 walk count.
 
 `"degree"` is the actual 1D node-degree feature (row/out-degree under the directed row-wise convention). Use `"endpoint_degree"` (or explicit `deg_row`, `deg_col`) for the pairwise endpoint-degree channels.
 

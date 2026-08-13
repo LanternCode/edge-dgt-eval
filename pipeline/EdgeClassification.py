@@ -405,8 +405,8 @@ class FeatureRegistry:
       - In the dense/image-style path, `deg_row`, `deg_col`, and `deg_diff` are canonical 
         adjacency-derived pairwise channels. `deg_diff` explicitly provides the absolute difference 
         (|row - col|) as a non-linear inductive bias to aid structural symmetry detection.
-      - `twohop` (A^2) provides the exact count of length-2 paths between nodes and is supported
-        in the dense/image-style path and the full-matrix GNN path.
+      - `twohop` is a 1D node feature: the number of unique nodes at exactly graph distance 2,
+        excluding the source and its direct neighbours. Directed graphs use outward reachability.
 
     Policies:
         supervised_redaction_policy:
@@ -537,9 +537,9 @@ class FeatureRegistry:
                     shortest_path_from_adj(A_base[b], is_directed=self.directed)
                     for b in range(B)
                 ], dim=0).to(dtype)
-            elif k.startswith("power_") or k == "twohop":
+            elif k.startswith("power_"):
                 try:
-                    p = 2 if k == "twohop" else int(k.split("_", 1)[1])
+                    p = int(k.split("_", 1)[1])
                 except Exception:
                     p = 2
                 if p not in _power_memo:
@@ -552,7 +552,7 @@ class FeatureRegistry:
                 ordered_feat_parts.append(_pw_cache_batch[k].to(dtype).unsqueeze(1))
                 continue
 
-            if k == "transpose" or k == "shortest_path" or k.startswith("power_") or k == "twohop":
+            if k == "transpose" or k == "shortest_path" or k.startswith("power_"):
                 ordered_feat_parts.append(_mat_cache_batch[k].unsqueeze(1))
                 continue
 
@@ -732,7 +732,7 @@ class FeatureRegistry:
             names.append("mask")
             channel_sources["mask"] = "mask"
 
-        canonical_1d_keys = {"degree", "triangles", "clustering_coeff"}
+        canonical_1d_keys = {"degree", "triangles", "clustering_coeff", "twohop"}
         for k in keys:
             explicit_type = self.custom_feature_types.get(k)
             emitted_names = (
@@ -1488,7 +1488,7 @@ def _augment_with_canonical_features(ds_like, bench, hooks, directed):
 
     probe_feats = next((c for c in probe if isinstance(c, dict)), None)
     present = set(probe_feats.keys()) if probe_feats is not None else set()
-    missing = [k for k in requested if k not in present]
+    missing = [k for k in requested if k not in present and k != "shortest_path"]
 
     if not missing:
         return ds_like
@@ -1683,8 +1683,7 @@ def _task_to_meta_dict(task):
 # ============================================================
 class MatrixMLPBase(nn.Module):
     """
-    Base class providing GPU-chunked streaming for Matrix MLPs.
-    Expects self.net to be defined by subclasses.
+    Base class for per-edge Matrix MLPs. Expects self.net to be defined by subclasses.
 
     Each edge position is scored independently — there is no spatial coupling between
     (i, j) pairs. As a consequence, running the MLP on any subset of rows produces
@@ -2935,9 +2934,10 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
         prec = tp / max(1, tp + fp)
         rec = tp / max(1, tp + fn)
         f1 = (2 * prec * rec / max(1e-12, (prec + rec))) if (prec + rec) > 0 else 0.0
-
         tnr = tn / max(1, tn + fp)  # specificity/TNR
-        bacc = 0.5 * (rec + tnr)
+
+        # BAcc averages TPR and TNR; one is undefined when a class is absent
+        bacc = 0.5 * (rec + tnr) if ((y_all == 1).any() and (y_all == 0).any()) else float("nan")
         auroc = float("nan")
         auprc = float("nan")
 
@@ -3053,12 +3053,6 @@ def run_random_forest_for_task(
 
     # 1) Inherit safely resolved keys from the parent pipeline
     rf_keys = list(feature_keys)
-    seen = set(rf_keys)
-
-    # 2) RF doesn't take raw 'adj' as a key, strip it if the parent passed it
-    if "adj" in seen:
-        rf_keys.remove("adj")
-        seen.remove("adj")
 
     # Prevent RF from inheriting a stale mask channel requirement
     registry.use_mask_channel = False
@@ -3071,7 +3065,7 @@ def run_random_forest_for_task(
         include_adj=bool(allow_adj_channel)
     )
 
-    # 'adj' is always present in registry.manifest. This gate excludes it from RF inputs when allow_adj_channel=False
+    # Gate the fitted manifest down to RF's input channels
     drop = {"mask"} | (set() if allow_adj_channel else {"adj"})
     manifest = getattr(registry, "manifest", [])
     keep_idx = [i for i, n in enumerate(manifest) if n not in drop]
@@ -3206,8 +3200,11 @@ def run_random_forest_for_task(
             return X_res[:valid], y_res[:valid]
         
         valid_pos = min(seen_pos, int(max_pos))
-        effective_pos = max(1, valid_pos)
-        target_neg = max(1, int(effective_pos * rf_neg_pos_ratio)) if rf_neg_pos_ratio > 0 else int(max_neg)
+        if rf_neg_pos_ratio > 0 and valid_pos > 0:
+            target_neg = max(1, int(valid_pos * rf_neg_pos_ratio))
+        else:
+            # No positives to balance against: keep the available negatives up to the cap
+            target_neg = int(max_neg)
         valid_neg = min(seen_neg, int(max_neg), target_neg)
         
         X_final = np.concatenate([X_res[:valid_pos], X_res[int(max_pos):int(max_pos) + valid_neg]], axis=0)
@@ -3369,7 +3366,9 @@ def run_random_forest_for_task(
         rec = TP / max(1, TP + FN)
         f1 = (2.0 * prec * rec / max(1e-12, prec + rec)) if (prec + rec) > 0 else 0.0
         acc = (TP + TN) / max(1, TP + TN + FP + FN)
-        bacc = 0.5 * (rec + (TN / max(1, TN + FP)))
+
+        # BAcc averages TPR and TNR; one is undefined when a class is absent
+        bacc = 0.5 * (rec + (TN / max(1, TN + FP))) if (has_pos and has_neg) else float("nan")
 
         return (thr if fixed_thr is None else None), {
             "loss/edge": float("nan"),

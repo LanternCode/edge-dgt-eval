@@ -73,16 +73,8 @@ def pairwise_batch_from_adj(A_batch: Tensor, keys: Sequence[str], *, is_directed
     if "deg_diff" in keys:
         results["deg_diff"] = (row_deg.view(B, N, 1) - col_deg.view(B, 1, N)).abs()
         
-    if "twohop" in keys:
-        # A^2 yields the exact number of 2-hop paths from i to j
-        results["twohop"] = A01 @ A01
-
     if any(k in keys for k in ("cn", "jaccard")):
-        # Directed cn and twohop are the same product
-        if is_directed and "twohop" in results:
-            cn = results["twohop"].clone()
-        else:
-            cn = (A01 @ A01) if is_directed else (A01 @ A01.transpose(-1, -2))
+        cn = (A01 @ A01) if is_directed else (A01 @ A01.transpose(-1, -2))
         cn.diagonal(dim1=-2, dim2=-1).fill_(0.0)
         
         if "cn" in keys:

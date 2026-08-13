@@ -72,8 +72,7 @@ class GraphBenchmark:
     # ------------------------------------------------------------------ #
     def generate_graph(self, graph_type: str, num_nodes: int, directed: bool = False, rng=random) -> nx.Graph:
         """
-        Generates a base topology for a given graph family, dynamically scaling parameters
-        to target an average degree of ~3.5 to ensure a consistent baseline across node counts.
+        Generates a base topology for a given graph family.
 
         1. erdos_renyi:
         - Base: Probability dynamically scaled as p = 3.5 / N.
@@ -650,12 +649,21 @@ class GraphBenchmark:
                 with np.errstate(divide='ignore', invalid='ignore'):
                     feats['clustering_coeff'] = np.where(possible > 0, tri / possible, 0.0)
 
+        # Unique nodes at exactly distance 2. Outward reachability when directed.
+        if 'twohop' in feature_list:
+            A01 = (adj > 0).astype(np.float32)
+            two = (A01 @ A01) > 0
+            # Exclude the source and direct neighbours
+            np.fill_diagonal(two, False)
+            two &= ~(A01 > 0)
+            feats['twohop'] = two.sum(axis=1).astype(np.float32)  # 1D node-wise
+
         # Pairwise link-prediction features (all 2D)
         want_pairwise = any(
-            k in feature_list for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col', 'twohop')
+            k in feature_list for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col')
         )
         if want_pairwise:
-            pairwise_keys = [k for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col', 'twohop') if k in feature_list]
+            pairwise_keys = [k for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col') if k in feature_list]
             if pairwise_keys:
                 A_t = torch.as_tensor(adj, dtype=torch.float32)
                 batch = pairwise_batch_from_adj(A_t, pairwise_keys, is_directed=directed)

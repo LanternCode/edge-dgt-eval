@@ -1138,6 +1138,12 @@ def _prepare_features_batch(
     node_mask_batch = torch.zeros((B, N), dtype=torch.bool, device=dev)
     seq_idx = torch.arange(N, device=dev)
     mask_bool = mask.to(device=dev, dtype=torch.bool)
+    if not is_directed:
+        # effective_mask() treats (i, j) and (j, i) as one supervised pair, so masks differing
+        # only in orientation must yield identical edge features and z-score statistics.
+        # The decoder also reads E[j, i] for its reverse term.
+        mask_bool = mask_bool | mask_bool.transpose(1, 2)
+
     for b in range(B):
         fdict = feats[b]
         edge_mask_b = mask_bool[b]
@@ -1600,10 +1606,6 @@ class GNNTrainConfig:
     # Saving
     save_dir: Optional[str] = "saved_checkpoints"  # None to skip saving
 
-    # Display / summary formatting
-    display_decimals: int = 4
-    display_truncate: bool = False
-
 
 def _supervised_indices(
     mask: torch.Tensor, A: torch.Tensor, is_directed: bool, edges_only: bool
@@ -1623,7 +1625,11 @@ def _balance_binary_negpos(y_sel: torch.Tensor, ratio: float) -> torch.Tensor:
     pos_idx = torch.nonzero(y_sel > 0.5, as_tuple=False).squeeze(-1)
     neg_idx = torch.nonzero(y_sel <= 0.5, as_tuple=False).squeeze(-1)
 
-    target_neg = int(max(1, pos_idx.numel()) * ratio)
+    # One-class batch: nothing to balance against, so keep everything
+    if pos_idx.numel() == 0 or neg_idx.numel() == 0:
+        return torch.cat([pos_idx, neg_idx])
+
+    target_neg = int(pos_idx.numel() * ratio)
 
     if target_neg < neg_idx.numel():
         perm = torch.randperm(neg_idx.numel(), device=y_sel.device)[:target_neg]
@@ -1900,7 +1906,10 @@ def _gnn_eval_split(
         prec = TP / max(1, TP + FP)
         rec = TP / max(1, TP + FN)
         f1 = (2.0 * prec * rec / max(1e-12, prec + rec)) if (prec + rec) > 0 else 0.0
-        bacc = 0.5 * (rec + (TN / max(1, TN + FP)))
+
+        # BAcc averages TPR and TNR; one is undefined when a class is absent
+        _both = bool(np.any(y_i == 1)) and bool(np.any(y_i == 0))
+        bacc = 0.5 * (rec + (TN / max(1, TN + FP))) if _both else float("nan")
 
         metrics.update({"accuracy": float(acc), "precision": float(prec), "recall": float(rec), "f1": float(f1), "bacc": float(bacc)})
 
@@ -2165,11 +2174,7 @@ def train_one_gnn_edges(
     is_directed = bool(getattr(task, "directed", False))
     edges_only = bool(getattr(task, "eval_on_existing_edges_only", False))
     num_classes = int(getattr(task, "num_classes", 1))
-
-    # pairwise_on_demand requires single-graph batches on this runner
-    if int(getattr(cfg, "batch_size", 16)) != 1:
-        print("[WARN] train_one_gnn_edges operates exclusively in on-demand mode and requires batch_size=1; forcing batch_size=1 locally.", flush=True)
-        cfg.batch_size = 1
+    cfg.batch_size = 1
 
     train_loader, val_loader, test_loader = loaders
     probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
@@ -2409,8 +2414,8 @@ def run_gnn_suite(
     """
     canon = _canonicalise_encoders(encoders)
     cfg = _coerce_train_cfg(cfg)
-    cfg.display_decimals = int(getattr(cfg, "display_decimals", display_decimals))
-    cfg.display_truncate = bool(getattr(cfg, "display_truncate", display_truncate))
+    cfg.display_decimals = int(display_decimals)
+    cfg.display_truncate = bool(display_truncate)
 
     install_boundary_hooks()
     base_bundle = begin_or_attach_run(
@@ -2460,7 +2465,7 @@ def run_gnn_suite(
             "raw": out,
         }
         results_target[enc] = entry
-        _elapsed = out.get("raw", {}).get("elapsed_seconds")
+        _elapsed = out.get("elapsed_seconds")
         if _elapsed is not None:
             print(f"[TIME] Training total: {_format_duration(_elapsed)}")
 
@@ -2510,8 +2515,8 @@ def run_gnn_edges_suite(
     """
     canon = _canonicalise_encoders(encoders)
     cfg = _coerce_train_cfg(cfg)
-    cfg.display_decimals = int(getattr(cfg, "display_decimals", display_decimals))
-    cfg.display_truncate = bool(getattr(cfg, "display_truncate", display_truncate))
+    cfg.display_decimals = int(display_decimals)
+    cfg.display_truncate = bool(display_truncate)
 
     install_boundary_hooks()
     base_bundle = begin_or_attach_run(
@@ -2540,6 +2545,10 @@ def run_gnn_edges_suite(
             directed=task.directed
         )
 
+    if int(getattr(cfg, "batch_size", 16)) != 1:
+        print("[WARN] Scalable Mode processes one graph at a time; the configured batch_size is ignored.", flush=True)
+    cfg.batch_size = 1
+
     shared_loaders = _resolve_loaders(task, cfg, batch_size=1)
     shared_feature_schema = _infer_feature_schema(
         list(shared_loaders), custom_types=custom_types
@@ -2564,7 +2573,7 @@ def run_gnn_edges_suite(
         }
 
         results_target[enc] = entry
-        _elapsed = out.get("raw", {}).get("elapsed_seconds")
+        _elapsed = out.get("elapsed_seconds")
         if _elapsed is not None:
             print(f"[TIME] Training total: {_format_duration(_elapsed)}")
 
@@ -2643,10 +2652,10 @@ def _infer_feature_schema(
 
     # Targeted scan: shrinking set, exhaustive across all loaders.
     # Untargeted scan: cap total batches to avoid full dataset traversal.
-    seeking = set(requested) - {"adj"} if requested is not None else None
+    seeking = set(requested) - {"adj", "shortest_path"} if requested is not None else None
 
-    # Keep the caller's ordering; set iteration order varies per process under Python's randomised string hashing.
-    requested_order = [] if requested_keys is None else [k for k in requested_keys if k != "adj"]
+    # Keep the caller's ordering. Set iteration order varies per process under Python's randomised string hashing
+    requested_order = [] if requested_keys is None else [k for k in requested_keys if k not in ("adj", "shortest_path")]
     total_batches = 0
 
     def _classify_and_register(k: str, t: torch.Tensor, N_unpadded: int):
@@ -2735,10 +2744,9 @@ def _infer_feature_schema(
             if seeking is None and total_batches >= max_batches:
                 done = True
 
-    if seeking is not None and "shortest_path" in seeking:
+    if requested is not None and "shortest_path" in requested:
         seen_edges.add("shortest_path")
         edge_keys.append("shortest_path")
-        seeking.discard("shortest_path")
 
     # Warn about requested features absent from all loaders.
     # Unlike the dense pipeline (which zero-fills missing channels at a known shape),
