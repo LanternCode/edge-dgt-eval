@@ -23,7 +23,7 @@ class GraphBenchmark:
     Public methods we rely on:
     - generate_graph(graph_type, num_nodes, directed=False)
     - extract_features(adj, feature_set)
-    - sample_specs(num_graphs, min_nodes, max_nodes, graph_types=None)
+    - sample_specs(num_graphs, min_nodes, max_nodes)
     - generate_dataset(specs, hooks, prepackage=True, directed=False, seed=None)
     - make_loaders(dataset, batch_size, ratios=(0.7, 0.2, 0.1), collate_fn=None, seed=None, pin_memory=None)
 
@@ -32,7 +32,7 @@ class GraphBenchmark:
     (b) preserve pre-divided train/val/test sample collections.
 
     New minimal helpers (single responsibility):
-      - sample_specs(num_graphs, min_nodes, max_nodes, graph_types)
+      - sample_specs(num_graphs, min_nodes, max_nodes)
       - generate_dataset(specs, hooks, prepackage=True)  # task-agnostic
       - make_loaders(dataset, batch_size, ratios=(...), collate_fn=None)
     """
@@ -352,12 +352,10 @@ class GraphBenchmark:
         self,
         num_graphs: int,
         min_nodes: int,
-        max_nodes: int,
-        graph_types: Optional[List[str]] = None,
+        max_nodes: int
     ) -> List[Tuple[str, int]]:
-        gtypes = graph_types or self.graph_types
         sizes = np.random.randint(min_nodes, max_nodes + 1, size=num_graphs)
-        return [(random.choice(gtypes), int(N)) for N in sizes]
+        return [(random.choice(self.graph_types), int(N)) for N in sizes]
 
     def generate_dataset(
         self,

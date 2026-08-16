@@ -121,6 +121,7 @@ from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Callable, Union, Sequence, ClassVar, FrozenSet, Set, Literal, Any
 from torch.utils.data import DataLoader, Dataset
 from sklearn.ensemble import RandomForestClassifier
+from functools import partial
 from sklearn.metrics import (
     accuracy_score, roc_auc_score, average_precision_score, precision_score, recall_score,
     f1_score, balanced_accuracy_score, roc_curve, precision_recall_curve
@@ -145,7 +146,7 @@ def seed_everything(seed: int):
 # ============================================================
 # 1) Collate, masks, stacking, channel statistics
 # ============================================================
-def collate_fn_pad(batch):
+def collate_fn_pad(batch, *, num_classes: int = 1):
     """
     Collates a batch of graph samples into padded dense tensors.
 
@@ -233,6 +234,13 @@ def collate_fn_pad(batch):
         elif L.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
             L = L.float()
 
+        if num_classes > 1:
+            valid = torch.isfinite(L) & (L == L.round()) & (L >= 0) & (L < num_classes)
+            if not bool(valid.all()):
+                raise ValueError(
+                    f"[INVALID MULTICLASS LABEL] Multiclass labels must be integer class IDs in [0, {num_classes - 1}]."
+                )
+
         # Standardise evaluation mask
         if M is None:
             M = torch.ones((N, N), dtype=torch.bool)
@@ -293,6 +301,9 @@ def effective_mask(
 
     if m.dim() == 2:
         m = m.unsqueeze(0)
+
+    if not directed and not torch.equal(m, m.transpose(-1, -2)):
+        raise ValueError("[INVALID MASK] Undirected task masks must be symmetric.")
 
     if A_bool.dim() == 2:
         A_bool = A_bool.unsqueeze(0)
@@ -521,13 +532,20 @@ class FeatureRegistry:
         A_base = adj
 
         # Pre-compute pairwise features for the full 3D batch
+        _has_power = any(k.startswith("power_") for k in feature_keys)
         _pw_keys = [k for k in feature_keys if k in FeatureRegistry.DERIVABLE_FROM_ADJ]
+        if _has_power and "jaccard" in _pw_keys and "cn" not in _pw_keys:
+            _pw_keys.append("cn")
         _pw_cache_batch = pairwise_batch_from_adj(A_base, _pw_keys, is_directed=self.directed) if _pw_keys else {}
 
         # Pre-compute batched matrix transforms of adjacency
         _mat_cache_batch = {}
         _power_memo = {}
-        ordered_feat_parts: List[torch.Tensor] = []
+        if _has_power and "cn" in _pw_cache_batch and (
+            self.directed or torch.equal(A_base, A_base.transpose(-1, -2))
+        ):
+            _power_memo[2] = _pw_cache_batch["cn"].to(dtype)
+        
         for k in feature_keys:
             if k == "transpose":
                 _mat_cache_batch[k] = A_base.transpose(1, 2).contiguous()
@@ -561,6 +579,7 @@ class FeatureRegistry:
                 _mat_cache_batch[k] = _power_memo[p]
 
         # [2..] feature channels
+        ordered_feat_parts: List[torch.Tensor] = []
         for k in feature_keys:
             if k in FeatureRegistry.DERIVABLE_FROM_ADJ:
                 ordered_feat_parts.append(_pw_cache_batch[k].to(dtype).unsqueeze(1))
@@ -928,8 +947,7 @@ class ProvidedSplitsTask(TaskSpec):
         directed: Whether evaluation is over full matrix (directed) or upper-triangle (undirected).
         hooks: TaskHooks
             - label_fn is optional (None yields all-zero labels), feature_set controls canonical/custom features, and allow_adj_channel gates 'adj' as input.
-        graph_types: Optional list passed to GraphBenchmark.sample_specs.
-        num_graphs: How many graphs to sample; passed through to GraphBenchmark.
+        num_graphs: How many graphs to sample. Passed through to GraphBenchmark.
         min_nodes / max_nodes: Node count bounds for sampling.
         ratios: Train/val/test fractions for GraphBenchmark.make_loaders.
             Zero-sized splits are allowed. Splits are formed via integer cut points,
@@ -943,7 +961,6 @@ class ProvidedSplitsTask(TaskSpec):
         name: str,
         directed: bool,
         hooks: TaskHooks,
-        graph_types: Optional[List[str]] = None,
         num_graphs: int = 400,
         min_nodes: int = 6,
         max_nodes: int = 140,
@@ -958,7 +975,6 @@ class ProvidedSplitsTask(TaskSpec):
         seed: Optional[int] = None
     ):
         self.hooks = hooks
-        self.graph_types = graph_types
         self.num_graphs = num_graphs
         self.min_nodes = min_nodes
         self.max_nodes = max_nodes
@@ -998,16 +1014,14 @@ class ProvidedSplitsTask(TaskSpec):
         """
         bench = self._bench_instance
         if bench is None:
-            bench = GraphBenchmark(
-                show_progress=bool(getattr(self, "show_progress", False)),
-                graph_types=self.graph_types
-            )
+            bench = GraphBenchmark(show_progress=bool(getattr(self, "show_progress", False)))
             self._bench_instance = bench
             self._owns_bench_instance = True
 
         bs = int(batch_size if batch_size is not None else getattr(self, "batch_size", 16))
         nw = getattr(self, "num_workers", 0)
         pin = _resolve_loader_pin_memory(self)
+        collate = partial(collate_fn_pad, num_classes=self.num_classes)
 
         # Validate and cache mask policy before any dataset access
         _cached_mask_policy = str(self.mask_policy).lower() if self.mask_policy else ""
@@ -1109,7 +1123,7 @@ class ProvidedSplitsTask(TaskSpec):
                 batch_size=bs,
                 shuffle=effective_shuffle,
                 num_workers=nw,
-                collate_fn=collate_fn_pad,
+                collate_fn=collate,
                 pin_memory=pin
             )
 
@@ -1170,8 +1184,7 @@ class ProvidedSplitsTask(TaskSpec):
             specs = bench.sample_specs(
                 num_graphs=self.num_graphs,
                 min_nodes=self.min_nodes,
-                max_nodes=self.max_nodes,
-                graph_types=self.graph_types
+                max_nodes=self.max_nodes
             )
 
             # Normalise feature_set so the synthetic path matches the single-graph/provided-splits path.
@@ -1197,7 +1210,7 @@ class ProvidedSplitsTask(TaskSpec):
             dataset=ds,
             batch_size=bs,
             ratios=self.ratios,
-            collate_fn=collate_fn_pad,
+            collate_fn=collate,
             seed=self.seed,
             pin_memory=pin,
             num_workers=nw
@@ -1445,9 +1458,10 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
     test_ds  = _SingleGraphDataset(A, feats_t, L, splits["test"])
 
     pin = _resolve_loader_pin_memory(task_obj)
-    train_loader = DataLoader(train_ds, batch_size, shuffle=False, num_workers=nw, collate_fn=collate_fn_pad, pin_memory=pin)
-    val_loader   = DataLoader(val_ds,   batch_size, shuffle=False, num_workers=nw, collate_fn=collate_fn_pad, pin_memory=pin)
-    test_loader  = DataLoader(test_ds,  batch_size, shuffle=False, num_workers=nw, collate_fn=collate_fn_pad, pin_memory=pin)
+    collate = partial(collate_fn_pad, num_classes=int(getattr(task_obj, "num_classes", 1)))
+    train_loader = DataLoader(train_ds, batch_size, shuffle=False, num_workers=nw, collate_fn=collate, pin_memory=pin)
+    val_loader   = DataLoader(val_ds,   batch_size, shuffle=False, num_workers=nw, collate_fn=collate, pin_memory=pin)
+    test_loader  = DataLoader(test_ds,  batch_size, shuffle=False, num_workers=nw, collate_fn=collate, pin_memory=pin)
     return train_loader, val_loader, test_loader
 
 
@@ -1666,7 +1680,7 @@ def _task_to_meta_dict(task):
     # Shallow pick of common fields from SimpleNamespace-like tasks
     keys = (
         "name", "directed", "eval_on_existing_edges_only",
-        "graph_types", "num_graphs", "min_nodes", "max_nodes", "ratios"
+        "num_graphs", "min_nodes", "max_nodes", "ratios"
     )
     meta = {k: getattr(task, k) for k in keys if hasattr(task, k)}
 
@@ -2141,6 +2155,7 @@ class TNNTrainConfig:
     tx_min_keep_ratio: float = 0.0   # used only when tx_token_policy == "auto"
     tx_use_decoder: bool = True
     tx_force_adj_channel: bool = True  # TX keeps 'adj' unless you turn this off
+    tx_patch_overlap: bool = False
     tx_scheduler: str = "none"  # ["none", "cosine", "step"]
 
     # RandomForest-specific
@@ -2476,9 +2491,9 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         n_layers = _get("tx_layers", 6)
         n_heads = _get("tx_heads", 6)
         dropout = _get("tx_dropout", 0.10)
+        patch_overlap = bool(_get("tx_patch_overlap", False))
         token_pol = _get("tx_token_policy", "keep_all")
         min_keep = _get("tx_min_keep_ratio", 0.0)
-
         CANDIDATES = (2, 4, 8, 16, 24, 32, 48, 64)
 
         def tokens_for(N: int, P: int, S: int) -> int:
@@ -2486,27 +2501,22 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
             Sr = (H_pad - P) // S + 1
             return Sr * Sr
 
-        # Choose smallest P (and possibly S<P) that fits the budget for N_ref
+        # Choose the smallest patch whose configured stride policy fits the sizing budget
         chosen = None
         for P in CANDIDATES:
-            L0 = tokens_for(N_ref, P, P)
-            if L0 <= budget:
-                chosen = (P, P, L0)
+            S = max(1, P // 2) if patch_overlap else P
+            L = tokens_for(N_ref, P, S)
+            if L <= budget:
+                chosen = (P, S, L)
                 break
 
-            S = max(1, P // 2)
-            L1 = tokens_for(N_ref, P, S)
-            if L1 <= budget:
-                chosen = (P, S, L1)
-                break
-
-        # fallback: pick the largest available patch to minimiSe tokens
-        if chosen is None:  
+        # Fallback: use the largest patch with the configured stride policy
+        if chosen is None:
             P_max = max(CANDIDATES)
-            chosen = (P_max, P_max, tokens_for(N_ref, P_max, P_max))
+            S_max = max(1, P_max // 2) if patch_overlap else P_max
+            chosen = (P_max, S_max, tokens_for(N_ref, P_max, S_max))
 
         P_adapt, S_effective, L_est = chosen
-
         model = PatchTransformer(
             in_channels=eff_in_ch,
             d_model=d_model,
@@ -2519,7 +2529,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
             max_tokens=budget,
             use_decoder=use_dec,
             token_policy=token_pol,
-            min_keep_ratio=min_keep,
+            min_keep_ratio=min_keep
         ).to(DEVICE)
 
         print(f"[TX] N≈{N_ref}, patch={P_adapt}, stride={S_effective}, tokens≈{L_est}, "
@@ -2962,24 +2972,19 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
         pred = prob.argmax(axis=1)
 
         # Metrics
-        valid_mask = (y_all >= 0) & (y_all < K)
-        valid_y = y_all[valid_mask]
-        valid_pred = pred[valid_mask]
-
-        acc = float(accuracy_score(valid_y, valid_pred)) if valid_y.size else float("nan")
-        P_macro = float(precision_score(valid_y, valid_pred, average="macro", zero_division=0))
-        R_macro = float(recall_score(valid_y, valid_pred, average="macro", zero_division=0))
-        F1_macro = float(f1_score(valid_y, valid_pred, average="macro", zero_division=0))
+        acc = float(accuracy_score(y_all, pred)) if y_all.size else float("nan")
+        P_macro = float(precision_score(y_all, pred, average="macro", zero_division=0))
+        R_macro = float(recall_score(y_all, pred, average="macro", zero_division=0))
+        F1_macro = float(f1_score(y_all, pred, average="macro", zero_division=0))
 
         # Balanced accuracy = macro-average recall; guard degenerate splits
-        if len(np.unique(valid_y)) >= 2:
-            BAcc_macro = float(balanced_accuracy_score(valid_y, valid_pred))
+        if len(np.unique(y_all)) >= 2:
+            BAcc_macro = float(balanced_accuracy_score(y_all, pred))
         else:
             BAcc_macro = float("nan")
 
         AUC_macro = float("nan")
         AUPRC_macro = float("nan")
-
         aucs, aprs = [], []
         for k in range(K):
             y_bin = (y_all == k).astype(np.int32)
@@ -3222,7 +3227,7 @@ def run_random_forest_for_task(
                 "_y": [],
             }
         return {
-            "loss/edge": float("nan"),
+            "loss/edge": None,
             "accuracy": float("nan"),
             "P_macro": float("nan"),
             "R_macro": float("nan"),

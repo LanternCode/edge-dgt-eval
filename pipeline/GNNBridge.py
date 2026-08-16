@@ -413,25 +413,36 @@ def _assemble_features_for_graph(
     X = X * nm_vec.view(N, 1).to(X.dtype)
 
     # Sanitise and per-graph z-score (edge-wise) combined
-    E_extra = None
+    E_local = None
     if E.numel():
         E = torch.nan_to_num(E, nan=0.0)
         E_b = E.unsqueeze(0)
 
         if extra_edge_mask is not None:
             xm_bool = extra_edge_mask.to(device=E.device, dtype=torch.bool)
-            xm_f = xm_bool.to(E.dtype)
-            E_extra = FeatureRegistry.zscore_edges_per_graph(E_b, mask=xm_bool.unsqueeze(0)).squeeze(0)
-            E_extra = E_extra * xm_f.unsqueeze(-1)
+            flat = E_b.reshape(1, N * N, E.size(-1))
+            xm = xm_bool.reshape(1, N * N, 1).to(E.dtype)
+
+            count = torch.clamp(xm.sum(dim=1, keepdim=True), min=1.0)
+            mean = (flat * xm).sum(dim=1, keepdim=True) / count
+            var = ((flat - mean) ** 2 * xm).sum(dim=1, keepdim=True) / count
+            std = torch.clamp(var.sqrt(), min=1e-8)
+
+            edge_ids = torch.nonzero(xm_bool.reshape(-1), as_tuple=False).view(-1)
+            edge_attr = (flat[0, edge_ids] - mean[0, 0]) / std[0, 0]
+            E_local = (edge_ids, edge_attr)
 
         E_mask_b = em_bool.unsqueeze(0)
         E = FeatureRegistry.zscore_edges_per_graph(E_b, mask=E_mask_b).squeeze(0)
         E = E * em_f.unsqueeze(-1)
     elif extra_edge_mask is not None:
-        E_extra = E
+        E_local = (
+            torch.empty((0,), device=E.device, dtype=torch.long),
+            torch.empty((0, 0), device=E.device, dtype=E.dtype)
+        )
 
     if extra_edge_mask is not None:
-        return X, (E, E_extra)
+        return X, (E, E_local)
     return X, E
 
 
@@ -847,23 +858,36 @@ class _GPSEncoder(nn.Module):
         A: torch.Tensor,
         X: torch.Tensor,
         node_mask: torch.Tensor,
-        E: Optional[torch.Tensor] = None
+        E_local: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> torch.Tensor:
         """
         Args:
             A: (N, N) sparse binary adjacency (routed by _prepare_adj_for_encoder).
             X: (N, in_dim) per-graph z-scored node features.
             node_mask: (N,) boolean validity mask.
-            E: optional (N, N, Fe) edge features for local GPS message passing.
+            E_local: optional `(edge_ids, edge_attr)` pair for local GPS message passing.
+                `edge_ids` contains flattened pre-DropEdge adjacency positions and
+                `edge_attr` contains the corresponding normalised edge features.
         Returns:
             Z: (N, out_dim) node embeddings.
         """
         A_bin = _masked_binary_sparse(A, node_mask)
         m_float = node_mask.unsqueeze(1).to(X.dtype)
         edge_attr = None
-        if E is not None and self.edge_dim > 0 and E.numel():
+        if E_local is not None and self.edge_dim > 0:
+            edge_ids, edge_values = E_local
             row, col = A_bin.indices()
-            edge_attr = E[row, col]
+            current_ids = row * int(A_bin.size(0)) + col
+
+            if current_ids.numel():
+                pos = torch.searchsorted(edge_ids, current_ids)
+                if torch.any(pos >= edge_ids.numel()):
+                    raise RuntimeError("[GPS] Message passing edge is missing from local edge features.")
+                if not torch.equal(edge_ids[pos], current_ids):
+                    raise RuntimeError("[GPS] Local edge features are misaligned with message passing edges.")
+                edge_attr = edge_values[pos]
+            else:
+                edge_attr = edge_values.new_zeros((0, self.edge_dim))
 
         H = F.relu(self.in_proj(X))
         H = self.drop(H) * m_float
@@ -878,7 +902,7 @@ class _GPSEncoder(nn.Module):
         A: Union[torch.Tensor, List[torch.Tensor]],
         X_batch: List[torch.Tensor],
         node_mask: torch.Tensor,
-        E_batch: Optional[List[torch.Tensor]] = None
+        E_batch: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
     ) -> List[torch.Tensor]:
         return [
             self.forward_one(A[b], X_batch[b], node_mask[b], None if E_batch is None else E_batch[b])
@@ -1835,13 +1859,6 @@ def _gnn_eval_split(
         y_pred = torch.cat(all_preds).numpy()
         y_prob = torch.cat(all_probs).numpy() if all_probs else None
 
-        # Filter out unexpected negative labels before sklearn evaluation; padding is excluded by mask
-        valid_mask = (y_true >= 0)
-        y_true = y_true[valid_mask]
-        y_pred = y_pred[valid_mask]
-        if y_prob is not None:
-            y_prob = y_prob[valid_mask]
-
         metrics["accuracy"] = accuracy_score(y_true, y_pred)
         metrics["F1_macro"] = f1_score(y_true, y_pred, average="macro", zero_division=0)
         metrics["P_macro"] = precision_score(y_true, y_pred, average="macro", zero_division=0)
@@ -2518,11 +2535,12 @@ def run_gnn_edges_suite(
           It does not affect run finalisation, cache clearing, or feature reset.
 
     Feature schema:
-        - Discovers all features present in the sample feature dicts via untargeted
-          schema inference. Typed custom declarations in task.hooks.feature_set provide
-          node/edge metadata without narrowing discovery. Node features flow through to
-          the encoder. The decoder's structural pair features are computed on the fly
-          from the adjacency.
+        - Uses untargeted schema inference over at most 64 batches total across the
+          resolved loaders. Typed custom declarations in task.hooks.feature_set provide
+          node/edge metadata without narrowing discovery. Features first appearing after
+          that scan window are not added to the schema. Discovered node features flow
+          through to the encoder. The decoder's structural pair features are computed
+          on the fly from the adjacency.
     """
     canon = _canonicalise_encoders(encoders)
     cfg = _coerce_train_cfg(cfg)

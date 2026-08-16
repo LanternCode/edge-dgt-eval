@@ -290,9 +290,7 @@ The built-in `GraphBenchmark` generates synthetic graphs from the following fami
 | `tree_plus_chords` | Random labelled tree + up to 0.75N chord edges | BFS-directed tree + non-reciprocal chords |
 | `shape_cycle` | Incomplete ring topologies (~50% of nodes) + background forest | Forward-directed rings, randomly oriented forest |
 
-Most families hold average degree constant as node count varies: `erdos_renyi`, `random_geometric` and `tree_plus_chords` target ~3.5 explicitly; `barabasi_albert`, `powerlaw_cluster`, `random_regular` and `watts_strogatz` sit around 4; `balanced_tree` and `shape_cycle` around 2. `stochastic_block` is the exception — its `p_in`/`p_out` are drawn from fixed ranges independent of node count, so its average degree grows with graph size (~0.18 x N).
-
-Most graph families use an organic mutation step target 10–15% edge dropout to break algorithmic perfection. Because an integer number of edges must be removed, that range is not guaranteed when the graph does not contain enough edges to realise it. Small or sparse graphs may therefore have a lower realised dropout fraction or zero removals. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`.
+Most families hold average degree constant as node count varies: `erdos_renyi`, `random_geometric` and `tree_plus_chords` target ~3.5 explicitly; `barabasi_albert`, `powerlaw_cluster`, `random_regular` and `watts_strogatz` sit around 4; `balanced_tree` and `shape_cycle` around 2. `stochastic_block` is the exception — its `p_in`/`p_out` are drawn from fixed ranges independent of node count, so its average degree grows with graph size (~0.18 x N). They also use an organic mutation step target 10–15% edge dropout to break algorithmic perfection. Because an integer number of edges must be removed, that range is not guaranteed when the graph does not contain enough edges to realise it. Small or sparse graphs may therefore have a lower realised dropout fraction or zero removals. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`.
 
 ---
 
@@ -307,8 +305,10 @@ All dense models consume BCHW tensors (adjacency + features stacked as channels,
 | `mlp` | Multi-layer perceptron | Per-pixel MLP over channel features |
 | `deep_mlp` | Deeper MLP variant | Additional hidden layers |
 | `cnn` | Convolutional network | Spatial convolutions on the N×N feature grid |
-| `transformer` | Patch Transformer | Divides the N×N grid into patches processed as tokens; configurable token masking policy (`keep_all`, `from_mask`, `auto`) |
+| `transformer` | Patch Transformer | Divides the N×N grid into patches processed as tokens; configurable token masking policy (`keep_all`, `from_mask`, `auto`) and optional 50% patch overlap |
 | `rf` | Random Forest | scikit-learn; extracts per-edge feature vectors from the channel stack |
+
+For the Patch Transformer, `cfg.tx_patch_overlap=False` is the default and preserves the current non-overlapping tokenisation (`stride == patch`). Setting `cfg.tx_patch_overlap=True` enables 50% overlap (`stride = max(1, patch // 2)`). The adaptive patch-size selection accounts for the selected stride when estimating the token sizing budget.
 
 ### GNN models
 
@@ -381,6 +381,7 @@ class TNNTrainConfig:
     threshold_metric: str = "f1"      # "f1" | "bacc" (tuned on the validation split)
     select_by: str = "f1"             # "f1" | "bacc" | "auroc"
     tx_force_adj_channel: bool = True
+    tx_patch_overlap: bool = False     # False: stride=patch; True: 50% overlap
     save_dir: Optional[str] = "saved_checkpoints"
     # ... plus model-specific hyperparameters (mlp_hidden, cnn_hidden, tx_*, etc.)
 ```
@@ -454,7 +455,7 @@ Notes:
 - The dense runner prevents empty model inputs by adding the default dense structural feature set when needed: `degree`, `deg_row`, `deg_col`, `clustering_coeff`, `cn`, `jaccard`, `adamic_adar`.
 - In the full-matrix GNN path, edge matrices may include appended heavy structural pairwise features even if they were not explicitly requested as standalone edge tensors.
 - `pairwise_batch_from_adj(...)` returns keys in its own fixed helper insertion order, not the caller's requested key order.
-- In Scalable Mode, node features continue to flow through the encoder, but the decoder does not materialise a dense `(N, N, Fe)` edge-feature tensor. Instead, it computes its fixed structural pair-feature vector only for the supervised pairs selected for scoring. User-supplied decoder-side edge features outside that fixed structural set do not reach the Scalable Mode decoder.
+- In Scalable Mode, node features discovered by untargeted schema inference continue to flow through the encoder. Untargeted discovery scans at most 64 batches total across the resolved loaders, so a feature first appearing after that scan window is not added to the schema. The decoder does not materialise a dense `(N, N, Fe)` edge-feature tensor. Instead, it computes its fixed structural pair-feature vector only for the supervised pairs selected for scoring. User-supplied decoder-side edge features outside that fixed structural set do not reach the Scalable Mode decoder.
 
 ### Adjacency as input channel
 
@@ -549,7 +550,7 @@ Three distinct mask concepts exist. Confusing them is a common source of errors.
 
 Built by `effective_mask(mask, A, directed)`. Controls which `(i, j)` pairs contribute to loss and metrics.
 
-- **Undirected**: strict upper-triangle off-diagonal only (each pair evaluated once).
+- **Undirected**: strict upper-triangle off-diagonal only (each pair evaluated once). Asymmetric masks are rejected.
 - **Directed**: full matrix; diagonal `(i, i)` included only where `A[i, i] > 0`.
 - Always used. Independent of input features.
 
@@ -558,7 +559,7 @@ Label validity contract on supported paths:
 - This pipeline does **not** use ignore-index labels for padding or masking.
 - Padding is represented by `mask == False`, not by a sentinel target such as `-1`.
 - `collate_fn_pad(...)` pads `L` with `0` and pads `mask` with `False`.
-- For multiclass tasks, supervised labels are expected to be integer class IDs at positions selected by `effective_mask(...)`.
+- For multiclass tasks, label matrices must contain finite integer class IDs in `[0, num_classes - 1]`. Invalid values are rejected during collation.
 
 ### (B) Transformer token-keep mask
 
@@ -769,6 +770,8 @@ Technically:
 - Node features, including typed custom node features, flow through the encoder. User-supplied edge features outside the fixed Scalable Mode structural set do not reach the decoder.
 
 Scalable Mode forces `batch_size=1`, meaning one graph is processed at a time. This does not restrict the dataset to a single graph. `use_tree_aux_loss=True` is disabled in Scalable Mode. GPS uses `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` as encoder-side structural encodings in both runners.
+
+Full-matrix GPS also uses the assembled edge-feature channels for its local GINE-style message passing, normalised over the observed message-passing edges. Those local attributes are stored only for observed edges; the dense `(N, N, Fe)` tensor remains the decoder representation. Scalable Mode skips edge-matrix assembly before `encode_only()`, so its GPS local branch is constructed with `edge_dim=0`.
 
 These differences from full-matrix decoding are intentional and should not be reported as inconsistencies unless observed behaviour contradicts this contract.
 
