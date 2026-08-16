@@ -35,14 +35,14 @@ import torch.nn.functional as F
 import time
 from .EdgeClassification import (
     _format_duration, _normalise_feature_spec, _pick_probe_loader, _pos_weight, _reset_pipeline_runtime_state,
-    effective_mask, FeatureRegistry, _task_to_meta_dict, finalise_summary,
-    _resolve_loaders, get_optimal_threshold, save_pipeline_checkpoint
+    effective_mask, FeatureRegistry, _task_to_meta_dict, finalise_summary, _resolve_loaders,
+    get_optimal_threshold, save_pipeline_checkpoint
 )
 from ._utils.features import pairwise_for_pairs, pairwise_batch_from_adj, shortest_path_from_adj
-from ._utils.run_lifecycle import begin_or_attach_run, install_boundary_hooks
+from ._utils.run_lifecycle import begin_or_attach_run
 from sklearn.metrics import (
-    precision_score, recall_score, f1_score, roc_auc_score, average_precision_score,
-    accuracy_score, balanced_accuracy_score
+    precision_score, recall_score, f1_score, roc_auc_score,
+    average_precision_score, accuracy_score, balanced_accuracy_score
 )
 from typing import Dict, List, Optional, Sequence, Tuple, Any, Union
 from dataclasses import dataclass
@@ -220,8 +220,8 @@ def _assemble_features_for_graph(
             Node validity mask, shape (N,) boolean. True = real node, False = padding.
             Must be pre-normalised by the caller (_prepare_features_batch)
         edge_mask:
-            Active edge mask, shape (N, N) boolean. Used for adjacency redaction,
-            E masking, and edge z-scoring. Must be pre-normalised by the caller
+            Active edge mask, shape (N, N) boolean. Used for E masking and
+            edge z-scoring. Must be pre-normalised by the caller
         schema:
             Optional schema containing "node_keys" and/or "edge_keys" lists that define
             which feature keys to include and in what order
@@ -961,6 +961,7 @@ class _EdgeFeatureDecoder(nn.Module):
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, out_dim)
         )
+        self.register_buffer("_cached_tril_mask", torch.empty(0, 0, dtype=torch.bool), persistent=False)
 
     def forward(self, Z_batch: List[torch.Tensor], node_mask: torch.Tensor, E_batch: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -974,7 +975,7 @@ class _EdgeFeatureDecoder(nn.Module):
         """
         if not self.directed and len(Z_batch) > 0:
             N_max = Z_batch[0].shape[0]
-            if getattr(self, "_cached_tril_mask", None) is None or self._cached_tril_mask.shape[0] != N_max:
+            if self._cached_tril_mask.device != Z_batch[0].device or self._cached_tril_mask.shape[0] != N_max:
                 self._cached_tril_mask = torch.tril(torch.ones(N_max, N_max, dtype=torch.bool, device=Z_batch[0].device), diagonal=-1)
             tril_mask = self._cached_tril_mask
         else:
@@ -1437,12 +1438,13 @@ class GraphEdgeClassifier(nn.Module):
         feature pipeline, without scattering back into a dense N×N grid.
 
         Returns:
-            Logits: (M,) if binary, or (M, K) if multiclass.
+            Logits: (M,) if binary, or (M, K) if multiclass. Row i corresponds to row i of `idx`.
         """
         Z_batch, E_batch, _ = self._encode_batch(A, feats, mask)
         dev = A.device
 
-        parts = []
+        M = int(idx.shape[0])
+        out = None
         for b, Z in enumerate(Z_batch):
             keep = idx[:, 0] == b
             if not torch.any(keep):
@@ -1454,14 +1456,20 @@ class GraphEdgeClassifier(nn.Module):
             z_v = Z[dst]
             edge_feats = E_batch[b][src, dst]
             edge_feats_rev = E_batch[b][dst, src] if not self.directed else None
-            parts.append(self.dec.score_pairs(z_u, z_v, edge_feats, edge_feats_rev))
+            s_b = self.dec.score_pairs(z_u, z_v, edge_feats, edge_feats_rev)
 
-        if not parts:
+            # Scatter to the rows these pairs occupy in idx
+            if out is None:
+                shape = (M,) if s_b.dim() == 1 else (M, s_b.shape[-1])
+                out = torch.zeros(shape, device=s_b.device, dtype=s_b.dtype)
+            out[keep] = s_b
+
+        if out is None:
             if self.num_classes > 1:
                 return torch.empty((0, self.num_classes), device=dev, dtype=Z_batch[0].dtype)
             return torch.empty((0,), device=dev, dtype=Z_batch[0].dtype)
 
-        return torch.cat(parts, dim=0)
+        return out
 
     def score_pairs_on_demand(
             self,
@@ -1480,20 +1488,22 @@ class GraphEdgeClassifier(nn.Module):
         dev = Z.device
         M = src.numel()
 
-        # Compute degrees
-        row_deg = (A > 0.5).to(Z.dtype).sum(dim=1)
-        col_deg = (A > 0.5).to(Z.dtype).sum(dim=0) if getattr(self, "directed", False) else row_deg
+        # `sum` is not on the autocast allowlist, so counts stay fp32 unless explicitly cast
+        is_directed = bool(getattr(self, "directed", False))
+        A01 = (A > 0.5).to(torch.float32)
+        row_deg = A01.sum(dim=1)
+        col_deg = A01.sum(dim=0) if is_directed else row_deg
         d_u = row_deg[src]
         d_v = col_deg[dst]
         deg_diff = (d_u - d_v).abs().view(-1, 1)
 
-        # Compute structural features
+        # Compute structural features - bf16 is exact only to 256 and these feed jaccard and adamic_adar
         pairwise_keys = list(FeatureRegistry.HEAVY_PAIRWISE_KEYS)
         pairwise_feats = pairwise_for_pairs(
-            A, src, dst, pairwise_keys,
-            is_directed=getattr(self, "directed", False),
-            row_deg=row_deg.to(torch.float32),
-            col_deg=col_deg.to(torch.float32)
+            A01, src, dst, pairwise_keys,
+            is_directed=is_directed,
+            row_deg=row_deg,
+            col_deg=col_deg
         )
         cn = pairwise_feats["cn"]
         jacc = pairwise_feats["jaccard"]
@@ -1507,7 +1517,7 @@ class GraphEdgeClassifier(nn.Module):
         edge_feats = torch.cat([
             d_u.view(-1, 1), d_v.view(-1, 1), deg_diff,
             cn.view(-1, 1), jacc.view(-1, 1), aa.view(-1, 1)
-        ], dim=1)
+        ], dim=1).to(Z.dtype)
 
         # Build reverse edge features with swapped per-node slots (d_u <-> d_v)
         edge_feats_rev = None
@@ -1515,7 +1525,7 @@ class GraphEdgeClassifier(nn.Module):
             edge_feats_rev = torch.cat([
                 d_v.view(-1, 1), d_u.view(-1, 1), deg_diff,
                 cn.view(-1, 1), jacc.view(-1, 1), aa.view(-1, 1)
-            ], dim=1)
+            ], dim=1).to(Z.dtype)
 
         return self.dec.score_pairs(z_u, z_v, edge_feats, edge_feats_rev)
 
@@ -1588,7 +1598,7 @@ class GNNTrainConfig:
     # Task-agnostic knobs
     dropedge_p: float = 0.10  # training-time DropEdge strength for encoder message passing - 0.0 disables it
     lap_pe_k: int = 0  # 0 disables universal Laplacian positional encodings
-    gps_lap_pe_k: int = 16  # GPS uses at least this many Laplacian PE columns in full-matrix mode
+    gps_lap_pe_k: int = 16  # GPS uses at least this many Laplacian PE columns in both GNN runners
     gps_lap_pe_sign_flip: bool = True  # training-time sign augmentation for GPS-owned LapPE
     gps_rwse_steps: int = 16  # optional GPS-owned RWSE columns; 0 disables RWSE
     gnn_zero_supervised: bool = False  # if True, zero supervised cells in A before message passing
@@ -1667,7 +1677,10 @@ def _tree_count_penalty(
     node_mask = node_mask | (A > 0.5).any(dim=-1) | (A > 0.5).any(dim=-2)
 
     n_valid = node_mask.sum(dim=1).to(pred_edge_count.dtype)
-    target_edge_count = (n_valid - 1).clamp_min(0)
+
+    # pred_edge_count is bounded by the number of supervised candidate cells
+    n_candidates = m.sum(dim=(1, 2)).to(pred_edge_count.dtype)
+    target_edge_count = torch.minimum((n_valid - 1).clamp_min(0), n_candidates)
 
     # L1 penalty normalised by the graph size
     loss = torch.abs(pred_edge_count - target_edge_count) / n_valid.clamp_min(1.0)
@@ -1730,7 +1743,7 @@ def _gnn_eval_split(
         fixed_thr: Optional[float] = None,
         fallback_thr: float = 0.5
 ):
-    """Shared evaluation logic for both full-batch and single-graph on-demand GNN trainers."""
+    """Shared evaluation logic for both full-matrix and Scalable Mode GNN trainers."""
     model.eval()
     all_labels = []
 
@@ -2417,7 +2430,6 @@ def run_gnn_suite(
     cfg.display_decimals = int(display_decimals)
     cfg.display_truncate = bool(display_truncate)
 
-    install_boundary_hooks()
     base_bundle = begin_or_attach_run(
         task_key=(id(task), str(getattr(task, "name", "task"))),
         stage="gnn_full",
@@ -2461,8 +2473,7 @@ def run_gnn_suite(
             "val": out.get("val", {}),
             "test": out.get("test", {}),
             "thr": out.get("thr"),
-            "ckpt": out.get("ckpt"),
-            "raw": out,
+            "ckpt": out.get("ckpt")
         }
         results_target[enc] = entry
         _elapsed = out.get("elapsed_seconds")
@@ -2487,15 +2498,15 @@ def run_gnn_edges_suite(
         *,
         quiet: bool = False,
         display_decimals: int = 4,
-        display_truncate: bool = False,
+        display_truncate: bool = False
 ) -> Dict[str, Any]:
     """
-    Bridge helper for single-graph on-demand GNN training via `train_one_gnn_edges(...)`.
+    Bridge helper for Scalable Mode GNN training via `train_one_gnn_edges(...)`.
 
     Run lifecycle:
         - This call starts a new run unless it attaches to an already-open dense run
           created by `run_pipeline_for_task(...)` on the same task in the same script/cell.
-        - When attached after the dense runner, the dense and single-graph on-demand GNN stages
+        - When attached after the dense runner, the dense and Scalable Mode GNN stages
           are treated as one combined run and share a single merged results bundle /
           final summary table.
         - Otherwise, this call is itself a complete standalone run.
@@ -2518,7 +2529,6 @@ def run_gnn_edges_suite(
     cfg.display_decimals = int(display_decimals)
     cfg.display_truncate = bool(display_truncate)
 
-    install_boundary_hooks()
     base_bundle = begin_or_attach_run(
         task_key=(id(task), str(getattr(task, "name", "task"))),
         stage="gnn_edges",
@@ -2556,7 +2566,7 @@ def run_gnn_edges_suite(
 
     for enc in canon:
         print("\n" + "=" * 80)
-        print(f"Running GNN encoder: {enc.upper()} (single-graph on-demand)")
+        print(f"Running GNN encoder: {enc.upper()} (Scalable Mode)")
         print("=" * 80)
 
         out = train_one_gnn_edges(
@@ -2568,8 +2578,7 @@ def run_gnn_edges_suite(
             "val": out.get("val", {}),
             "test": out.get("test", {}),
             "thr": out.get("thr"),
-            "ckpt": out.get("ckpt"),
-            "raw": out
+            "ckpt": out.get("ckpt")
         }
 
         results_target[enc] = entry

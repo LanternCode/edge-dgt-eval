@@ -24,7 +24,6 @@ class _ActiveRun:
     task_key: Any
     stages: List[str]
     bundle: Bundle
-    can_attach: CanAttachFn
     reset_cb: ResetFn
     summary_cb: SummaryFn
     quiet: bool
@@ -113,7 +112,7 @@ def get_active_run_checkpoint_timestamp() -> Optional[str]:
         timestamp = run_meta.get("checkpoint_run_timestamp")
 
         if timestamp is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             run_meta["checkpoint_run_timestamp"] = timestamp
 
         return str(timestamp)
@@ -239,17 +238,15 @@ def begin_or_attach_run(
             task_key=task_key,
             stages=[stage],
             bundle=bundle,
-            can_attach=can_attach,
             reset_cb=reset_cb,
             summary_cb=summary_cb,
             quiet=bool(quiet),
             display_decimals=int(display_decimals),
             display_truncate=bool(display_truncate),
-            open=True,
+            open=True
         )
         _stamp_bundle(bundle, _ACTIVE_RUN.stages, is_open=True)
         run_meta = bundle["metadata"].setdefault("run", {})
         run_meta["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         run_meta["_started_monotonic"] = time.monotonic()
         return bundle
-    

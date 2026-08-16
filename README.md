@@ -292,7 +292,7 @@ The built-in `GraphBenchmark` generates synthetic graphs from the following fami
 
 Most families hold average degree constant as node count varies: `erdos_renyi`, `random_geometric` and `tree_plus_chords` target ~3.5 explicitly; `barabasi_albert`, `powerlaw_cluster`, `random_regular` and `watts_strogatz` sit around 4; `balanced_tree` and `shape_cycle` around 2. `stochastic_block` is the exception — its `p_in`/`p_out` are drawn from fixed ranges independent of node count, so its average degree grows with graph size (~0.18 x N).
 
-All generated graphs undergo organic mutation (10–15% edge dropout) to break algorithmic perfection. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`.
+Most graph families use an organic mutation step target 10–15% edge dropout to break algorithmic perfection. Because an integer number of edges must be removed, that range is not guaranteed when the graph does not contain enough edges to realise it. Small or sparse graphs may therefore have a lower realised dropout fraction or zero removals. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`.
 
 ---
 
@@ -342,7 +342,7 @@ Aliases for `gps`: `graph_gps`, `graph-gps`.
 | `bacc` | Balanced accuracy: mean of TPR and TNR |
 | `auroc` | Area under the ROC curve (threshold-independent) |
 | `auprc` | Area under the precision-recall curve |
-| `loss/edge` | BCE with pos\_weight, computed globally over the split |
+| `loss/edge` | BCE with pos\_weight, computed globally over the split for neural models. Unavailable for Random Forest (`-` in the final summary) |
 
 Threshold tuning is performed on the validation split. The dense pipeline supports configurable leading metrics (`cfg.threshold_metric`, `cfg.select_by`); the GNN pipeline uses fixed validation-F1 for both threshold tuning and checkpoint selection.
 
@@ -357,7 +357,7 @@ Tuning always returns a threshold drawn from the observed score distribution. Wh
 | `P_macro` / `R_macro` | Macro-averaged precision / recall |
 | `BAcc_macro` | Balanced accuracy |
 | `AUC_macro` / `AUPRC_macro` | Macro-averaged one-vs-rest AUROC / AUPRC |
-| `loss/edge` | Cross-entropy loss |
+| `loss/edge` | Cross-entropy loss for neural models; unavailable for Random Forest (`-` in the final summary) |
 
 ---
 
@@ -463,7 +463,7 @@ Notes:
 | `hooks.allow_adj_channel=True` | All dense models | Include `adj` for all models |
 | `cfg.tx_force_adj_channel=True` | Transformer only | Force `adj` for TX even if hooks say no |
 
-When `hooks.allow_adj_channel=False`, dense no-feature mode is unavailable. In that case `run_pipeline_for_task(...)` appends the default dense structural feature set to `task.hooks.feature_set` before loader resolution.
+When `hooks.allow_adj_channel=False`, dense no-feature mode is unavailable. In that case `run_pipeline_for_task(...)` temporarily uses the default dense structural feature set during loader resolution, then restores the caller's original `task.hooks.feature_set`.
 
 GNN encoders never consume `adj` as a feature channel — they receive it as the propagation matrix.
 
@@ -473,8 +473,8 @@ Controls what gets zeroed at supervised `(i, j)` positions in BCHW inputs:
 
 | Policy | Behaviour |
 |--------|----------|
-| `"adj_only"` (default) | Zero only the `adj` channel; derived channels reflect that redaction |
-| `"all"` | Zero every channel at supervised positions |
+| `"adj_only"` (default) | Zero the `adj` channel; derived channels reflect that redaction |
+| `"all"` | Zero every applicable input channel at task-mask positions |
 | `"none"` | No redaction |
 
 #### GNN-side redaction
@@ -685,7 +685,7 @@ All three runner entry points return a `bundle` dictionary:
 }
 ```
 
-Each metrics dict also carries `_prob` (per-pair predicted probabilities) and `_y` (per-pair integer labels) for the corresponding split, for downstream analysis. The most recent bundle is also attached to the task as `task._latest_results` for the duration of the run; it is cleared when the run is finalised. In a combined dense → GNN run, both stages write into the same bundle, so `results` contains keys for all models across both pipelines.
+For non-empty evaluated splits, metrics dicts also carry `_prob` (per-pair predicted probabilities) and `_y` (per-pair integer labels) for downstream analysis. Empty splits or splits with no supervised pairs may instead return only the applicable `NaN` summary metrics and may omit `_prob` / `_y`. GNN validation with no finite selectable result may use the minimal `{"f1": NaN}` fallback. These forms are intentional and do not represent valid zero-valued metrics. The most recent bundle is also attached to the task as `task._latest_results` for the duration of the run. It is cleared when the run is finalised. In a combined dense → GNN run, both stages write into the same bundle, so `results` contains keys for all models across both pipelines.
 
 ### Checkpoint format
 
@@ -774,7 +774,7 @@ These differences from full-matrix decoding are intentional and should not be re
 
 ### Eval loss vs training loss
 
-Training computes `pos_weight` per-batch for numerical stability. Evaluation recomputes a single global `pos_weight` across the full split for a comparable, stable metric. The reported `loss/edge` is therefore not identical to the average of per-batch training losses. This is standard practice.
+For neural models, training computes `pos_weight` per-batch for numerical stability. Evaluation recomputes a single global `pos_weight` across the full split for a comparable, stable metric. The reported `loss/edge` is therefore not identical to the average of per-batch training losses. Random Forest has no corresponding `loss/edge` and displays `-` in the final summary.
 
 ### `run_pipeline_for_task` rejects GNN keys
 
@@ -887,7 +887,7 @@ The following are **not currently supported**. If you need one, open an issue an
 
 - **Pipeline-level strict mode.** Some malformed inputs currently warn and continue where feasible.
 - **Per-feature strictness controls for dynamic padding.**
-- **Configurable RF edge cap.** The RF path uses a fixed maximum of 20,000,000 edges.
+- **Configurable RF edge cap.** The RF path uses a fixed maximum of 20,000,000 edges. Its capped training collector preallocates the reservoir at that maximum so replacement sampling remains one-pass and in-place. Small training splits reserve the corresponding array address space.
 
 ---
 

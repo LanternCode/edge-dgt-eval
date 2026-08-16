@@ -28,28 +28,21 @@ class GraphBenchmark:
     - make_loaders(dataset, batch_size, ratios=(0.7, 0.2, 0.1), collate_fn=None, seed=None, pin_memory=None)
 
     When using existing split definitions, ProvidedSplitsTask reads bench.splits and will either:
-    (a) use split masks for a single graph,
-    (b) preserve pre-divided train/val/test sample collections, or
-    (c) combine samples and resplit them via GraphBenchmark.make_loaders(ratios=...)
+    (a) use split masks for a single graph, or
+    (b) preserve pre-divided train/val/test sample collections.
 
-    New minimal helpers (small, single responsibility):
+    New minimal helpers (single responsibility):
       - sample_specs(num_graphs, min_nodes, max_nodes, graph_types)
       - generate_dataset(specs, hooks, prepackage=True)  # task-agnostic
       - make_loaders(dataset, batch_size, ratios=(...), collate_fn=None)
     """
     def __init__(
         self,
-        num_graphs: int = 200,
-        min_nodes: int = 6,
-        max_nodes: int = 140,
         show_progress: bool = False,
         graph_types: Optional[List[str]] = None,
         shape_cycle_shapes: Optional[List[str]] = None,
         shape_cycle_removal_prob: float = 0.30
     ):
-        self.num_graphs = int(num_graphs)
-        self.min_nodes = int(min_nodes)
-        self.max_nodes = int(max_nodes)
         self.show_progress = show_progress
         self.graph_types = graph_types or [
             'erdos_renyi', 'barabasi_albert', 'watts_strogatz',
@@ -420,8 +413,9 @@ class GraphBenchmark:
                     f"with your chosen `graph_types`."
                 )
 
-            # 2) Organic mutation - Randomly drop 10-15% of edges/arrows to break algorithmic perfection
-            # Graph families that implement internal mutation bypass this via `skip_organic_mutation`
+            # 2) Organic mutation - Drop 10-15% of edges to break algorithmic perfection.
+            # Small edge counts round down and may realise a lower fraction.
+            # Graph families that implement internal mutation bypass this via `skip_organic_mutation`.
             if not G.graph.get('skip_organic_mutation', False):
                 edges = list(G.edges())
                 drop_count = int(len(edges) * local_rng.uniform(0.10, 0.15))
@@ -457,16 +451,15 @@ class GraphBenchmark:
             # Lock in Ground Truth (Output of Phase 3)
             G.remove_edges_from(list(nx.selfloop_edges(G)))
             if 'complete_adj' in G.graph:
-                A_true = G.graph['complete_adj'].copy()
+                A_obs = self._sanitise_adj(nx.to_numpy_array(G, dtype=np.float32), nx.is_directed(G))
+                # Background-forest and stitched edges live only in G
+                A_true = np.maximum(G.graph['complete_adj'].copy(), A_obs)
                 G_true = nx.DiGraph() if is_dir else nx.Graph()
                 G_true.add_nodes_from(G.nodes(data=True))
                 G_true.graph.update(G.graph)
                 I, J = np.where(A_true > 0)
                 G_true.add_edges_from(zip(I.tolist(), J.tolist()))
                 A_true = self._sanitise_adj(A_true, nx.is_directed(G_true))
-                A_obs = self._sanitise_adj(
-                    nx.to_numpy_array(G, dtype=np.float32), nx.is_directed(G)
-                )
             else:
                 G_true = G.copy()
                 A_true = self._sanitise_adj(
@@ -612,7 +605,7 @@ class GraphBenchmark:
         feats: Dict[str, np.ndarray] = {}
         adj_f = adj.astype(np.float32, copy=False)
         if 'transpose' in feature_list:
-            feats['transpose'] = adj.T
+            feats['transpose'] = adj_f.T
 
         # Handle explicit requests, e.g., 'power_2', without pulling in all powers
         need_a3 = 'triangles' in feature_list or 'clustering_coeff' in feature_list
@@ -659,16 +652,15 @@ class GraphBenchmark:
             feats['twohop'] = two.sum(axis=1).astype(np.float32)  # 1D node-wise
 
         # Pairwise link-prediction features (all 2D)
-        want_pairwise = any(
-            k in feature_list for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col')
-        )
-        if want_pairwise:
-            pairwise_keys = [k for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col') if k in feature_list]
-            if pairwise_keys:
-                A_t = torch.as_tensor(adj, dtype=torch.float32)
-                batch = pairwise_batch_from_adj(A_t, pairwise_keys, is_directed=directed)
-                for k, v in batch.items():
-                    feats[k] = v.cpu().numpy().astype(np.float32)
+        pairwise_keys = [
+            k for k in ('cn', 'jaccard', 'adamic_adar', 'deg_diff', 'deg_row', 'deg_col')
+            if k in feature_list
+        ]
+        if pairwise_keys:
+            A_t = torch.as_tensor(adj, dtype=torch.float32)
+            batch = pairwise_batch_from_adj(A_t, pairwise_keys, is_directed=directed)
+            for k, v in batch.items():
+                feats[k] = v.cpu().numpy().astype(np.float32)
 
         return feats
 
@@ -708,10 +700,11 @@ class GraphBenchmark:
                 raise ValueError(f"Unknown parameter '{p}' in label_fn. "
                                  f"Allowed aliases must map to A_obs, A_true, or G_true.")
 
+        slots = tuple({'A_obs': 0, 'A_true': 1, 'G_true': 2}[m] for m in mapping)
+
         def fast_label_fn(A_obs, A_true, G_true):
-            local_vars = locals()
-            args = [local_vars[m] for m in mapping]
-            return label_fn(*args)
+            available = (A_obs, A_true, G_true)
+            return label_fn(*(available[s] for s in slots))
 
         return fast_label_fn
     

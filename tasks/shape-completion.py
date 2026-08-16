@@ -34,9 +34,6 @@ hooks = TaskHooks(
 
 # Use only the 'shape_cycle' graph family
 bench = GraphBenchmark(
-    num_graphs=1000,
-    min_nodes=6,
-    max_nodes=140,
     graph_types=["shape_cycle"],
     shape_cycle_shapes=["triangle", "square", "pentagon", "hexagon"],
     shape_cycle_removal_prob=0.3

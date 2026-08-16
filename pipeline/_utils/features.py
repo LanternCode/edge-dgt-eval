@@ -5,6 +5,7 @@ import torch
 import networkx as nx
 from torch import Tensor
 from typing import Dict, Optional, Sequence
+from functools import lru_cache
 
 CANONICAL_FEATURES = {
     "transpose", "power_2", "power_3", "power_4", "power_5",
@@ -30,23 +31,37 @@ UNDIRECTED_AUTO_FEATURES = (
     "shortest_path",
 )
 
+
+@lru_cache(maxsize=512)
+def _shortest_path_cached(packed_adj: bytes, n: int, is_directed: bool) -> np.ndarray:
+    A01 = np.unpackbits(
+        np.frombuffer(packed_adj, dtype=np.uint8),
+        count=n * n
+    ).reshape(n, n)
+    graph_type = nx.DiGraph if is_directed else nx.Graph
+    G = nx.from_numpy_array(A01, create_using=graph_type)
+    dist_dtype = np.int16 if n <= np.iinfo(np.int16).max else np.int32
+    D = np.full((n, n), -1, dtype=dist_dtype)
+    for src, lengths in nx.all_pairs_shortest_path_length(G):
+        for dst, dist in lengths.items():
+            D[src, dst] = dist
+    return D
+
+
 def shortest_path_from_adj(A: Tensor, *, is_directed: bool = False) -> Tensor:
     """
-    Compute all-pairs shortest-path distances from the provided adjacency.
+    Compute all pair shortest-path distances from the provided adjacency.
 
     The caller is responsible for passing the graph view the model is allowed to
-    see. In the training pipeline this should usually be the supervised-redacted
+    see. In the training pipeline this should usually be the supervised, redacted
     adjacency, so direct held-out edges do not leak through distance-1 entries.
 
     Returns an (N, N) float tensor on A.device, with unreachable pairs encoded as -1.
     """
-    A01 = (A.detach().cpu().numpy() > 0).astype(np.uint8)
-    graph_type = nx.DiGraph if is_directed else nx.Graph
-    G = nx.from_numpy_array(A01, create_using=graph_type)
-    D = np.full(A01.shape, -1, dtype=np.float32)
-    for src, lengths in nx.all_pairs_shortest_path_length(G):
-        for dst, dist in lengths.items():
-            D[src, dst] = float(dist)
+    A01 = A.detach().cpu().numpy() > 0
+    n = int(A01.shape[0])
+    packed_adj = np.packbits(A01.reshape(-1)).tobytes()
+    D = _shortest_path_cached(packed_adj, n, bool(is_directed))
     return torch.as_tensor(D, device=A.device, dtype=torch.float32)
 
 
@@ -75,7 +90,6 @@ def pairwise_batch_from_adj(A_batch: Tensor, keys: Sequence[str], *, is_directed
         
     if any(k in keys for k in ("cn", "jaccard")):
         cn = (A01 @ A01) if is_directed else (A01 @ A01.transpose(-1, -2))
-        cn.diagonal(dim1=-2, dim2=-1).fill_(0.0)
         
         if "cn" in keys:
             results["cn"] = cn
@@ -88,7 +102,6 @@ def pairwise_batch_from_adj(A_batch: Tensor, keys: Sequence[str], *, is_directed
         safe_inv_log = torch.where(row_deg > 1, 1.0 / torch.log(row_deg), torch.zeros_like(row_deg))
         rhs = A01 if is_directed else A01.transpose(-1, -2)
         W = (A01 * safe_inv_log.view(B, 1, N)) @ rhs
-        W.diagonal(dim1=-2, dim2=-1).fill_(0.0)
         results["adamic_adar"] = W
 
     # Squeeze the batch dimension back out if the user passed a 2D matrix
@@ -106,38 +119,68 @@ def pairwise_for_pairs(
         *,
         is_directed: bool = True,
         row_deg: Optional[Tensor] = None,
-        col_deg: Optional[Tensor] = None
+        col_deg: Optional[Tensor] = None,
+        chunk_size: int = 4096
 ) -> Dict[str, Tensor]:
     """
     Compute pairwise features only for specific (src, dst) pairs.
-    Materialises a dense binary adjacency view internally and computes outputs only for the requested pairs.
+    Pair rows are processed in chunks so temporary memory is O(chunk_size * N).
     """
     if A.is_sparse:
         A01 = (A.to_dense() > 0).to(dtype=torch.float32)
     else:
         A01 = torch.gt(A, 0).to(dtype=torch.float32)
 
-    results: Dict[str, Tensor] = {}
     if row_deg is None:
         row_deg = A01.sum(dim=1)
+    else:
+        row_deg = row_deg.to(device=A01.device, dtype=torch.float32)
     if col_deg is None:
         col_deg = A01.sum(dim=0) if is_directed else row_deg
+    else:
+        col_deg = col_deg.to(device=A01.device, dtype=torch.float32)
 
-    # score_pairs_on_demand requests exactly the heavy pairwise keys. Endpoint degrees are computed by the caller itself.
-    Au = A01[src]
-    Av = A01.t()[dst] if is_directed else A01[dst]
-    cn = (Au * Av).sum(dim=1)  # (M,)
-
+    allowed = {"cn", "jaccard", "adamic_adar"}
     for key in keys:
-        if key == "cn":
-            results[key] = cn
-        elif key == "jaccard":
-            union = row_deg[src] + col_deg[dst] - cn
-            results[key] = torch.where(union > 0, cn / union, torch.zeros_like(union))
-        elif key == "adamic_adar":
-            invlog = torch.where(row_deg > 1, 1.0 / torch.log(row_deg), torch.zeros_like(row_deg))
-            results[key] = ((Au * Av) * invlog.view(1, -1)).sum(dim=1)
-        else:
+        if key not in allowed:
             raise KeyError(f"Unsupported key for pairwise_for_pairs: {key}")
+
+    M = int(src.numel())
+    step = max(1, int(chunk_size))
+    results: Dict[str, Tensor] = {
+        key: torch.empty((M,), device=A01.device, dtype=torch.float32)
+        for key in keys
+    }
+    invlog = None
+    if "adamic_adar" in results:
+        invlog = torch.where(
+            row_deg > 1,
+            1.0 / torch.log(row_deg),
+            torch.zeros_like(row_deg)
+        )
+
+    A01_t = A01.t() if is_directed else A01
+    for start in range(0, M, step):
+        end = min(start + step, M)
+        src_c = src[start:end]
+        dst_c = dst[start:end]
+
+        Au = A01[src_c]
+        Av = A01_t[dst_c]
+        shared = Au * Av
+        cn = shared.sum(dim=1)
+
+        if "cn" in results:
+            results["cn"][start:end] = cn
+        if "jaccard" in results:
+            union = row_deg[src_c] + col_deg[dst_c] - cn
+            results["jaccard"][start:end] = torch.where(
+                union > 0,
+                cn / union,
+                torch.zeros_like(union)
+            )
+        if "adamic_adar" in results:
+            shared.mul_(invlog.view(1, -1))
+            results["adamic_adar"][start:end] = shared.sum(dim=1)
 
     return results
