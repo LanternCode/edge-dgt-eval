@@ -1,6 +1,6 @@
 # An Architecture Evaluation Framework for edge-level Deep Graph Transformation Tasks
 
-Architecture evaluation framework for binary and multiclass edge prediction tasks on graphs, supporting both dense (image-style) models and GNN encoders with a shared evaluation contract
+Architecture evaluation framework for binary and multiclass edge prediction tasks on graphs, supporting both dense (image-style) models and GNN encoders with a shared evaluation contract.
 
 ---
 
@@ -15,7 +15,7 @@ The pipeline provides two architecturally separate model families under a shared
 
 Both pipelines share evaluation masking (`effective_mask`), metric computation, the summary printer, checkpoint saving, and a run lifecycle manager that supports standalone or combined dense→GNN execution in a single script or notebook cell.
 
-A built-in synthetic graph generator (`GraphBenchmark`) produces datasets from 10 graph families with native directed and undirected support, enabling controlled benchmarking across diverse topologies. Users define a task by writing a short task file — a label function, a feature request, and configuration — then call the provided runner entry points.
+A built-in synthetic graph generator (`GraphBenchmark`) produces datasets from 10 graph families with native support for directed and undirected graphs, enabling controlled benchmarking across diverse topologies. Users define a task by writing a short task file — a label function, a feature request, and configuration — then call the provided runner entry points.
 
 ---
 
@@ -54,13 +54,13 @@ Users interact with the pipeline by writing a **task file**: define a label func
 Task files should be run as modules from the repository root:
 
 ```bash
-python -m tasks.symmetric_closure
+python -m tasks.symmetric-closure
 ```
 
 For task files that take command-line arguments:
 
 ```bash
-python -m tasks.graph_denoising --model cnn
+python -m tasks.graph-denoising --model cnn
 ```
 
 ### Example: symmetric closure on directed graphs
@@ -223,7 +223,7 @@ Supported run shapes:
 
 1. A standalone dense call.
 2. A standalone GNN call.
-3. A combined dense → GNN run on the same task in the same script / notebook cell.
+3. A combined dense → GNN run on the same task in the same script/notebook cell.
 
 Rules:
 
@@ -290,7 +290,7 @@ The built-in `GraphBenchmark` generates synthetic graphs from the following fami
 | `tree_plus_chords` | Random labelled tree + up to 0.75N chord edges | BFS-directed tree + non-reciprocal chords |
 | `shape_cycle` | Incomplete ring topologies (~50% of nodes) + background forest | Forward-directed rings, randomly oriented forest |
 
-Most families hold average degree constant as node count varies: `erdos_renyi`, `random_geometric` and `tree_plus_chords` target ~3.5 explicitly; `barabasi_albert`, `powerlaw_cluster`, `random_regular` and `watts_strogatz` sit around 4; `balanced_tree` and `shape_cycle` around 2. `stochastic_block` is the exception — its `p_in`/`p_out` are drawn from fixed ranges independent of node count, so its average degree grows with graph size (~0.18 x N). They also use an organic mutation step target 10–15% edge dropout to break algorithmic perfection. Because an integer number of edges must be removed, that range is not guaranteed when the graph does not contain enough edges to realise it. Small or sparse graphs may therefore have a lower realised dropout fraction or zero removals. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`.
+Most families hold average degree constant as node count varies: `erdos_renyi`, `random_geometric` and `tree_plus_chords` target ~3.5 explicitly; `barabasi_albert`, `powerlaw_cluster`, `random_regular` and `watts_strogatz` sit around 4; `balanced_tree` and `shape_cycle` around 2. `stochastic_block` is the exception — its `p_in`/`p_out` are drawn from fixed ranges independent of node count, so its average degree grows with graph size (~0.18 x N). They also use an organic mutation step targeting 10–15% edge dropout to break algorithmic perfection. Because an integer number of edges must be removed, that range is not guaranteed when the graph does not contain enough edges to realise it. Small or sparse graphs may therefore have a lower realised dropout fraction or zero removals. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`.
 
 ---
 
@@ -308,7 +308,7 @@ All dense models consume BCHW tensors (adjacency + features stacked as channels,
 | `transformer` | Patch Transformer | Divides the N×N grid into patches processed as tokens; configurable token masking policy (`keep_all`, `from_mask`, `auto`) and optional 50% patch overlap |
 | `rf` | Random Forest | scikit-learn; extracts per-edge feature vectors from the channel stack |
 
-For the Patch Transformer, `cfg.tx_patch_overlap=False` is the default and preserves the current non-overlapping tokenisation (`stride == patch`). Setting `cfg.tx_patch_overlap=True` enables 50% overlap (`stride = max(1, patch // 2)`). The adaptive patch-size selection accounts for the selected stride when estimating the token sizing budget.
+For the Patch Transformer, `cfg.tx_patch_overlap=False` is the default and preserves the current non-overlapping tokenisation (`stride == patch`). Setting `cfg.tx_patch_overlap=True` enables 50% overlap (`stride = max(1, patch // 2)`). Adaptive patch size selection accounts for the selected stride when estimating the token sizing budget.
 
 ### GNN models
 
@@ -346,7 +346,7 @@ Aliases for `gps`: `graph_gps`, `graph-gps`.
 
 Threshold tuning is performed on the validation split. The dense pipeline supports configurable leading metrics (`cfg.threshold_metric`, `cfg.select_by`); the GNN pipeline uses fixed validation-F1 for both threshold tuning and checkpoint selection.
 
-Tuning always returns a threshold drawn from the observed score distribution. When no threshold on that split beats chance, which is normal in early epochs, and on small validation splits, the tuner returns the best available real threshold over the degenerate predict-all-negative point, so a reported `bacc` below 0.5 reflects the split rather than a tuning failure. Degenerate splits (all-positive or all-negative) fall back to the previous epoch's threshold.
+Tuning always returns a threshold drawn from the observed score distribution. When no threshold on that split beats chance, which is normal in early epochs and on small validation splits, the tuner returns the best available real threshold over the degenerate predict-all-negative point, so a reported `bacc` below 0.5 reflects the split rather than a tuning failure. Degenerate splits (all-positive or all-negative) fall back to the previous epoch's threshold.
 
 ### Multiclass tasks
 
@@ -455,7 +455,7 @@ Notes:
 - The dense runner prevents empty model inputs by adding the default dense structural feature set when needed: `degree`, `deg_row`, `deg_col`, `clustering_coeff`, `cn`, `jaccard`, `adamic_adar`.
 - In the full-matrix GNN path, edge matrices may include appended heavy structural pairwise features even if they were not explicitly requested as standalone edge tensors.
 - `pairwise_batch_from_adj(...)` returns keys in its own fixed helper insertion order, not the caller's requested key order.
-- In Scalable Mode, node features discovered by untargeted schema inference continue to flow through the encoder. Untargeted discovery scans at most 64 batches total across the resolved loaders, so a feature first appearing after that scan window is not added to the schema. The decoder does not materialise a dense `(N, N, Fe)` edge-feature tensor. Instead, it computes its fixed structural pair-feature vector only for the supervised pairs selected for scoring. User-supplied decoder-side edge features outside that fixed structural set do not reach the Scalable Mode decoder.
+- In Scalable Mode, node features discovered by untargeted schema inference continue to flow through the encoder. Untargeted discovery scans at most 64 batches total across the resolved loaders, so features that first appear after that scan window are not added to the schema. The decoder does not materialise a dense `(N, N, Fe)` edge-feature tensor. Instead, it computes its fixed structural pair-feature vector only for the supervised pairs selected for scoring. User-supplied decoder-side edge features outside that fixed structural set do not reach the Scalable Mode decoder.
 
 ### Adjacency as input channel
 
@@ -464,7 +464,7 @@ Notes:
 | `hooks.allow_adj_channel=True` | All dense models | Include `adj` for all models |
 | `cfg.tx_force_adj_channel=True` | Transformer only | Force `adj` for TX even if hooks say no |
 
-When `hooks.allow_adj_channel=False`, dense no-feature mode is unavailable. In that case `run_pipeline_for_task(...)` temporarily uses the default dense structural feature set during loader resolution, then restores the caller's original `task.hooks.feature_set`.
+When `hooks.allow_adj_channel=False`, dense no-feature mode is unavailable. In that case, `run_pipeline_for_task(...)` temporarily uses the default dense structural feature set during loader resolution, then restores the caller's original `task.hooks.feature_set`.
 
 GNN encoders never consume `adj` as a feature channel — they receive it as the propagation matrix.
 
@@ -504,7 +504,7 @@ Use `True` for tasks where the objective operates exclusively on existing edges 
 
 Canonical and custom features follow different ownership rules:
 
-- **Canonical features** are pipeline-owned and remain plain strings in `hooks.feature_set`. If requested, the pipeline is responsible for making them available.
+- **Canonical features** are pipeline-owned and remain plain strings in `hooks.feature_set`. If requested, the pipeline makes them available.
 - **Custom features** are user-owned. Declare each custom name and its type directly in `hooks.feature_set` as `(name, "node")` or `(name, "edge")`, and provide its tensor in the sample feature dictionaries wherever it is used.
 - Custom feature types are part of the task declaration and therefore do not depend on run-scoped registration state.
 - `adj`, `mask`, and `_N` are reserved pipeline names and cannot be declared as custom features. Canonical feature names also cannot be redeclared as custom.
@@ -658,7 +658,7 @@ run_gnn_edges_suite(...)
   → model.score_pairs_on_demand(...)       [compute pair features and score selected pairs]
 ```
 
-`run_gnn_edges_suite(...)` is the dedicated Scalable Mode runner and forces `batch_size=1`, so one graph is processed at a time. A task may still contain multiple graphs, which are processed sequentially. The graph encoder operates on the graph as a whole; the memory saving comes from avoiding the dense decoder-side edge-feature representation and computing structural decoder features only for the selected supervised pairs.
+`run_gnn_edges_suite(...)` is the dedicated Scalable Mode runner and forces `batch_size=1`, so one graph is processed at a time. A task may still contain multiple graphs, which are processed sequentially. The graph encoder operates on the graph as a whole. Memory savings come from avoiding the dense decoder-side edge feature representation and computing structural decoder features only for the selected supervised pairs.
 
 ---
 
@@ -718,7 +718,7 @@ The exact `meta` payload is pipeline-specific; only `state_dict`, `model_key`, `
 ```python
 task = ProvidedSplitsTask(..., seed=42)
 # Internally calls seed_everything(42), which locks:
-#   random, np.random, torch.manual_seed, CUDA seeds, cudnn deterministic mode
+#   random, np.random, torch.manual_seed, CUDA seeds, cuDNN deterministic mode
 ```
 
 If no seed is provided, a random seed is generated and printed. The seed controls graph generation order, dataset splitting, dataloader shuffling, and model initialisation.
@@ -769,7 +769,7 @@ Technically:
 - The decoder computes its structural inputs only for those selected pairs. Its fixed structural feature vector contains endpoint degree statistics together with common-neighbour, Jaccard, and Adamic–Adar statistics derived from the adjacency visible to the model.
 - Node features, including typed custom node features, flow through the encoder. User-supplied edge features outside the fixed Scalable Mode structural set do not reach the decoder.
 
-Scalable Mode forces `batch_size=1`, meaning one graph is processed at a time. This does not restrict the dataset to a single graph. `use_tree_aux_loss=True` is disabled in Scalable Mode. GPS uses `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` as encoder-side structural encodings in both runners.
+Scalable Mode forces `batch_size=1`, so it processes one graph at a time. This does not restrict the dataset to a single graph. `use_tree_aux_loss=True` is disabled in Scalable Mode. GPS uses `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` as encoder-side structural encodings in both runners.
 
 Full-matrix GPS also uses the assembled edge-feature channels for its local GINE-style message passing, normalised over the observed message-passing edges. Those local attributes are stored only for observed edges; the dense `(N, N, Fe)` tensor remains the decoder representation. Scalable Mode skips edge-matrix assembly before `encode_only()`, so its GPS local branch is constructed with `edge_dim=0`.
 
@@ -824,14 +824,14 @@ Attribute initialisation, naming, or structural issues that affect maintainabili
 The following do not qualify under any category and should not be reported:
 
 - **Style preferences**: staticmethod vs instance method, import grouping, variable naming conventions.
-- **Used imports**: every import in this codebase is used. An import being used in only one function does not make it "narrowly scoped" or "dead."
+- **Used imports**: every import in this codebase is used. An import used in only one function is not "narrowly scoped" or "dead."
 - **Defensive calls**: `gc.collect()`, `torch.cuda.ipc_collect()`, `torch.cuda.synchronize()` exist as safety nets and are not dead code.
 - **Numerical safety nets in forward paths**: `torch.nan_to_num`, `torch.clamp`, and input bounding in encoder or decoder forward methods guard against silent NaN or Inf propagation.
 - **Code organisation choices**: whether two runners with shared setup should be merged into one parameterised function are structural preferences.
 
 ### Common false-positive patterns (do not report)
 
-- **Flagging documented runtime lifecycle behaviour as a bug.** State that is explicitly owned by a run (for example summary bookkeeping or other pipeline runtime state reset at run finalisation) should not be reported as a defect unless the behaviour contradicts the documented run semantics.
+- **Flagging documented runtime lifecycle behaviour as a bug.** State that is explicitly owned by a run (for example, summary bookkeeping or other pipeline runtime state reset at run finalisation) should not be reported as a defect unless the behaviour contradicts the documented run semantics.
 - **Flagging the behaviour a parameter controls as a bug.** If a configurable flag changes pipeline behaviour, that behaviour is the flag's purpose, not a defect.
 - **"Pipeline A does X but pipeline B does Y."** Check "Key Design Decisions" first. The dense and GNN pipelines intentionally differ in normalisation, redaction integration, threshold policy, and feature assembly.
 - **Intermediate state that gets overwritten.** Trace the full call chain from the supported entry point to the point of use. If a value is set early and unconditionally overwritten before it is consumed, the early value is not a bug.
