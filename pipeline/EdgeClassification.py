@@ -117,7 +117,6 @@ from .GraphBenchmark import GraphBenchmark
 from types import SimpleNamespace
 from pathlib import Path
 from dataclasses import dataclass
-from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Callable, Union, Sequence, ClassVar, FrozenSet, Set, Literal, Any
 from torch.utils.data import DataLoader, Dataset
 from sklearn.ensemble import RandomForestClassifier
@@ -221,10 +220,16 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
             if isinstance(c, dict):
                 continue
             arr = torch.from_numpy(np.asarray(c)) if not isinstance(c, torch.Tensor) else c
-            if arr.ndim == 2 and arr.shape == (N, N):
-                matrices.append(arr)
+            if arr.ndim != 2 or tuple(arr.shape) != (N, N):
+                raise ValueError(
+                    f"[SAMPLE SHAPE] Sample contains a matrix component of shape {tuple(arr.shape)}; label "
+                    f"and evaluation mask matrices must match the adjacency at ({N}, {N}). "
+                    f"Roles are assigned in order, so a mis-shaped matrix would shift the remaining "
+                    f"components into the wrong slots."
+                )
+            matrices.append(arr)
 
-        # Assignment is shape-filtered: the first non-dict (N, N) matrix becomes L and the second becomes M
+        # Roles are positional: the first non-dict matrix becomes L and the second becomes M
         L = matrices[0] if len(matrices) > 0 else None
         M = matrices[1] if len(matrices) > 1 else None
 
@@ -383,9 +388,6 @@ def save_pipeline_checkpoint(model_key: str, state_dict: dict, task: Any, cfg: A
         save_root = Path(__file__).resolve().parents[1] / save_root
     
     timestamp = get_active_run_checkpoint_timestamp()
-    if timestamp is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     out_dir = save_root / str(getattr(task, "name", "task")) / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / f"{model_key}.pth"
@@ -555,10 +557,7 @@ class FeatureRegistry:
                     for b in range(B)
                 ], dim=0).to(dtype)
             elif k.startswith("power_"):
-                try:
-                    p = int(k.split("_", 1)[1])
-                except Exception:
-                    p = 2
+                p = int(k.split("_", 1)[1])
 
                 if p == 2 and 2 not in _power_memo:
                     _power_memo[2] = (A_base @ A_base).to(dtype)
@@ -573,8 +572,6 @@ class FeatureRegistry:
                         _power_memo[4] = (_power_memo[2] @ _power_memo[2]).to(dtype)
                     if p == 5:
                         _power_memo[5] = (A_base @ _power_memo[4]).to(dtype)
-                elif p not in _power_memo:
-                    _power_memo[p] = torch.matrix_power(A_base, p).to(dtype)
 
                 _mat_cache_batch[k] = _power_memo[p]
 
@@ -686,11 +683,10 @@ class FeatureRegistry:
             loader: torch.utils.data.DataLoader,
             feature_keys: Sequence[str],
             max_batches: int = 1024,
-            *,
-            include_adj: bool = True
+            *, include_adj: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Mean/std per channel computed on the active train mask (BCHW → BHWC → gather by mask).
+        Mean/std per channel from a bounded train-loader pass over at most `max_batches` batches.
         """
         sum_c, sumsq_c, count, C_seen = None, None, 0, None
         for i, (A, feats, _, mask) in enumerate(loader):
@@ -919,7 +915,7 @@ class TaskHooks:
     - feature_set: True for all canonical features, False for none, or a list containing
       canonical feature names/macros and typed custom declarations `(name, "node"|"edge")`.
     - orientation: None | "dag"; passed to *_orient_to_directed on A_obs.
-    - ensure_connected: If True, connect components by chaining with single edges.
+    - ensure_connected: If True, connect components using proportional multi-stitching.
     - allow_adj_channel: If True, include adjacency as an explicit numerical feature.
     """
     label_fn: Optional[Union[
@@ -1080,6 +1076,7 @@ class ProvidedSplitsTask(TaskSpec):
             class _MaskPolicyDataset(Dataset):
                 def __init__(self, base):
                     self.base = base
+                    self._pipeline_persistent_workers = bool(getattr(base, "_pipeline_persistent_workers", False))
 
                 def __len__(self):
                     return len(self.base)
@@ -1100,8 +1097,14 @@ class ProvidedSplitsTask(TaskSpec):
                         if isinstance(c, dict):
                             continue
                         arr = c if isinstance(c, torch.Tensor) else torch.as_tensor(np.asarray(c))
-                        if arr.ndim == 2 and tuple(arr.shape) == (N, N):
-                            matrices.append(arr)
+                        if arr.ndim != 2 or tuple(arr.shape) != (N, N):
+                            raise ValueError(
+                                f"[SAMPLE SHAPE] Sample contains a matrix component of shape {tuple(arr.shape)}; label "
+                                f"and evaluation mask matrices must match the adjacency at ({N}, {N}). "
+                                f"Roles are assigned in order, so a mis-shaped matrix would shift the remaining "
+                                f"components into the wrong slots."
+                            )
+                        matrices.append(arr)
 
                     # If the user already provided >= 2 matrices (L and Mask), respect their tuple and skip policy
                     if len(matrices) >= 2:
@@ -1124,7 +1127,8 @@ class ProvidedSplitsTask(TaskSpec):
                 shuffle=effective_shuffle,
                 num_workers=nw,
                 collate_fn=collate,
-                pin_memory=pin
+                pin_memory=pin,
+                persistent_workers=bool(nw > 0 and getattr(ds_like, "_pipeline_persistent_workers", False))
             )
 
             if effective_shuffle:
@@ -1260,7 +1264,7 @@ def _normalise_feature_spec(x, directed: bool) -> Tuple[List[str], Dict[str, str
 
     Semantics:
       True                       -> orientation-aware automatic canonical feature set
-      list/tuple/set             -> canonical names/macros and/or `(name, type)` custom entries
+      list                       -> canonical names/macros and/or `(name, type)` custom entries
       str                        -> [str]
       False/None/[]              -> []
 
@@ -1404,7 +1408,7 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
             else:
                 feats_np = task_obj.extract_features(A_np, feature_set=feature_list)
         else:
-            # last resort: no features
+            # Without bench/task extract_features, canonical auto-derivation is unavailable
             feats_np = {}
 
     # Ensure numpy dtype/shape sanity and convert to torch
@@ -1473,11 +1477,11 @@ def _augment_with_canonical_features(ds_like, bench, hooks, directed):
     Canonical features are pipeline-owned, split-level outputs. Custom features
     remain user-supplied and are used only where the dataset provides them.
 
-    This helper probes the split once to determine which requested canonical
-    features are absent from the split representation. If any are missing, it
-    wraps the dataset and derives exactly those canonical features from each
-    item's adjacency matrix on access. If none are missing, or no features are
-    requested, the original dataset is returned unwrapped.
+    The first sample is intentionally the authoritative split-schema probe.
+    This is not a per-sample repair pass. If a requested canonical key is absent
+    from sample 0, the dataset is wrapped and that feature is derived for every
+    item on access. If the key is present in sample 0, the split is trusted to
+    provide it consistently and later samples are not scanned or repaired.
     """
     requested = _normalise_feature_set(getattr(hooks, "feature_set", False), directed=directed)
     if not requested:
@@ -1506,16 +1510,11 @@ def _augment_with_canonical_features(ds_like, bench, hooks, directed):
     if not missing:
         return ds_like
 
-    print(
-        f"[INFO] Pre-divided dataset is missing requested canonical feature(s) {missing}. "
-        f"Auto-deriving from adjacency.",
-        flush=True
-    )
-
     class _CanonicalAugmentedDataset(Dataset):
         def __init__(self, base):
             self.base = base
             self._cached_missing = [None] * len(base)
+            self._pipeline_persistent_workers = True
 
         def __len__(self):
             return len(self.base)
@@ -1699,30 +1698,9 @@ class MatrixMLPBase(nn.Module):
     Base class for per-edge Matrix MLPs. Expects self.net to be defined by subclasses.
 
     Each edge position is scored independently — there is no spatial coupling between (i, j) pairs.
-    As a consequence, running the MLP on any subset of rows produces bit-for-bit identical results
-    to running it on the full grid. The supported training/evaluation paths exploit this through
-    `_forward_flat`, gathering only supervised pairs and skipping padding/non-supervised positions.
-    `forward` and `_flatten_edges` are retained as the standard full-grid `nn.Module` inference
-    interface, including for models restored from checkpoints.
+    Supported training/evaluation paths gather only supervised pairs and score them through
+    `_forward_flat`, skipping padding and non-supervised positions.
     """
-    def _flatten_edges(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
-        if x.dim() != 4:
-            raise RuntimeError(f"Expected 4D input, got {x.shape}")
-
-        B = x.size(0)
-        in_features = getattr(self.net[0], "in_features")
-
-        # Pipeline strictly provides BCHW: (B, C, N, N)
-        if x.size(1) != in_features:
-            raise RuntimeError(f"Channel mismatch: x={tuple(x.shape)}, expected {in_features} at dim 1")
-             
-        N = x.size(2)
-        assert N == x.size(3), "Expected square N×N"
-        
-        # Safely permute to BHWC then flatten
-        x2d = x.permute(0, 2, 3, 1).contiguous().view(B * N * N, in_features)
-        return x2d, (B, N, N)
-
     def _forward_flat(self, x2d: torch.Tensor) -> torch.Tensor:
         """
         Returns logits on the same device as model parameters.
@@ -1736,15 +1714,6 @@ class MatrixMLPBase(nn.Module):
         
         xb = x2d.to(device=dev, dtype=dtype, non_blocking=True)
         return self.net(xb)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x2d, (B, N, _) = self._flatten_edges(x)
-        y2d = self._forward_flat(x2d)  # (E, out) on model device
-        out_dim = y2d.size(-1)
-        if out_dim == 1:
-            return y2d.view(B, N, N)  # (B, N, N)
-        else:
-            return y2d.view(B, N, N, out_dim).permute(0, 3, 1, 2)  # (B, K, N, N)
 
 
 class MatrixFeatureMLP(MatrixMLPBase):
@@ -2045,7 +2014,7 @@ class PatchTransformer(nn.Module):
             keep_ratio_per_graph = base.float().mean(dim=(1, 2))
             meets_threshold = (keep_ratio_per_graph > self.min_keep_ratio).view(B, 1, 1)
             m = torch.where(meets_threshold, base, torch.ones((B, N, N), dtype=torch.bool, device=device))
-        else:  # "from_mask" (backwards-compatible default)
+        else:  # "from_mask"
             if _task_mask is not None and _task_mask.any():
                 m = _task_mask.to(device=device, dtype=torch.bool)
             else:
@@ -2136,6 +2105,7 @@ class TNNTrainConfig:
     # What to zero at the supervised (i,j) pixel when building BCHW inputs:
     #   "all"      → zero every channel at (i,j)
     #   "adj_only" → zero only the 'adj' channel at (i,j); non-adj features remain visible
+    #   "none"     → no redaction; all channels remain visible at (i,j)
     supervised_redaction_policy: Literal["all", "adj_only", "none"] = "adj_only"
 
     # MLPs
@@ -2278,15 +2248,16 @@ def forward_logits_common(
     model_key, model, device
 ):
     """
-        Build BCHW inputs from (A, feats, mask), standardise with registry stats, slice to keep_idx,
-        apply the final visibility gate across ALL channels, and run the selected head.
+    Build BCHW inputs from (A, feats, mask), standardise with registry stats,
+    and run the selected head.
 
-        Redaction policy: controlled by registry.supervised_redaction_policy ("all" | "adj_only").
-        Apply the final visibility gate per policy ("all" → all channels, "adj_only" → only 'adj')
+    Redaction is applied during `registry.stack_channels_BCHW`, before
+    standardisation, according to `registry.supervised_redaction_policy`
+    ("all" | "adj_only" | "none").
 
-        Returns:
-            logits: (B, N, N) for binary heads, or (B, K, N, N) for multiclass heads.
-        """
+    Returns:
+        logits: (B, N, N) for binary heads, or (B, K, N, N) for multiclass heads.
+    """
     # ------------------------------
     # 1) Move adjacency/mask to device (feats moved inside stacker as needed)
     # ------------------------------
@@ -2300,7 +2271,7 @@ def forward_logits_common(
         m_in = mask.to(device, non_blocking=True)
 
     # ------------------------------
-    # 2) Assemble channels and slice immediately
+    # 2) Assemble channels
     # ------------------------------
     # x_bchw: (B, C_all, N, N)
     x_bchw = registry.stack_channels_BCHW(
@@ -2311,12 +2282,10 @@ def forward_logits_common(
     if keep_idx is None or len(keep_idx) == 0:
         raise ValueError("keep_idx is empty; no input channels to feed the model.")
         
-    x_bchw = x_bchw[:, keep_idx, :, :]  # Slice first (B, C_eff, N, N)
-
     # ------------------------------
-    # 3) Standardise only the kept channels
+    # 3) Standardise the manifest channels
     # ------------------------------
-    x_bchw_std = registry.standardise_bchw(x_bchw, keep_idx=keep_idx)
+    x_bchw_std = registry.standardise_bchw(x_bchw)
 
     # ------------------------------
     # 4) Forward through the selected head - TX can optionally take a task mask
@@ -2336,7 +2305,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     This version:
       - Never includes 'adj' in feature_keys (it's handled by the registry/manifest).
       - Builds keep_idx from registry.manifest and includes exactly one 'adj' for TX (or if allow_adj_channel=True).
-      - Uses the same stack -> standardise -> slice (keep_idx) contract in both train and eval.
+      - Uses the same stack -> standardise manifest-channel contract in both train and eval.
       - Leaves your optimiser/scheduler structure unchanged (uses existing 'criterion', 'optimiser', 'scaler' names).
     """
     # ------------------------------------------------------------
@@ -2597,8 +2566,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                         A_dev, feats, m_dev, feature_keys,
                         include_adj=("adj" in getattr(registry, "manifest", []))
                     )
-                    x_bchw = x_bchw[:, keep_idx, :, :]
-                    x_bchw_std = registry.standardise_bchw(x_bchw, keep_idx=keep_idx)
+                    x_bchw_std = registry.standardise_bchw(x_bchw)
 
                     b_dev = idx_cpu[:, 0].to(DEVICE, non_blocking=True)
                     i_dev = idx_cpu[:, 1].to(DEVICE, non_blocking=True)
@@ -2805,8 +2773,7 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
                 A_dev, feats, m_dev, feature_keys,
                 include_adj=("adj" in getattr(registry, "manifest", []))
             )
-            x_bchw = x_bchw[:, keep_idx, :, :]
-            x_bchw_std = registry.standardise_bchw(x_bchw, keep_idx=keep_idx)
+            x_bchw_std = registry.standardise_bchw(x_bchw)
 
             # Index (B, C_eff, N, N) at supervised positions → (E, C_eff).
             # Mixed advanced+slice indexing: advanced dims 0/2/3 broadcast to (E,),
@@ -3060,7 +3027,25 @@ def run_random_forest_for_task(
     # Fit/refresh registry stats for RF with the pipeline-resolved list
     registry.fit(train_loader, rf_keys, include_adj=bool(allow_adj_channel))
 
-    # Collect a split into (E,C) and labels (with optional reservoir sampling) 
+    def _iter_split_rows(loader: DataLoader):
+        for A, feats, L, mask in loader:
+            x_bchw = registry.stack_channels_BCHW(
+                A, feats, mask, rf_keys, include_adj=("adj" in getattr(registry, "manifest", []))
+            )
+            x_bchw = registry.standardise_bchw(x_bchw)
+
+            m = effective_mask(mask, A, registry.directed)
+            if edges_only:
+                m = m & (A > 0.5)
+            if not m.any():
+                continue
+
+            idx = torch.nonzero(m, as_tuple=False)
+            X_c = x_bchw[idx[:, 0], :, idx[:, 1], idx[:, 2]].numpy()
+            y_c = L[idx[:, 0], idx[:, 1], idx[:, 2]].numpy()
+            yield X_c, y_c
+
+    # Collect a split into (E,C) and labels (with optional reservoir sampling)
     def _collect_split(loader: DataLoader, enforce_cap: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         rng = np.random.default_rng(getattr(task, "seed", None))
         X_res, y_res = None, None
@@ -3073,23 +3058,7 @@ def run_random_forest_for_task(
         max_neg = cap - max_pos if is_capped_binary else cap
 
         with torch.no_grad():
-            for A, feats, L, mask in loader:
-                x_bchw = registry.stack_channels_BCHW(
-                    A, feats, mask, rf_keys, include_adj=("adj" in getattr(registry, "manifest", []))
-                )
-                x_bchw = registry.standardise_bchw(x_bchw)
-                
-                m = effective_mask(mask, A, registry.directed)
-                if edges_only:
-                    m = m & (A > 0.5)
-                if not m.any():
-                    continue
-
-                idx = torch.nonzero(m, as_tuple=False)
-                X_c = x_bchw[idx[:, 0], :, idx[:, 1], idx[:, 2]]
-                X_c = X_c.numpy()
-                y_c = L[idx[:, 0], idx[:, 1], idx[:, 2]].numpy()
-                
+            for X_c, y_c in _iter_split_rows(loader):
                 if X_res is None:
                     alloc_size = int(cap) if (enforce_cap and max_edges and (num_classes > 1 or is_global_capped_binary)) \
                         else (int(max_pos + max_neg) if enforce_cap and max_edges else 0)
@@ -3102,11 +3071,13 @@ def run_random_forest_for_task(
                     continue
 
                 if num_classes > 1:
-                    n_fill = min(int(cap) - seen_multi, X_c.shape[0])
+                    # Clamp: a full reservoir must start replacement at row 0
+                    n_fill = max(0, min(int(cap) - seen_multi, X_c.shape[0]))
                     if n_fill > 0:
                         X_res[seen_multi:seen_multi + n_fill] = X_c[:n_fill]
                         y_res[seen_multi:seen_multi + n_fill] = y_c[:n_fill]
                         seen_multi += n_fill
+
                     for i in range(n_fill, X_c.shape[0]):
                         j = rng.integers(0, seen_multi + 1)
                         if j < cap:
@@ -3114,11 +3085,13 @@ def run_random_forest_for_task(
                         seen_multi += 1
                 elif is_global_capped_binary:
                     y_c = (y_c > 0.5).astype(np.float32)
-                    n_fill = min(int(cap) - seen_bin, X_c.shape[0])
+                    # Clamp: a full reservoir must start replacement at row 0, never a negative index.
+                    n_fill = max(0, min(int(cap) - seen_bin, X_c.shape[0]))
                     if n_fill > 0:
                         X_res[seen_bin:seen_bin + n_fill] = X_c[:n_fill]
                         y_res[seen_bin:seen_bin + n_fill] = y_c[:n_fill]
                         seen_bin += n_fill
+
                     for i in range(n_fill, X_c.shape[0]):
                         j = rng.integers(0, seen_bin + 1)
                         if j < cap:
@@ -3189,7 +3162,7 @@ def run_random_forest_for_task(
             return X_res[:valid], y_res[:valid]
         
         valid_pos = min(seen_pos, int(max_pos))
-        if rf_neg_pos_ratio > 0 and valid_pos > 0:
+        if valid_pos > 0:
             target_neg = max(1, int(valid_pos * rf_neg_pos_ratio))
         else:
             # No positives to balance against: keep the available negatives up to the cap
@@ -3278,6 +3251,24 @@ def run_random_forest_for_task(
                         full_probs[:, c] = probs[:, i]
                 return full_probs
             return probs
+
+    def _predict_split(loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
+        prob_parts, y_parts = [], []
+
+        with torch.no_grad():
+            for X_c, y_c in _iter_split_rows(loader):
+                prob_parts.append(_predict_probas(rf, X_c, num_classes))
+                y_parts.append(
+                    (y_c > 0.5).astype(np.float32)
+                    if num_classes == 1 else y_c.astype(np.int64)
+                )
+
+        if not y_parts:
+            prob_shape = (0,) if num_classes == 1 else (0, num_classes)
+            y_dtype = np.float32 if num_classes == 1 else np.int64
+            return np.empty(prob_shape, dtype=np.float32), np.empty((0,), dtype=y_dtype)
+
+        return np.concatenate(prob_parts, axis=0), np.concatenate(y_parts, axis=0)
 
     def _metrics_from_probs(
             probs: np.ndarray,
@@ -3380,21 +3371,19 @@ def run_random_forest_for_task(
         }
 
     # --- Val/Test ---
-    Xv, yv = _collect_split(val_loader)
-    if Xv.shape[0] == 0:
+    pv, yv = _predict_split(val_loader)
+    if yv.size == 0:
         thr = 0.5 if num_classes == 1 else None
         val_m = _empty_metrics()
     else:
-        pv = _predict_probas(rf, Xv, num_classes)
         thr, val_m = _metrics_from_probs(pv, yv, fixed_thr=None, threshold_metric=threshold_metric)
         val_m["_prob"] = pv.astype(np.float32).tolist()
         val_m["_y"] = yv.astype(int).tolist()
 
-    Xt, yt = _collect_split(test_loader)
-    if Xt.shape[0] == 0:
+    pt, yt = _predict_split(test_loader)
+    if yt.size == 0:
         test_m = _empty_metrics()
     else:
-        pt = _predict_probas(rf, Xt, num_classes)
         _, test_m = _metrics_from_probs(pt, yt, fixed_thr=thr, threshold_metric=threshold_metric)
         test_m["_prob"] = pt.astype(np.float32).tolist()
         test_m["_y"] = yt.astype(int).tolist()

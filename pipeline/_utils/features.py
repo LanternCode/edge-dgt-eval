@@ -120,13 +120,17 @@ def pairwise_for_pairs(
         is_directed: bool = True,
         row_deg: Optional[Tensor] = None,
         col_deg: Optional[Tensor] = None,
-        chunk_size: int = 4096
+        chunk_size: int = 4096,
+        prebinarized: bool = False
 ) -> Dict[str, Tensor]:
     """
     Compute pairwise features only for specific (src, dst) pairs.
     Pair rows are processed in chunks so temporary memory is O(chunk_size * N).
     """
-    if A.is_sparse:
+    if prebinarized:
+        A01 = A.to_dense() if A.is_sparse else A
+        A01 = A01.to(dtype=torch.float32)
+    elif A.is_sparse:
         A01 = (A.to_dense() > 0).to(dtype=torch.float32)
     else:
         A01 = torch.gt(A, 0).to(dtype=torch.float32)

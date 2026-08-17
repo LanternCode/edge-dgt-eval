@@ -481,6 +481,12 @@ class GraphBenchmark:
 
             F = {k: (v.astype(np.float32) if v is not None else None) for k, v in F_extra.items()}
             L = fast_label_fn(A_obs, A_true, G_true).astype(np.float32, copy=False)
+            if L.shape != A_obs.shape:
+                raise ValueError(
+                    f"[LABEL SHAPE] hooks.label_fn returned {L.shape} for graph {i}/{total} "
+                    f"(type '{gtype}', adjacency {A_obs.shape}). Label matrices must match the "
+                    f"observed adjacency exactly."
+                )
 
             graphs.append(A_obs.astype(np.float32, copy=False))
             labels.append(L)
@@ -573,9 +579,10 @@ class GraphBenchmark:
             g.manual_seed(int(seed))
 
         train_shuffle = len(train_ds) > 0
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=train_shuffle, collate_fn=collate_fn, pin_memory=pin, generator=g, num_workers=num_workers)
-        val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin, num_workers=num_workers)
-        test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin, num_workers=num_workers)
+        persistent = bool(num_workers > 0 and getattr(dataset, "_pipeline_persistent_workers", False))
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=train_shuffle, collate_fn=collate_fn, pin_memory=pin, generator=g, num_workers=num_workers, persistent_workers=persistent)
+        val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin, num_workers=num_workers, persistent_workers=persistent)
+        test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin, num_workers=num_workers, persistent_workers=persistent)
         return train_loader, val_loader, test_loader
 
     # ------------------------------------------------------------------ #

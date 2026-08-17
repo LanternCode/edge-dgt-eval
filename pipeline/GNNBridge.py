@@ -172,7 +172,7 @@ def _assemble_features_for_graph(
         feats: Dict[str, torch.Tensor],
         node_mask: torch.Tensor,
         edge_mask: torch.Tensor,
-        schema: Optional[Dict[str, Any]] = None,
+        schema: Dict[str, Any],
         lap_pe_k: int = 0,
         lap_pe_sign_flip: bool = False,
         rwse_steps: int = 0,
@@ -180,7 +180,10 @@ def _assemble_features_for_graph(
         append_pairwise: bool = True,
         is_directed: bool = False,
         extra_edge_mask: Optional[torch.Tensor] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor,
+    Union[torch.Tensor, Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
+]:
     """
     Build node features X and edge/pairwise features E for a single (possibly padded) graph
 
@@ -215,7 +218,7 @@ def _assemble_features_for_graph(
               - edge/pairwise features shaped (N, N),
               - scalars (treated as constants),
             and possibly other tensors; non-tensor / non-ndarray entries are ignored.
-            If `schema` is provided, it controls which keys are used
+            The required `schema` controls which keys are used
         node_mask:
             Node validity mask, shape (N,) boolean. True = real node, False = padding.
             Must be pre-normalised by the caller (_prepare_features_batch)
@@ -223,7 +226,7 @@ def _assemble_features_for_graph(
             Active edge mask, shape (N, N) boolean. Used for E masking and
             edge z-scoring. Must be pre-normalised by the caller
         schema:
-            Optional schema containing "node_keys" and/or "edge_keys" lists that define
+            Required schema containing "node_keys" and "edge_keys" lists that define
             which feature keys to include and in what order
         lap_pe_k:
             Number of Laplacian positional encoding eigenvectors to append to X
@@ -237,6 +240,9 @@ def _assemble_features_for_graph(
         append_pairwise:
             If True, append derived pairwise features (FeatureRegistry.HEAVY_PAIRWISE_KEYS)
             as supported by `pairwise_batch_from_adj`
+        extra_edge_mask:
+            Optional mask selecting observed/local message-passing edges. When supplied,
+            the second return value is `(E, E_local)` rather than `E`.
 
     Returns:
         X:
@@ -245,7 +251,9 @@ def _assemble_features_for_graph(
         E:
             Edge/pairwise feature cube of shape (N, N, F_edge), sanitised, masked on
             inactive edges, and per-graph z-scored (using `edge_mask`). If
-            `build_edge_mats` is False, shape is (N, N, 0)
+            `build_edge_mats` is False, shape is (N, N, 0). When `extra_edge_mask`
+            is supplied, the second return value is `(E, E_local)`, where `E_local`
+            is `(edge_ids, edge_attr)` for the selected local message passing edges.
     """
     N = int(A.size(0))
     dev = A.device
@@ -1411,13 +1419,6 @@ class GraphEdgeClassifier(nn.Module):
             Z_batch = self.enc(A_for_enc, X_batch, node_mask)
 
         d = int(Z_batch[0].size(1))
-        for Eb in E_batch:
-            if Eb.numel() and int(Eb.size(-1)) != Fe:
-                raise ValueError(
-                    f"[MODEL ERROR] Inconsistent edge feature width across batch. "
-                    f"The full-matrix GNN decoder expects a single schema-fixed Fe per batch; "
-                    f"expected Fe={Fe}, got Fe={int(Eb.size(-1))}."
-                )
         if self.dec is None:
             self.dec = self._build_decoder(d, Fe).to(dev)
 
@@ -1527,7 +1528,8 @@ class GraphEdgeClassifier(nn.Module):
             A01, src, dst, pairwise_keys,
             is_directed=is_directed,
             row_deg=row_deg,
-            col_deg=col_deg
+            col_deg=col_deg,
+            prebinarized=True
         )
         cn = pairwise_feats["cn"]
         jacc = pairwise_feats["jaccard"]
@@ -1668,7 +1670,7 @@ def _balance_binary_negpos(y_sel: torch.Tensor, ratio: float) -> torch.Tensor:
     if target_neg < neg_idx.numel():
         perm = torch.randperm(neg_idx.numel(), device=y_sel.device)[:target_neg]
         neg_idx = neg_idx[perm]
-    elif target_neg > neg_idx.numel() and neg_idx.numel() > 0:
+    elif target_neg > neg_idx.numel():
         deficit = target_neg - neg_idx.numel()
         repl = neg_idx[torch.randint(0, neg_idx.numel(), (deficit,), device=y_sel.device)]
         neg_idx = torch.cat([neg_idx, repl])
@@ -2017,7 +2019,7 @@ def train_one_gnn(
         A0_dev = A0.to(device)
         M0_dev = M0.to(device)
         A0_enc = _redact_supervised_edges(A0_dev, M0_dev, zero_supervised)
-        _ = model(A0_enc, feats0, M0_dev)
+        _ = model._encode_batch(A0_enc, feats0, M0_dev)
 
     # Optimiser, scaler and scheduler
     optimiser = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
@@ -2628,19 +2630,25 @@ def _drop_edges(A: torch.Tensor, p: float, directed: bool) -> torch.Tensor:
 
     # Dense path (2D or (1,N,N))
     orig_dim = A.dim()
-    if orig_dim == 2:
-        A = A.unsqueeze(0)
-    B, N, _ = A.shape
+    A_batch = A.unsqueeze(0) if orig_dim == 2 else A
+    out = A_batch.clone()
 
-    dev = A.device
-    keep = (torch.rand((B, N, N), device=dev) > p).to(dtype=A.dtype)
-    if not directed:
-        keep = torch.triu(keep, diagonal=1)
-        keep = (keep + keep.transpose(-1, -2) > 0).to(dtype=A.dtype)
+    if directed:
+        edge_idx = torch.nonzero(A_batch != 0, as_tuple=False)
+        if edge_idx.numel():
+            edge_idx = edge_idx[edge_idx[:, 1] != edge_idx[:, 2]]
+            if edge_idx.numel():
+                keep = (torch.rand(edge_idx.size(0), device=A_batch.device) > p).to(A_batch.dtype)
+                out[edge_idx[:, 0], edge_idx[:, 1], edge_idx[:, 2]] *= keep
+    else:
+        present = (A_batch != 0) | (A_batch.transpose(-1, -2) != 0)
+        pair_idx = torch.nonzero(torch.triu(present, diagonal=1), as_tuple=False)
+        if pair_idx.numel():
+            keep = (torch.rand(pair_idx.size(0), device=A_batch.device) > p).to(A_batch.dtype)
+            b, i, j = pair_idx[:, 0], pair_idx[:, 1], pair_idx[:, 2]
+            out[b, i, j] *= keep
+            out[b, j, i] *= keep
 
-    eye = torch.eye(N, device=dev, dtype=A.dtype).unsqueeze(0)
-    out = A * keep
-    out = out * (1.0 - eye) + A * eye  # preserve diagonal from A
     return out if orig_dim == 3 else out.squeeze(0)
 
 

@@ -282,7 +282,7 @@ The built-in `GraphBenchmark` generates synthetic graphs from the following fami
 | `erdos_renyi` | Uniform random edges (p = 3.5/N) | Native (NetworkX) |
 | `barabasi_albert` | Preferential attachment (m=2); scale-free degree distribution | Bollobás scale-free model |
 | `watts_strogatz` | Small-world with local structure and random rewiring | Custom directed analogue |
-| `random_regular` | Strict 4-regular graph | Eulerian circuit orientation (in=out=2) |
+| `random_regular` | 4-regular graph for N > 4. Cycle graph for N ≤ 4 | Eulerian circuit orientation (in=out=2) |
 | `stochastic_block` | 2-block community structure (p\_in > p\_out) | Native (NetworkX) |
 | `powerlaw_cluster` | Holme-Kim: scale-free hubs with high clustering | Directed triad formation |
 | `random_geometric` | Spatial proximity with radius r = √(3.5/Nπ) | K-nearest neighbours (K=3) |
@@ -424,7 +424,7 @@ Notes:
 - `gps_rwse_steps` controls GPS-owned random-walk structural encodings. These are not part of `hooks.feature_set` and are not requested by `feature_set=True`.
 - `gnn_zero_supervised` controls adjacency redaction uniformly across GNN encoders; GPS derives its model-owned structural processing from that same model-visible adjacency.
 - `neg_pos_ratio` controls negative-to-positive sampling ratio for binary GNN training. `None` (default) disables ratio-based sampling and uses `pos_weight` instead.
-- `use_tree_aux_loss=True` adds an auxiliary penalty pulling the expected number of predicted edges toward `N-1`. It does not detect cycles or enforce connectivity. Only meaningful for spanning-tree tasks. Automatically disabled in Scalable Mode.
+- `use_tree_aux_loss=True` adds an auxiliary penalty pulling the expected number of predicted edges toward `n - 1`, capped by the number of supervised candidate pairs. `n` counts nodes that carry a supervised pair or an observed edge, which equals the graph size under the default all-ones mask and excludes isolated nodes under a sparse mask. It does not detect cycles or enforce connectivity. Only meaningful for spanning-tree tasks. Automatically disabled in Scalable Mode.
 - Summary display formatting is set on the runner call itself, e.g. `run_gnn_suite(..., display_decimals=6, display_truncate=True)`.
 
 ---
@@ -478,6 +478,8 @@ Controls what gets zeroed at supervised `(i, j)` positions in BCHW inputs:
 | `"all"` | Zero every applicable input channel at task-mask positions |
 | `"none"` | No redaction |
 
+Interaction with channel statistics: statistics are fitted only on positions selected by `effective_mask` after channel assembly/redaction, then applied to all positions in each manifest channel. If a channel is constant on the supervised positions, its fitted variance is zero even if that channel varies elsewhere; `standardise_bchw` then relies on its minimum-standard-deviation and output clamps. This can occur under any redaction policy — for example, when `effective_mask` selects only observed edges and the adjacency channel is therefore constant on the fitted positions. This sampling-domain behaviour is separate from which channels the redaction policy zeroes.
+
 #### GNN-side redaction
 
 The GNN pipeline uses a separate flag, `cfg.gnn_zero_supervised`, which controls whether supervised edges are zeroed in the adjacency matrix before message passing.
@@ -525,7 +527,7 @@ hooks = TaskHooks(
 
 The custom type is mandatory; custom node/edge semantics are not inferred from a square tensor. Canonical strings, macros, `True`, and `False` retain their existing meaning.
 
-For supported pre-divided datasets, requested canonical features are treated as split-level pipeline outputs. Custom features remain user-supplied and may be present only where the user provides them.
+For supported pre-divided datasets, canonical-feature availability is a **split-level schema decision, not a per-sample repair pass**. The first sample of each split is the schema probe. If a requested canonical key is absent from that probe, the pipeline wraps the split and derives that feature from every item's adjacency on access. If the key is present in the probe, the split is treated as already providing that feature and later samples are not scanned or repaired individually. A canonical key supplied by a pre-divided dataset must therefore be supplied consistently across that split; omission or `None` in later samples is inconsistent user data, not a request for pipeline re-derivation. Custom features remain user-supplied and may be present only where the user provides them.
 
 Non-square 2D inputs are treated as node features when no explicit custom type is available. `(F, N)` node inputs are transposed to `(N, F)` when the second dimension matches the graph dimension.
 
@@ -559,6 +561,7 @@ Label validity contract on supported paths:
 - This pipeline does **not** use ignore-index labels for padding or masking.
 - Padding is represented by `mask == False`, not by a sentinel target such as `-1`.
 - `collate_fn_pad(...)` pads `L` with `0` and pads `mask` with `False`.
+- Label and evaluation-mask matrices must be `(N, N)`, matching the adjacency. Roles are assigned positionally, so a mis-shaped matrix is rejected during collation.
 - For multiclass tasks, label matrices must contain finite integer class IDs in `[0, num_classes - 1]`. Invalid values are rejected during collation.
 
 ### (B) Transformer token-keep mask
@@ -622,8 +625,7 @@ train_and_eval_one_model(...)
   → registry.fit(train_loader, feature_keys)              [compute channel stats]
   → forward_logits_common(A, feats, mask, ...)
        → registry.stack_channels_BCHW(...)                [assemble + redact]
-       → x_bchw = x_bchw[:, keep_idx, :, :]               [slice to effective channels]
-       → x_bchw_std = registry.standardise_bchw(...)      [apply train stats to kept channels]
+       → x_bchw_std = registry.standardise_bchw(x_bchw)   [apply train stats to manifest channels]
        → model(x_bchw_std)                                [or model(x_bchw_std, _task_mask=m) for TX]
 ```
 
@@ -633,16 +635,23 @@ train_and_eval_one_model(...)
 collate_fn_pad(batch)
   → (A_batch, F_list, L_batch, M_batch)
 
-train_one_gnn(...)
+run_gnn_suite(...)
+  → _resolve_loaders(task, cfg)
   → _infer_feature_schema([train, val, test], requested_keys=feature_keys)
-  → _redact_supervised_edges(A, mask, ...)        [zero supervised in A]
-  → _prepare_features_batch(A, feats, mask, ...)  [per-graph X, E, node_mask]
-       → _assemble_features_for_graph(...)        [build X(N, F), E(N, N, Fe)]
-            → zscore_nodes_per_graph(X)
-            → zscore_edges_per_graph(E)
-  → GPS only: _prepare_gps_local_edge_features(...) [local message-passing edge features]
-  → model.enc.forward(A, X_batch, node_mask)        [encode → Z_batch]
-  → model.dec.forward(Z_batch, node_mask, E_batch)  [decode → logits]
+  → train_one_gnn(...) per encoder:
+       → _redact_supervised_edges(A, mask, ...)          [zero supervised in A]
+       → _supervised_indices(...)                        [select supervised pairs]
+       → model.score_pairs_selected(...)                 [default path]
+            → model._encode_batch(...)
+                 → _prepare_features_batch(...)
+                      → _assemble_features_for_graph(...) [build X(N, F), E(N, N, Fe)]
+                           → zscore_nodes_per_graph(X)
+                           → zscore_edges_per_graph(E)
+                           → GPS only: local edge features, normalised over observed edges
+                 → _prepare_adj_for_encoder(...)
+                 → model.enc(...)                         [encode → Z_batch]
+            → model.dec.score_pairs(...)                  [score selected pairs]
+       → model(...) only when use_tree_aux_loss=True      [full-grid logits]
 ```
 
 ### Loader → Model (GNN, Scalable Mode)
@@ -675,7 +684,7 @@ All three runner entry points return a `bundle` dictionary:
             "val":  { "f1": ..., "precision": ..., "recall": ..., ..., "_prob": [...], "_y": [...] },
             "test": { "f1": ..., "precision": ..., "recall": ..., ..., "_prob": [...], "_y": [...] },
             "thr":  0.42,           # tuned threshold (binary) or None (multiclass)
-            "ckpt": "saved_checkpoints/task_name/YYYYMMDD_HHMMSS/model_key.pth",
+            "ckpt": "saved_checkpoints/task_name/YYYYMMDD_HHMMSS_ffffff/model_key.pth"
         },
         # ...
     },
@@ -703,7 +712,7 @@ For non-empty evaluated splits, metrics dicts also carry `_prob` (per-pair predi
 }
 ```
 
-Saved to `saved_checkpoints/<task.name>/<timestamp>/<model_key>.pth` via `save_pipeline_checkpoint(...)`.
+Saved to `saved_checkpoints/<task.name>/<timestamp>/<model_key>.pth` via `save_pipeline_checkpoint(...)`. The timestamp is `YYYYMMDD_HHMMSS_ffffff`; microsecond precision keeps runs starting within the same second in separate directories. Every checkpoint written during one run shares a single timestamp.
 
 Common dense-pipeline metadata fields include: `manifest`, `use_mask_channel`, `directed`, `supervised_redaction_policy`, `edges_only`, `seed`, `feature_keys`, `keep_idx`, `eff_in_ch`.
 
@@ -746,9 +755,11 @@ The following are **intentional** and should not be flagged as bugs, inconsisten
 
 | Aspect | Dense pipeline | GNN pipeline |
 |--------|----------------|--------------|
-| Normalisation | Dataset-level channel stats (fit on train) | Per-graph z-score |
+| Normalisation | Dataset-level channel stats (up to 1,024 batches) | Per-graph z-score |
 | Input format | BCHW tensor (all graphs padded to `N_max`) | Per-graph lists of `(N, F)` and `(N, N, Fe)` |
 | Adjacency redaction | Inside `stack_channels_BCHW` during channel assembly | Via `_redact_supervised_edges` before encoding |
+
+Dense normalisation intentionally uses a **bounded statistics pass**, not an exhaustive reduction over the entire training split. `FeatureRegistry.compute_channel_stats(...)` consumes at most the first 1,024 batches yielded by the training loader. If the training loader contains more than 1,024 batches, the fitted mean/std are therefore estimates from that bounded pass; changing batch size or loader order can change the estimate because it changes which examples fall inside the 1,024-batch window. This cap is an intentional bound on normalisation setup work.
 
 The redaction logic is duplicated across pipelines because it integrates at different architectural points. The dense path redacts during BCHW assembly (where it can also redact derived channels), while the GNN path redacts the raw adjacency before message passing.
 
@@ -791,6 +802,37 @@ For `ProvidedSplitsTask`, the supported entry points resolve loaders via `_resol
 
 The pipeline supports task wrapping. Some internal utilities inspect `base_task` when the top-level task object does not explicitly define a required property. Metadata serialisation is taken from the top-level task object used by the runner.
 
+### Canonical feature resolution is schema-level, not per-sample repair
+
+- Generated datasets use the pipeline's canonical feature derivation normally.
+- Pre-divided datasets use sample `0` of each split as the authoritative schema probe. The pipeline does not scan every sample looking for individually missing canonical keys.
+- If the probe already contains a requested canonical key, that split is trusted to provide the declared feature consistently. Later omissions are not automatically repaired.
+- Presence detection is key-based. A key present with value `None` still declares that key as present to the split-schema probe; `None` is not interpreted as a request for re-derivation.
+- Supported single-graph tasks only receive automatically derived canonical features when the benchmark or task exposes an `extract_features(...)` implementation.
+
+These rules avoid an implicit per-sample data-repair pass over user-provided datasets. They are part of the supported data contract and should not be reported as failures of canonical-feature ownership.
+
+### Dense normalisation uses a bounded 1,024-batch statistics pass
+
+Dense channel mean/std fitting consumes at most 1,024 batches from the training loader. It is a bounded estimate of the training distribution, not an exhaustive whole-dataset reduction. For training loaders longer than 1,024 batches, the fitted statistics may depend on batch size and loader order because those determine which examples are observed within the bounded pass. The fitted statistics are then reused for validation/test standardisation and by compatible dense-model stages through the normal statistics cache.
+
+### GPS structural encodings are recomputed per batch, not cached
+
+`_assemble_features_for_graph` recomputes the LapPE eigendecomposition and the RWSE matrix powers on every batch of every epoch. Both are deterministic functions of the model-visible pre-DropEdge adjacency, and both operate on the unpadded valid-node submatrix, so they are genuinely cacheable across epochs. This is a deliberate decision, not an oversight, and it should not be reported as redundancy.
+
+It was measured on an instrumented `run_gnn_suite(..., encoders=["gps"])`, comparing the current code against a variant that memoises both encodings on their content:
+
+| Configuration | LapPE `eigh` | RWSE | Recoverable share of wall |
+|---|---|---|---|
+| `max_nodes=140`, 120 graphs, 5 epochs | 1.46 s / 564 calls → 0.33 s / 120 calls | 1.40 s → 0.82 s | ~3% |
+| `max_nodes=300`, 24 graphs, 3 epochs | 0.91 s → 0.36 s | 0.63 s → 0.47 s | ~2% |
+
+Three things make that ceiling not worth taking. Run-to-run wall-clock variance on an identical configuration was 64.1 s versus 74.5 s, roughly five times the effect, so the saving is not separable from noise. The share does not grow with graph size, because encoder and decoder work scales alongside the O(N³) eigendecomposition. And the work exists only under GPS: `_effective_rwse_steps` returns `0` for every other encoder, and `_effective_lap_pe_k` defaults to `0`, so `sage`, `gin`, `gcn`, and `edge_tx` have nothing to cache.
+
+There is also a device asymmetry. Building a content key requires a device-to-host transfer and bit-pack per graph per batch. On CPU that is cheap next to `eigh`; on GPU, where `eigh` at these sizes is sub-millisecond, a synchronising transfer per graph per batch can cost more than it saves. This is why `shortest_path_from_adj` is cached and these are not: BFS is unavoidably host-bound and orders of magnitude more expensive than a matmul, so it clears the same bar these do not.
+
+Reopening this needs a reproducible profile on a supported entry point, on the target device, showing the structural encodings above roughly 10% of wall across repeated runs, and accounting for key-construction cost. A single-run measurement or a microbenchmark of the encodings in isolation is not sufficient.
+
 ---
 
 ## Code Review Scope
@@ -805,7 +847,7 @@ Before reporting: read the target code twice. Check for guards (`torch.where`, `
 
 ### 2. Redundant code
 
-Code that performs identical work twice or can be removed or simplified without changing behaviour. This includes unnecessary type casts, duplicate computations, and re-derivations of values already available in scope. Suboptimal code where a logically equivalent, more efficient implementation exists also qualifies as redundancy. For hot-path performance claims that would change encoder adjacency routing, feature assembly, or training-loop behaviour, report them as findings only when supported by profiling or concrete measurements on a supported code path; otherwise treat them as non-blocking hypotheses, not recommended changes.
+Code that performs identical work twice or can be removed or simplified without changing behaviour. This includes unnecessary type casts, duplicate computations, and re-derivations of values already available in scope. Suboptimal code where a logically equivalent, more efficient implementation exists also qualifies as redundancy. For hot-path performance claims that would change encoder adjacency routing, feature assembly, or training-loop behaviour, report them as findings only when supported by profiling or concrete measurements on a supported code path; otherwise treat them as non-blocking hypotheses, not recommended changes. Caching the GPS structural encodings has already been measured and declined; see "GPS structural encodings are recomputed per batch, not cached" for the numbers and the threshold that would reopen it.
 
 ### 3. Inconsistent behaviour
 
@@ -840,6 +882,8 @@ The following do not qualify under any category and should not be reported:
 - **`getattr` fallback values on attributes that `__init__` always sets.** If a constructor unconditionally assigns `self.x = value`, a downstream `getattr(self, "x", fallback)` is defensive.
 - **Issues behind active guards.** If a guard disables a feature for a particular mode, hypothetical issues within the guarded-off code are not bugs.
 - **Assuming a called function cannot handle an observed input.** If a utility is called with a given shape on multiple exercised supported paths without issues, it handles that shape. Do not flag it as a bug without evidence of failure.
+- **Treating split-level canonical schema resolution as per-sample repair.** Pre-divided datasets intentionally use sample `0` as the authoritative split-schema probe. If that sample declares a requested canonical key, later samples are not scanned or repaired individually.
+- **Treating bounded dense normalisation as an exhaustive whole-dataset reduction.** Dense statistics intentionally consume at most 1,024 training-loader batches. On larger training splits, batch size and loader order may therefore change the fitted estimate. This is documented normalisation policy.
 
 ---
 

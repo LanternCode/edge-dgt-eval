@@ -94,18 +94,15 @@ def finalise_open_run(*_args, **_kwargs) -> None:
         _finalise_open_run_locked()
 
 
-def get_active_run_checkpoint_timestamp() -> Optional[str]:
+def get_active_run_checkpoint_timestamp() -> str:
     """
     Return the checkpoint timestamp owned by the currently active run.
 
-    If a run is open but has not saved anything yet, create the timestamp once
-    and store it in the run metadata. If no run is active, return None so the
-    checkpoint helper can fall back to standalone behavior.
+    If the run has not saved anything yet, create the timestamp once and
+    store it in the run metadata.
     """
     with _LOCK:
         run = _ACTIVE_RUN
-        if run is None or not run.open:
-            return None
 
         meta = run.bundle.setdefault("metadata", {})
         run_meta = meta.setdefault("run", {})
