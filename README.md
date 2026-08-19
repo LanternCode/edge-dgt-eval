@@ -175,8 +175,8 @@ run_gnn_suite(
 | `label_fn` | callable or `None` | Computes the label matrix L. Receives `A_obs`, `A_true`, and/or `G_true` based on parameter name matching. `None` yields all-zero labels. |
 | `feature_set` | `bool` or `list[str | tuple[str, Literal["node", "edge"]]]` | `True` for the orientation-aware automatic canonical feature set, `False` for none, or a list containing canonical names/macros and typed custom declarations such as `("my_feature", "node")` or `("my_feature", "edge")`. |
 | `allow_adj_channel` | `bool` | If `True`, include the observed adjacency as an explicit input channel for dense models. |
-| `orientation` | `str` or `None` | Optional post-generation orientation mode (e.g. `"dag"`). |
-| `ensure_connected` | `bool` | If `True`, enforce connectivity via proportional multi-stitching after generation. |
+| `orientation` | `str` or `None` | Optional post-generation orientation mode (e.g. `"dag"`). DAG mode takes precedence over `ensure_connected`. |
+| `ensure_connected` | `bool` | If `True`, enforce connectivity via proportional multi-stitching after generation. Ignored when `orientation="dag"`. |
 
 ### Supported runner entry points
 
@@ -210,10 +210,9 @@ bundle = run_gnn_edges_suite(task, encoders=["sage"], cfg=cfg)
 
 ### Supported task shapes
 
-All three runners accept only these task shapes:
+All three runners accept only **`ProvidedSplitsTask` (or a subclass)**.
 
-1. **`ProvidedSplitsTask` (or a subclass)** — for generated multi-graph datasets with ratio-based splitting, or pre-split datasets exposed through `bench.splits`. Ratio-based splitting uses integer cut points; zero-sized splits are allowed.
-2. **Single-graph task exposing `task.bench` + `task.hooks`** — for the single-graph benchmark path.
+It supports generated multi-graph datasets with ratio-based splitting, pre-divided datasets exposed through `bench.splits`, and single-graph benchmarks whose `bench.splits` contains boolean split masks. Ratio-based splitting uses integer cut points; zero-sized splits are allowed.
 
 ### Run semantics
 
@@ -243,9 +242,9 @@ Rules:
 
 ```text
 ┌───────────────────────────────────────────────────────────────┐
-│                    Supported task shapes                      │
-│  1) ProvidedSplitsTask / subclass                             │
-│  2) Single-graph task exposing task.bench + task.hooks        │
+│                    Supported task shape                       │
+│                ProvidedSplitsTask / subclass                  │
+│                                                               │
 └────────────┬──────────────────────────┬───────────────────────┘
              │                          │
     ┌────────▼─────────────┐    ┌───────▼──────────────┐
@@ -290,7 +289,7 @@ The built-in `GraphBenchmark` generates synthetic graphs from the following fami
 | `tree_plus_chords` | Random labelled tree + up to 0.75N chord edges | BFS-directed tree + non-reciprocal chords |
 | `shape_cycle` | Incomplete ring topologies (~50% of nodes) + background forest | Forward-directed rings, randomly oriented forest |
 
-Most families hold average degree constant as node count varies: `erdos_renyi`, `random_geometric` and `tree_plus_chords` target ~3.5 explicitly; `barabasi_albert`, `powerlaw_cluster`, `random_regular` and `watts_strogatz` sit around 4; `balanced_tree` and `shape_cycle` around 2. `stochastic_block` is the exception — its `p_in`/`p_out` are drawn from fixed ranges independent of node count, so its average degree grows with graph size (~0.18 x N). They also use an organic mutation step targeting 10–15% edge dropout to break algorithmic perfection. Because an integer number of edges must be removed, that range is not guaranteed when the graph does not contain enough edges to realise it. Small or sparse graphs may therefore have a lower realised dropout fraction or zero removals. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`.
+Most families hold average degree constant as node count varies: `erdos_renyi`, `random_geometric` and `tree_plus_chords` target ~3.5 explicitly; `barabasi_albert`, `powerlaw_cluster`, `random_regular` and `watts_strogatz` sit around 4; `balanced_tree` and `shape_cycle` around 2. `stochastic_block` is the exception — its `p_in`/`p_out` are drawn from fixed ranges independent of node count, so its average degree grows with graph size (~0.18 x N). They also use an organic mutation step targeting 10–15% edge dropout to break algorithmic perfection. Because an integer number of edges must be removed, that range is not guaranteed when the graph does not contain enough edges to realise it. Small or sparse graphs may therefore have a lower realised dropout fraction or zero removals. Optional post-generation connectivity enforcement via proportional multi-stitching is available through `hooks.ensure_connected`; it is ignored when `hooks.orientation="dag"`.
 
 ---
 
@@ -608,11 +607,6 @@ ProvidedSplitsTask._build_loaders()
        → next top-level run:
             clear run cache and regenerate for auto-generated tasks
 
-single-graph task exposing task.bench + task.hooks
-  │
-  └─ _resolve_loaders(...)
-       → _coerce_bench(...)
-       → _build_single_graph_loaders_from_bench(...)
 ```
 
 ### Loader → Model (Dense)
@@ -808,7 +802,7 @@ The pipeline supports task wrapping. Some internal utilities inspect `base_task`
 - Pre-divided datasets use sample `0` of each split as the authoritative schema probe. The pipeline does not scan every sample looking for individually missing canonical keys.
 - If the probe already contains a requested canonical key, that split is trusted to provide the declared feature consistently. Later omissions are not automatically repaired.
 - Presence detection is key-based. A key present with value `None` still declares that key as present to the split-schema probe; `None` is not interpreted as a request for re-derivation.
-- Supported single-graph tasks only receive automatically derived canonical features when the benchmark or task exposes an `extract_features(...)` implementation.
+- On the `ProvidedSplitsTask` single-graph mask-split path, automatically derived canonical features require the benchmark to expose an `extract_features(...)` implementation.
 
 These rules avoid an implicit per-sample data-repair pass over user-provided datasets. They are part of the supported data contract and should not be reported as failures of canonical-feature ownership.
 

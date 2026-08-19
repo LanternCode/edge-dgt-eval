@@ -240,7 +240,6 @@ def begin_or_attach_run(
             quiet=bool(quiet),
             display_decimals=int(display_decimals),
             display_truncate=bool(display_truncate),
-            open=True
         )
         _stamp_bundle(bundle, _ACTIVE_RUN.stages, is_open=True)
         run_meta = bundle["metadata"].setdefault("run", {})

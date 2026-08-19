@@ -25,8 +25,8 @@ or mathematically incorrect results.
 
 Core abstractions
 -----------------
-- TaskSpec: tiny adapter every dataset implements to provide batches of
-  (A_obs, feature_dict, L, mask), plus split loaders.
+- TaskSpec: base task metadata/hooks adapter. Supported runner inputs use
+  ProvidedSplitsTask or a subclass; loader construction is pipeline-owned.
 
 - FeatureRegistry: stacks the features into BHWC/BCHW, computes per-channel
   train-only mean/std, standardises, and records the exact channel manifest.
@@ -44,9 +44,8 @@ Core abstractions
 
 Usage
 -----
-- Supported task entry paths are:
-  (1) ProvidedSplitsTask for generated datasets or pre-split datasets, or
-  (2) a single-graph task exposing `task.bench` + `task.hooks`.
+- The supported task entry path is ProvidedSplitsTask or a subclass.
+  This includes generated datasets, pre-split datasets, and single-graph mask splits.
 - Direct task-provided `train_dataloader` / `val_dataloader` / `test_dataloader`
   entry points are unsupported.
 - Requires `GraphBenchmark` importable on sys.path.
@@ -54,7 +53,7 @@ Usage
 
 Notes
 -----
-- Directed/undirected behaviour comes from the TaskSpec (`task.directed`), not cfg.
+- Directed/undirected behaviour comes from the task (`task.directed`).
 
 Self-loops:
     Adjacency matrices are used as provided by the task/loaders. Dense models and GNN
@@ -553,7 +552,10 @@ class FeatureRegistry:
                 _mat_cache_batch[k] = A_base.transpose(1, 2).contiguous()
             elif k == "shortest_path":
                 _mat_cache_batch[k] = torch.stack([
-                    shortest_path_from_adj(A_base[b], is_directed=self.directed)
+                    shortest_path_from_adj(
+                        A_base[b], is_directed=self.directed,
+                        valid_n=int(feats[b].get("_N", N)) if isinstance(feats[b], dict) else N
+                    )
                     for b in range(B)
                 ], dim=0).to(dtype)
             elif k.startswith("power_"):
@@ -712,19 +714,20 @@ class FeatureRegistry:
                 sumsq_c += q
             count += flat.shape[0]
 
+        # Fallback: zero mean, unit std
         if not count:
-            # Fallback: zero mean, unit std. 
-            # C_seen is only None if the dataloader yielded exactly 0 batches.
-            # In that case trust the pre-resolved manifest length.
+            # C_seen is only None if the dataloader yielded exactly 0 batches
+            # In that case trust the pre-resolved manifest length
             C = C_seen if C_seen is not None else len(self.manifest)
             return (
                 torch.zeros(C, dtype=torch.float32),
                 torch.ones(C, dtype=torch.float32)
             )
 
-        mean = (sum_c / count).to(torch.float32)
-        var = (sumsq_c / count) - (mean.to(torch.float64) ** 2)
-        std = torch.sqrt(torch.clamp(var.to(torch.float32), min=1e-8))
+        mean64 = sum_c / count
+        var64 = (sumsq_c / count) - (mean64 ** 2)
+        mean = mean64.to(torch.float32)
+        std = torch.sqrt(torch.clamp(var64, min=1e-8)).to(torch.float32)
         return mean, std
 
     def fit(
@@ -791,7 +794,7 @@ class FeatureRegistry:
             'std': self.std.clone() if self.std is not None else None
         }
 
-    def standardise_bchw(self, x: torch.Tensor, keep_idx: Optional[List[int]] = None) -> torch.Tensor:
+    def standardise_bchw(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, C_eff, H, W)
         Uses dataset means/stds; guards against tiny std and extreme values.
@@ -799,11 +802,8 @@ class FeatureRegistry:
         if self.mean is None or self.std is None:
             return x
 
-        mean_sliced = self.mean[keep_idx] if keep_idx is not None else self.mean
-        std_sliced = self.std[keep_idx] if keep_idx is not None else self.std
-
-        mu = mean_sliced.view(1, -1, 1, 1).to(x.device, non_blocking=True)
-        sig = std_sliced.view(1, -1, 1, 1).to(x.device, non_blocking=True)
+        mu = self.mean.view(1, -1, 1, 1).to(x.device, non_blocking=True)
+        sig = self.std.view(1, -1, 1, 1).to(x.device, non_blocking=True)
 
         # Guard against tiny std -> huge magnitudes -> exploding logits/loss
         x_std = (x - mu) / sig.clamp_min(1e-3)
@@ -914,8 +914,8 @@ class TaskHooks:
 
     - feature_set: True for all canonical features, False for none, or a list containing
       canonical feature names/macros and typed custom declarations `(name, "node"|"edge")`.
-    - orientation: None | "dag"; passed to *_orient_to_directed on A_obs.
-    - ensure_connected: If True, connect components using proportional multi-stitching.
+    - orientation: None | "dag"; passed to *_orient_to_directed on A_obs. DAG mode takes precedence over ensure_connected.
+    - ensure_connected: If True, connect components using proportional multi-stitching. Ignored when orientation="dag".
     - allow_adj_channel: If True, include adjacency as an explicit numerical feature.
     """
     label_fn: Optional[Union[
@@ -1253,7 +1253,7 @@ def _coerce_bench(bench_like):
     if missing:
         raise TypeError(
             "Bench is missing required fields: " + ", ".join(missing) +
-            ". Supported single-graph tasks must expose those fields directly on task.bench."
+            ". Single-graph benches used by ProvidedSplitsTask must expose those fields."
         )
     return bench
 
@@ -1578,12 +1578,10 @@ def _resolve_loaders(task, cfg, batch_size=None):
     rule. It prevents invalid task structures (like direct dataloader injection) from proceeding
     downstream.
 
-    Supported task entry paths only:
-      1. ProvidedSplitsTask-style tasks (or subclasses) explicitly exposing a `_build_loaders(...)` method.
-         This handles multi-graph datasets, generated datasets, and pre-divided split collections.
-      2. Single-graph tasks exposing exactly `task.bench` + `task.hooks`.
-         This handles the standard single-graph benchmarking path where splitting is defined
-         via boolean masks.
+    Supported task entry path only:
+      - ProvidedSplitsTask-style tasks (or subclasses) explicitly exposing a `_build_loaders(...)` method.
+        This handles generated datasets, pre-divided split collections, and single-graph
+        benchmarks whose `bench.splits` contains boolean split masks.
 
     Args:
         task: The task object to resolve.
@@ -1595,7 +1593,7 @@ def _resolve_loaders(task, cfg, batch_size=None):
 
     Raises:
         RuntimeError: If the task exposes direct dataloader attributes (`train_dataloader`, etc.),
-                      or if it does not conform to one of the two supported shapes above.
+                      or if it does not conform to the supported task shape above.
     """
     bs = batch_size if batch_size is not None else getattr(cfg, "batch_size", None)
     loader_sig = (
@@ -1605,7 +1603,7 @@ def _resolve_loaders(task, cfg, batch_size=None):
     )
 
     # 1) Supported adapter path: ProvidedSplitsTask / subclasses
-    if hasattr(task, "_build_loaders") and callable(task._build_loaders):
+    if isinstance(task, ProvidedSplitsTask):
         cached_sig = getattr(task, "_active_run_loader_sig", None)
         cached_loaders = getattr(task, "_active_run_loaders", None)
         if cached_loaders is not None and cached_sig == loader_sig:
@@ -1620,22 +1618,11 @@ def _resolve_loaders(task, cfg, batch_size=None):
     if any(hasattr(task, m) for m in ("train_dataloader", "val_dataloader", "test_dataloader")):
         raise RuntimeError(
             "Direct task-provided train_dataloader/val_dataloader/test_dataloader entry points are unsupported. "
-            "Use ProvidedSplitsTask (or a subclass implementing _build_loaders), or expose task.bench + task.hooks "
-            "for the supported single-graph path."
-        )
-
-    # 3) Supported single-graph path: explicit bench + hooks only
-    bench_obj = getattr(task, "bench", None)
-    hooks = getattr(task, "hooks", None)
-
-    if bench_obj is not None and hooks is not None:
-        return _build_single_graph_loaders_from_bench(
-            bench_obj, hooks, batch_size=bs, num_workers=int(getattr(task, "num_workers", 0)), task=task
+            "Use ProvidedSplitsTask or a subclass implementing _build_loaders."
         )
 
     raise RuntimeError(
-        "Unsupported task shape. Use ProvidedSplitsTask (or subclass) or expose task.bench + task.hooks "
-        "for the supported single-graph path."
+        "Unsupported task shape. Use ProvidedSplitsTask or a subclass."
     )
 
 
@@ -2244,7 +2231,7 @@ def get_optimal_threshold(y_true: np.ndarray, y_prob: np.ndarray, metric: str = 
 
 def forward_logits_common(
     A, feats, mask, *,
-    registry, feature_keys, keep_idx,
+    registry, feature_keys,
     model_key, model, device
 ):
     """
@@ -2274,18 +2261,16 @@ def forward_logits_common(
     # 2) Assemble channels
     # ------------------------------
     # x_bchw: (B, C_all, N, N)
-    x_bchw = registry.stack_channels_BCHW(
-        A, feats, m_in, feature_keys,
-        include_adj=("adj" in getattr(registry, "manifest", []))
-    )
+    with torch.amp.autocast("cuda", enabled=False):
+        x_bchw = registry.stack_channels_BCHW(
+            A, feats, m_in, feature_keys,
+            include_adj=("adj" in getattr(registry, "manifest", []))
+        )
 
-    if keep_idx is None or len(keep_idx) == 0:
-        raise ValueError("keep_idx is empty; no input channels to feed the model.")
-        
-    # ------------------------------
-    # 3) Standardise the manifest channels
-    # ------------------------------
-    x_bchw_std = registry.standardise_bchw(x_bchw)
+        # ------------------------------
+        # 3) Standardise the manifest channels
+        # ------------------------------
+        x_bchw_std = registry.standardise_bchw(x_bchw)
 
     # ------------------------------
     # 4) Forward through the selected head - TX can optionally take a task mask
@@ -2562,11 +2547,12 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                 if model_key in ("mlp", "deep_mlp"):
                     A_dev = A.to(DEVICE, non_blocking=True)
                     m_dev = mask.to(DEVICE, non_blocking=True)
-                    x_bchw = registry.stack_channels_BCHW(
-                        A_dev, feats, m_dev, feature_keys,
-                        include_adj=("adj" in getattr(registry, "manifest", []))
-                    )
-                    x_bchw_std = registry.standardise_bchw(x_bchw)
+                    with torch.amp.autocast("cuda", enabled=False):
+                        x_bchw = registry.stack_channels_BCHW(
+                            A_dev, feats, m_dev, feature_keys,
+                            include_adj=("adj" in getattr(registry, "manifest", []))
+                        )
+                        x_bchw_std = registry.standardise_bchw(x_bchw)
 
                     b_dev = idx_cpu[:, 0].to(DEVICE, non_blocking=True)
                     i_dev = idx_cpu[:, 1].to(DEVICE, non_blocking=True)
@@ -2579,7 +2565,6 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                         A, feats, mask,
                         registry=registry,
                         feature_keys=feature_keys,
-                        keep_idx=keep_idx,
                         model_key=model_key,
                         model=model,
                         device=DEVICE
@@ -2650,7 +2635,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         avg = (loss_sum / denom_sum) if denom_sum else float("nan")
 
         # Per-epoch Val probe (now capture + print macro-F1)
-        val_m = _eval_split(model_key, model, val_loader, registry, edges_only, cfg, feature_keys, keep_idx,
+        val_m = _eval_split(model_key, model, val_loader, registry, edges_only, cfg, feature_keys,
                             num_classes, fallback_thr=last_known_thr, criterion=criterion)
         last_known_thr = val_m.get("thr", last_known_thr)
         val_f1 = float(val_m.get("F1_macro", val_m.get("f1", float("nan"))))
@@ -2692,13 +2677,13 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     if best_state is not None:
         model.load_state_dict(best_state, strict=True)
 
-    val_m = _eval_split(model_key, model, val_loader, registry, edges_only, cfg, feature_keys, keep_idx,
+    val_m = _eval_split(model_key, model, val_loader, registry, edges_only, cfg, feature_keys,
                         num_classes, fixed_threshold=None, fallback_thr=last_known_thr, criterion=criterion)
 
     thr = val_m.get("thr", 0.5) if num_classes == 1 else None
     test_m = _eval_split(
         model_key, model, test_loader, registry,
-        edges_only, cfg, feature_keys, keep_idx, num_classes,
+        edges_only, cfg, feature_keys, num_classes,
         fixed_threshold=thr, criterion=criterion
     )
 
@@ -2735,7 +2720,7 @@ def _hooks_get(hooks, key, default=None):
 
 
 @torch.no_grad()
-def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_keys, keep_idx,
+def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_keys,
                 num_classes, fixed_threshold=None, fallback_thr=0.5, *, criterion=None):
     """
     Eval one split. Returns a dict with keys:
@@ -2808,7 +2793,6 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
                 A, feats, mask,
                 registry=registry,
                 feature_keys=feature_keys,
-                keep_idx=keep_idx,
                 model_key=model_key,
                 model=model,
                 device=DEVICE,
@@ -3639,7 +3623,7 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
           lifecycle manager rather than by this function directly.
 
     Args:
-        task: TaskSpec or ProvidedSplitsTask implementing train/val/test loaders, or exposing (bench + hooks).
+        task: ProvidedSplitsTask or subclass.
               Must define task.directed. hooks.allow_adj_channel gates 'adj' as input.
         models: Iterable of accepted model keys
                 {"mlp","deep_mlp","cnn","transformer","rf"}.
@@ -3659,8 +3643,6 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
         - Returns the active run bundle in the same {"results": ..., "metadata": ...} shape
           used by the rest of the pipeline.
     """
-    print(f"=== Task: {task.name} (directed={task.directed}) ===")
-
     # Lifecycle decision must happen before anything that reads or writes run-scoped state
     bundle = begin_or_attach_run(
         task_key=(id(task), str(getattr(task, "name", "task"))),
@@ -3677,6 +3659,8 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
         display_decimals=int(getattr(cfg, "display_decimals", 4)),
         display_truncate=bool(getattr(cfg, "display_truncate", False))
     )
+
+    print(f"=== Task: {task.name} (directed={task.directed}) ===")
     results = bundle["results"]
 
     # Task-controlled adjacency channel only (Transformer override is applied later in the TX branch)

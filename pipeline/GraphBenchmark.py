@@ -12,6 +12,7 @@ from time import perf_counter
 from collections.abc import Sized
 from typing import List, Tuple, Union, Dict, Optional, cast
 from torch.utils.data import DataLoader, Dataset, Subset
+from decimal import Decimal
 
 
 class GraphBenchmark:
@@ -369,6 +370,22 @@ class GraphBenchmark:
         fast_label_fn = self._compile_label_fn(getattr(hooks, "label_fn", None))
         local_rng = random.Random(seed) if seed is not None else random
 
+        orientation_mode = getattr(hooks, "orientation", None)
+        if orientation_mode == "dag" and not bool(directed):
+            raise ValueError(
+                f"[DATASET GENERATOR] DAG means Directed Acyclic Graph. hooks.orientation={orientation_mode!r} requires directed=True."
+            )
+
+        # DAG orientation takes precedence over connectivity enforcement
+        ensure_connected = bool(getattr(hooks, "ensure_connected", False))
+        if ensure_connected and orientation_mode == "dag":
+            ensure_connected = False
+            print(
+                "[DATASET GENERATOR] hooks.ensure_connected=True is ignored when hooks.orientation='dag'. "
+                "DAG orientation discards lower-triangle edges, so generated graphs may be weakly disconnected.",
+                flush=True,
+            )
+
         # Deque
         total = len(specs)
         recent = deque(maxlen=5) if self.show_progress else None
@@ -421,7 +438,6 @@ class GraphBenchmark:
                     G.remove_edges_from(local_rng.sample(edges, drop_count))
 
             # 3) Bottleneck-free connectivity (Proportional Multi-Stitching)
-            ensure_connected = getattr(hooks, "ensure_connected", False)
             if ensure_connected:
                 Gu = nx.Graph(G)
                 if not nx.is_connected(Gu):
@@ -451,7 +467,7 @@ class GraphBenchmark:
             if 'complete_adj' in G.graph:
                 A_obs = self._sanitise_adj(nx.to_numpy_array(G, dtype=np.float32), nx.is_directed(G))
                 # Background-forest and stitched edges live only in G
-                A_true = np.maximum(G.graph['complete_adj'].copy(), A_obs)
+                A_true = np.maximum(G.graph['complete_adj'], A_obs)
                 G_true = nx.DiGraph() if is_dir else nx.Graph()
                 G_true.add_nodes_from(G.nodes(data=True))
                 G_true.graph.update(G.graph)
@@ -464,12 +480,6 @@ class GraphBenchmark:
                     nx.to_numpy_array(G_true, dtype=np.float32), nx.is_directed(G_true)
                 )
                 A_obs = A_true.copy()
-
-            orientation_mode = getattr(hooks, "orientation", None)
-            if orientation_mode == "dag" and not is_dir:
-                raise ValueError(
-                    f"[DATASET GENERATOR] DAG means Directed Acyclic Graph. hooks.orientation={orientation_mode!r} requires directed=True."
-                )
 
             if orientation_mode:
                 A_obs = self._orient_to_directed(A_obs, mode=orientation_mode)
@@ -506,9 +516,9 @@ class GraphBenchmark:
         class _GBBuilt(Dataset):
             def __init__(self, Gs, Ls, Fs, prepack: bool):
                 if prepack:
-                    self.Gs = [np.array(g, copy=True) for g in Gs]
+                    self.Gs = list(Gs)
                     self.Ls = [np.array(l, copy=True) for l in Ls]
-                    self.Fs = [{k: (np.array(v, copy=True) if v is not None else None) for k, v in f.items()} for f in Fs]
+                    self.Fs = list(Fs)
                 else:
                     self.Gs, self.Ls, self.Fs = Gs, Ls, Fs
 
@@ -541,8 +551,13 @@ class GraphBenchmark:
         idx = np.arange(n)
         rng = np.random.default_rng(seed)
         rng.shuffle(idx)
-        a = int(ratios[0] * n)
-        b = int((ratios[0] + ratios[1]) * n)
+        
+        r0, r1, r2 = (Decimal(str(float(r))) for r in ratios)
+        if min(r0, r1, r2) < 0 or abs(r0 + r1 + r2 - 1) > Decimal("1e-6"):
+            raise ValueError(f"[PIPELINE SPLIT CONFIG] ratios must be non-negative and sum to 1.0; got {tuple(ratios)}.")
+        
+        a = int(r0 * n)
+        b = int((r0 + r1) * n)
         tr, va, te = idx[:a], idx[a:b], idx[b:]
 
         if len(tr) == 0:
@@ -643,7 +658,12 @@ class GraphBenchmark:
             if 'triangles' in feature_list:
                 feats['triangles'] = tri  # 1D node-wise
             if 'clustering_coeff' in feature_list:
-                possible = deg * (deg - 1) if directed else deg * (deg - 1) / 2
+                if directed:
+                    in_deg = adj_f.sum(axis=0)
+                    reciprocal_deg = (adj_f * adj_f.T).sum(axis=1)
+                    possible = deg * in_deg - reciprocal_deg
+                else:
+                    possible = deg * (deg - 1) / 2
                 with np.errstate(divide='ignore', invalid='ignore'):
                     feats['clustering_coeff'] = np.where(possible > 0, tri / possible, 0.0)
 

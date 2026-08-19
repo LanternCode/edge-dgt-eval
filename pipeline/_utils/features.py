@@ -48,7 +48,9 @@ def _shortest_path_cached(packed_adj: bytes, n: int, is_directed: bool) -> np.nd
     return D
 
 
-def shortest_path_from_adj(A: Tensor, *, is_directed: bool = False) -> Tensor:
+def shortest_path_from_adj(
+        A: Tensor, *, is_directed: bool = False, valid_n: Optional[int] = None
+) -> Tensor:
     """
     Compute all pair shortest-path distances from the provided adjacency.
 
@@ -58,10 +60,19 @@ def shortest_path_from_adj(A: Tensor, *, is_directed: bool = False) -> Tensor:
 
     Returns an (N, N) float tensor on A.device, with unreachable pairs encoded as -1.
     """
-    A01 = A.detach().cpu().numpy() > 0
-    n = int(A01.shape[0])
+    full_n = int(A.shape[0])
+    n = full_n if valid_n is None else int(valid_n)
+    A01 = A[:n, :n].detach().cpu().numpy() > 0
     packed_adj = np.packbits(A01.reshape(-1)).tobytes()
-    D = _shortest_path_cached(packed_adj, n, bool(is_directed))
+    D_core = _shortest_path_cached(packed_adj, n, bool(is_directed))
+
+    if n == full_n:
+        D = D_core
+    else:
+        D = np.full((full_n, full_n), -1, dtype=D_core.dtype)
+        D[:n, :n] = D_core
+        np.fill_diagonal(D[n:, n:], 0)
+
     return torch.as_tensor(D, device=A.device, dtype=torch.float32)
 
 

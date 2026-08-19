@@ -356,7 +356,7 @@ def _assemble_features_for_graph(
         edge_mats: List[torch.Tensor] = []
         for k in edge_keys:
             if k == "shortest_path":
-                edge_mats.append(shortest_path_from_adj(A, is_directed=is_directed))
+                edge_mats.append(shortest_path_from_adj(A, is_directed=is_directed, valid_n=N_unpadded))
                 continue
 
             v = feats.get(k, None)
@@ -496,7 +496,7 @@ class _GCNEncoder(torch.nn.Module):
         self.in_lin = torch.nn.Linear(in_dim, hidden)
         self.convs  = torch.nn.ModuleList([torch.nn.Linear(hidden, hidden) for _ in range(depth)])
         self.norms = torch.nn.ModuleList([
-            nn.LayerNorm(hidden, elementwise_affine=learnable_layer_norm) for _ in range(depth)
+            nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm) for _ in range(depth)
         ])
         self.drop   = torch.nn.Dropout(p=self.dropout)
         self.jk_proj = torch.nn.Linear((depth + 1) * hidden, hidden)
@@ -584,7 +584,7 @@ class _SAGEEncoder(nn.Module):
         self.neigh_lins = nn.ModuleList([nn.Linear(in_dim if i == 0 else hidden, hidden) for i in range(depth)])
         self.out = nn.Linear(hidden, out_dim)
         self.norms = nn.ModuleList([
-            nn.LayerNorm(hidden, elementwise_affine=learnable_layer_norm) for _ in range(depth)
+            nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm) for _ in range(depth)
         ])
         self.drop = nn.Dropout(dropout)
 
@@ -637,7 +637,7 @@ class _GINEncoder(nn.Module):
         ])
         self.out = nn.Linear(hidden, out_dim)
         self.norms = nn.ModuleList([
-            nn.LayerNorm(hidden, elementwise_affine=learnable_layer_norm) for _ in range(depth)
+            nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm) for _ in range(depth)
         ])
         self.drop = nn.Dropout(dropout)
 
@@ -687,8 +687,8 @@ class _EdgeMaskedTransformer(nn.Module):
             d_model=hidden, nhead=heads, dim_feedforward=hidden * 4,
             dropout=dropout, batch_first=True, activation="gelu"
         )
-        enc_layer.norm1 = nn.LayerNorm(hidden, elementwise_affine=learnable_layer_norm)
-        enc_layer.norm2 = nn.LayerNorm(hidden, elementwise_affine=learnable_layer_norm)
+        enc_layer.norm1 = nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
+        enc_layer.norm2 = nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
         self.enc = nn.TransformerEncoder(enc_layer, num_layers=depth)
         self.out = nn.Linear(hidden, out_dim)
         self.register_buffer("_eye_cache", torch.empty(0, 0, dtype=torch.bool), persistent=False)
@@ -735,9 +735,9 @@ class _GPSLayer(nn.Module):
     ):
         super().__init__()
         # Pre-norms for each branch
-        self.norm_local = nn.LayerNorm(hidden, elementwise_affine=learnable_layer_norm)
-        self.norm_attn = nn.LayerNorm(hidden, elementwise_affine=learnable_layer_norm)
-        self.norm_ffn = nn.LayerNorm(hidden, elementwise_affine=learnable_layer_norm)
+        self.norm_local = nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
+        self.norm_attn = nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
+        self.norm_ffn = nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
         self.edge_dim = int(edge_dim)
 
         # Local MPNN branch: GINE-style when edge features are available
@@ -1510,9 +1510,6 @@ class GraphEdgeClassifier(nn.Module):
         Returns:
             Logits: (M,) if binary, or (M, K) if multiclass.
         """
-        dev = Z.device
-        M = src.numel()
-
         # `sum` is not on the autocast allowlist, so counts stay fp32 unless explicitly cast
         is_directed = bool(getattr(self, "directed", False))
         A01 = (A > 0.5).to(torch.float32)
@@ -2032,6 +2029,8 @@ def train_one_gnn(
 
     # Loss Selection
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05) if num_classes > 1 else None
+    ratio_raw = getattr(cfg, "neg_pos_ratio", None)
+    neg_pos_ratio = None if ratio_raw is None else float(ratio_raw)
     disp_dec = int(getattr(cfg, "display_decimals", 4))
 
     # Eval Loop Closure
@@ -2071,10 +2070,8 @@ def train_one_gnn(
                     y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(device=device, dtype=torch.float32)
 
                     if not bool(getattr(cfg, "use_tree_aux_loss", False)):
-                        ratio_raw = getattr(cfg, "neg_pos_ratio", None)
-                        ratio = None if ratio_raw is None else float(ratio_raw)
-                        if ratio is not None and ratio > 0:
-                            keep = _balance_binary_negpos(y_sel, ratio)
+                        if neg_pos_ratio is not None and neg_pos_ratio > 0:
+                            keep = _balance_binary_negpos(y_sel, neg_pos_ratio)
                             idx = idx[keep]
                             y_sel = y_sel[keep]
                             prebalanced_binary = True
@@ -2092,14 +2089,12 @@ def train_one_gnn(
                     loss = criterion(z_sel, y_sel)
                     bs = int(y_sel.numel())
                 else:
-                    ratio_raw = getattr(cfg, "neg_pos_ratio", None)
-                    ratio = None if ratio_raw is None else float(ratio_raw)
-                    if ratio is not None and ratio > 0:
+                    if neg_pos_ratio is not None and neg_pos_ratio > 0:
                         if prebalanced_binary:
                             loss = nn.BCEWithLogitsLoss()(z_sel, y_sel)
                             bs = int(y_sel.numel())
                         else:
-                            keep = _balance_binary_negpos(y_sel, ratio)
+                            keep = _balance_binary_negpos(y_sel, neg_pos_ratio)
                             z_bal, y_bal = z_sel[keep], y_sel[keep]
                             loss = nn.BCEWithLogitsLoss()(z_bal, y_bal)
                             bs = int(y_bal.numel())
