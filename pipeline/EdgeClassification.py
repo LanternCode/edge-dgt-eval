@@ -400,7 +400,10 @@ def _pos_weight(y: torch.Tensor) -> torch.Tensor:
     pos = y.sum().to(dtype=torch.float32)
     neg = float(y.numel()) - pos
     w = neg / pos.clamp_min(1.0)
-    return torch.clamp(w, min=1e-3, max=1e3)  # Clamp to prevent gradient explosion
+    w = torch.where((pos > 0) & (neg > 0), w, torch.ones_like(w))
+
+    # Clamp to prevent gradient explosion
+    return torch.clamp(w, min=1e-3, max=1e3)
 
 
 # ============================================================
@@ -660,10 +663,7 @@ class FeatureRegistry:
 
                 per_graph_parts.append(M.unsqueeze(0).unsqueeze(0))
 
-            if per_graph_parts:
-                ordered_feat_parts.append(torch.cat(per_graph_parts, dim=0))
-            else:
-                ordered_feat_parts.append(torch.zeros((B, 0, N, N), dtype=dtype, device=A.device))
+            ordered_feat_parts.append(torch.cat(per_graph_parts, dim=0))
 
         # Concatenate along channel: per-batch base channels first, then feature channels
         base = torch.cat(X, dim=1) if X else torch.zeros((B, 0, N, N), dtype=dtype, device=A.device)
@@ -918,10 +918,7 @@ class TaskHooks:
     - ensure_connected: If True, connect components using proportional multi-stitching. Ignored when orientation="dag".
     - allow_adj_channel: If True, include adjacency as an explicit numerical feature.
     """
-    label_fn: Optional[Union[
-        Callable[[np.ndarray, nx.Graph], np.ndarray],
-        Callable[[np.ndarray], np.ndarray]
-    ]] = None
+    label_fn: Optional[Callable[..., np.ndarray]] = None
     feature_set: Union[bool, List[Union[str, Tuple[str, Literal["node", "edge"]]]]] = False
     orientation: Optional[str] = None
     ensure_connected: bool = False
@@ -1191,27 +1188,26 @@ class ProvidedSplitsTask(TaskSpec):
                 max_nodes=self.max_nodes
             )
 
-            # Normalise feature_set so the synthetic path matches the single-graph/provided-splits path.
+            # Normalise feature_set so the synthetic path matches the single-graph/provided-splits path
             hooks_for_generation = copy.copy(self.hooks)
+            generation_feature_set = getattr(
+                self, "_dense_generation_feature_set_override",
+                getattr(self.hooks, "feature_set", False)
+            )
             hooks_for_generation.feature_set = _normalise_feature_set(
-                getattr(self.hooks, "feature_set", False),
-                directed=self.directed
+                generation_feature_set, directed=self.directed
             )
-
             ds = bench.generate_dataset(
-                specs,
-                hooks=hooks_for_generation,
-                prepackage=True,
-                directed=self.directed,
-                seed=self.seed
+                specs, hooks=hooks_for_generation,
+                directed=self.directed, seed=self.seed
             )
 
-            ds = _augment_with_canonical_features(ds, bench, self.hooks, self.directed)
             ds = _wrap_with_mask_policy(ds)
             self._active_run_dataset = ds
 
+        loader_ds = _augment_with_canonical_features(ds, bench, self.hooks, self.directed)
         tr, va, te = bench.make_loaders(
-            dataset=ds,
+            dataset=loader_ds,
             batch_size=bs,
             ratios=self.ratios,
             collate_fn=collate,
@@ -1237,16 +1233,14 @@ class _SingleGraphDataset(Dataset):
         return self.A, self.feats, self.L, self.mask
 
 
-def _coerce_bench(bench_like):
+def _coerce_bench(bench):
     """
-    Accept dict or object; validate the required single-graph bench fields.
+    Validate the required single-graph bench fields.
     Only truly essential pieces are required:
       - A (adjacency, (N,N) torch.FloatTensor)
       - splits (dict with 'train'/'val'/'test' bool (N,N) masks)
     """
-    bench = SimpleNamespace(**bench_like) if isinstance(bench_like, dict) else bench_like
-
-    # Minimal validation: we really need an adjacency and splits
+    # Minimal validation: we need an adjacency matrix and splits
     missing = []
     if not hasattr(bench, "A"): missing.append("A")
     if not hasattr(bench, "splits"): missing.append("splits")
@@ -1323,11 +1317,9 @@ def _normalise_feature_spec(x, directed: bool) -> Tuple[List[str], Dict[str, str
         if item == "_N":
             raise ValueError("[FEATURE SET] '_N' is reserved internal metadata and cannot be requested as a feature.")
         if item == "powers":
-            expanded += [p for p in ("power_2", "power_3", "power_4", "power_5")
-                         if p in FeatureRegistry.CANONICAL]
+            expanded += ["power_2", "power_3", "power_4", "power_5"]
         elif item == "endpoint_degree":
-            expanded += [d for d in ("deg_row", "deg_col")
-                         if d in FeatureRegistry.CANONICAL]
+            expanded += ["deg_row", "deg_col"]
         else:
             expanded.append(item)
 
@@ -2289,7 +2281,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
 
     This version:
       - Never includes 'adj' in feature_keys (it's handled by the registry/manifest).
-      - Builds keep_idx from registry.manifest and includes exactly one 'adj' for TX (or if allow_adj_channel=True).
+      - Takes the fitted registry.manifest as the final channel list; keep_idx is the identity range over it.
       - Uses the same stack -> standardise manifest-channel contract in both train and eval.
       - Leaves your optimiser/scheduler structure unchanged (uses existing 'criterion', 'optimiser', 'scaler' names).
     """
@@ -2372,27 +2364,15 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     #   - If cfg.use_mask_channel is None, we infer: CNN/Transformer → True, MLP/RF → False.
     #   - This is independent from the adj channel and from (A)/(B).
     # -----------------------------------------------------------------------------
-    # Build the final ordered list of channel names to keep, by name
-    names: List[str] = []
-    if include_adj and ("adj" in manifest_names):
-        names.append("adj")
-    if getattr(registry, "use_mask_channel", False) and ("mask" in manifest_names):
-        names.append("mask")
-
-    # Add all other channels except duplicates of 'adj'/'mask'
-    for n in manifest_names:
-        if n in ("adj", "mask"):
-            continue
-        names.append(n)
-
-    # Map back to manifest indices
-    keep_idx = [manifest_names.index(n) for n in names if n in manifest_names]
-    eff_in_ch = len(keep_idx)
+    # The fitted manifest is already the final ordered channel list.
+    names = list(manifest_names)
+    keep_idx = list(range(len(manifest_names)))
+    eff_in_ch = len(manifest_names)
     if eff_in_ch == 0:
         raise ValueError("Effective in_channels is 0. Enable allow_adj_channel or tx_force_adj_channel.")
 
     if model_key in ("transformer", "cnn"):
-        print(f"[{model_key.upper()}] using channels:", names, " (dedup adj)" if ("adj" in names) else "")
+        print(f"[{model_key.upper()}] using channels:", names)
 
     # expose dense runtime state for eval / checkpoint metadata
     runtime.keep_idx = keep_idx
@@ -3596,7 +3576,10 @@ def _reset_pipeline_runtime_state(task=None) -> None:
     FeatureRegistry._warned_pad_features.clear()
 
     if task is not None:
-        for attr in ("_active_run_loaders", "_active_run_loader_sig", "_active_run_dataset", "_latest_results"):
+        for attr in (
+            "_active_run_loaders", "_active_run_loader_sig", "_active_run_dataset",
+            "_dense_generation_feature_set_override", "_latest_results"
+        ):
             if hasattr(task, attr):
                 delattr(task, attr)
 
@@ -3688,6 +3671,7 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
         feature_keys = ["degree", "deg_row", "deg_col", "clustering_coeff", "cn", "jaccard", "adamic_adar"]
         if hooks is not None:
             _original_feature_set = hooks.feature_set
+            task._dense_generation_feature_set_override = _original_feature_set
             hooks.feature_set = list(feature_keys)
             _restore_feature_set = True
         print(
@@ -3702,6 +3686,11 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
     finally:
         if _restore_feature_set:
             hooks.feature_set = _original_feature_set
+            if hasattr(task, "_dense_generation_feature_set_override"):
+                delattr(task, "_dense_generation_feature_set_override")
+            for attr in ("_active_run_loaders", "_active_run_loader_sig"):
+                if hasattr(task, attr):
+                    delattr(task, attr)
 
     # Expose dense runtime state to subroutines without mutating cfg
     print("feature_keys:", feature_keys)

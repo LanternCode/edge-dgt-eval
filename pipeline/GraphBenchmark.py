@@ -25,7 +25,7 @@ class GraphBenchmark:
     - generate_graph(graph_type, num_nodes, directed=False)
     - extract_features(adj, feature_set)
     - sample_specs(num_graphs, min_nodes, max_nodes)
-    - generate_dataset(specs, hooks, prepackage=True, directed=False, seed=None)
+    - generate_dataset(specs, hooks, directed=False, seed=None)
     - make_loaders(dataset, batch_size, ratios=(0.7, 0.2, 0.1), collate_fn=None, seed=None, pin_memory=None)
 
     When using existing split definitions, ProvidedSplitsTask reads bench.splits and will either:
@@ -34,7 +34,7 @@ class GraphBenchmark:
 
     New minimal helpers (single responsibility):
       - sample_specs(num_graphs, min_nodes, max_nodes)
-      - generate_dataset(specs, hooks, prepackage=True)  # task-agnostic
+      - generate_dataset(specs, hooks)
       - make_loaders(dataset, batch_size, ratios=(...), collate_fn=None)
     """
     def __init__(
@@ -164,6 +164,7 @@ class GraphBenchmark:
             if directed:
                 G_und = nx.random_regular_graph(4, num_nodes, seed=rng)
                 G_dir = nx.DiGraph()
+                G_dir.add_nodes_from(range(num_nodes))
                 for c in nx.connected_components(G_und):
                     sub = G_und.subgraph(c)
                     G_dir.add_edges_from(nx.eulerian_circuit(sub))
@@ -362,7 +363,6 @@ class GraphBenchmark:
         self,
         specs: List[Tuple[str, int]],     # e.g. produced by bench.sample_specs(...)
         hooks,
-        prepackage: bool = True,
         directed: bool = False,
         seed: Optional[int] = None
     ) -> Dataset:
@@ -410,7 +410,13 @@ class GraphBenchmark:
             max_retries = 20  
             while attempts < max_retries:
                 try:
-                    G = self.generate_graph(gtype, int(N), directed=is_dir, rng=local_rng)
+                    candidate = self.generate_graph(gtype, int(N), directed=is_dir, rng=local_rng)
+                    if candidate.number_of_nodes() != int(N):
+                        raise ValueError(
+                            f"[DATASET GENERATION ERROR] Generator returned {candidate.number_of_nodes()} nodes for requested N={int(N)}. "
+                            "Try adjusting the requested graph families, num_nodes, and min- and max-nodes settings."
+                        )
+                    G = candidate
                     break
                 except Exception as e:
                     # Log the exact error only once per graph family
@@ -514,13 +520,10 @@ class GraphBenchmark:
                 )
 
         class _GBBuilt(Dataset):
-            def __init__(self, Gs, Ls, Fs, prepack: bool):
-                if prepack:
-                    self.Gs = list(Gs)
-                    self.Ls = [np.array(l, copy=True) for l in Ls]
-                    self.Fs = list(Fs)
-                else:
-                    self.Gs, self.Ls, self.Fs = Gs, Ls, Fs
+            def __init__(self, Gs, Ls, Fs):
+                self.Gs = list(Gs)
+                self.Ls = [np.array(l, copy=True) for l in Ls]
+                self.Fs = list(Fs)
 
             def __len__(self):
                 return len(self.Gs)
@@ -528,7 +531,7 @@ class GraphBenchmark:
             def __getitem__(self, i):
                 return self.Gs[i], self.Ls[i], self.Fs[i]
 
-        return _GBBuilt(graphs, labels, feats, prepackage)
+        return _GBBuilt(graphs, labels, feats)
 
     def make_loaders(
         self,
@@ -551,7 +554,7 @@ class GraphBenchmark:
         idx = np.arange(n)
         rng = np.random.default_rng(seed)
         rng.shuffle(idx)
-        
+
         r0, r1, r2 = (Decimal(str(float(r))) for r in ratios)
         if min(r0, r1, r2) < 0 or abs(r0 + r1 + r2 - 1) > Decimal("1e-6"):
             raise ValueError(f"[PIPELINE SPLIT CONFIG] ratios must be non-negative and sum to 1.0; got {tuple(ratios)}.")
@@ -654,7 +657,9 @@ class GraphBenchmark:
 
         if 'triangles' in feature_list or 'clustering_coeff' in feature_list:
             A3 = power_cache[3]
-            tri = np.diag(A3) if directed else np.diag(A3) / 2
+            tri = np.diag(A3).copy()
+            if not directed:
+                tri /= 2
             if 'triangles' in feature_list:
                 feats['triangles'] = tri  # 1D node-wise
             if 'clustering_coeff' in feature_list:

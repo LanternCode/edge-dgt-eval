@@ -311,7 +311,7 @@ For the Patch Transformer, `cfg.tx_patch_overlap=False` is the default and prese
 
 ### GNN models
 
-All GNN encoders produce per-node embeddings that feed into a shared edge decoder. The encoders use LayerNorm (configurable affine / non-affine via `cfg.learnable_layer_norm`) and support training-time DropEdge regularisation.
+All GNN encoders produce per-node embeddings that feed into a shared edge decoder. The encoders use LayerNorm with configurable learnable / frozen affine parameters via `cfg.learnable_layer_norm` and support training-time DropEdge regularisation.
 
 | Key | Encoder | Propagation | Notes |
 |-----|---------|-------------|-------|
@@ -409,7 +409,7 @@ class GNNTrainConfig:
     gnn_zero_supervised: bool = False
     learnable_layer_norm: bool = True
     scheduler: str = "cosine"         # "none" | "cosine"
-    neg_pos_ratio: Optional[float] = None
+    neg_pos_ratio: Optional[float] = None  # None or <= 0 disables ratio sampling
     use_tree_aux_loss: bool = False
     save_dir: Optional[str] = "saved_checkpoints"
 ```
@@ -418,11 +418,11 @@ Notes:
 
 - GNN threshold tuning and checkpoint selection are always F1-based. Dense-only knobs such as `threshold_metric` and `select_by` do not apply.
 - `grad_clip=1.0` keeps gradient clipping enabled by default in the GNN pipeline; set `grad_clip=0.0` to disable it.
-- `learnable_layer_norm=False` switches the GNN encoder LayerNorm modules to the non-affine variant.
+- `learnable_layer_norm=False` keeps the GNN encoder LayerNorm affine parameters but freezes them at their initial identity values.
 - `lap_pe_k` is the general LapPE request in both GNN runners, and GPS additionally enforces at least `gps_lap_pe_k` LapPE columns. GPS also uses `gps_lap_pe_sign_flip` and `gps_rwse_steps`.
 - `gps_rwse_steps` controls GPS-owned random-walk structural encodings. These are not part of `hooks.feature_set` and are not requested by `feature_set=True`.
 - `gnn_zero_supervised` controls adjacency redaction uniformly across GNN encoders; GPS derives its model-owned structural processing from that same model-visible adjacency.
-- `neg_pos_ratio` controls negative-to-positive sampling ratio for binary GNN training. `None` (default) disables ratio-based sampling and uses `pos_weight` instead.
+- `neg_pos_ratio` controls negative-to-positive sampling ratio for binary GNN training. `None` (default) or a non-positive value disables ratio-based sampling and uses `pos_weight` instead. Positive values set the target negative-to-positive ratio.
 - `use_tree_aux_loss=True` adds an auxiliary penalty pulling the expected number of predicted edges toward `n - 1`, capped by the number of supervised candidate pairs. `n` counts nodes that carry a supervised pair or an observed edge, which equals the graph size under the default all-ones mask and excludes isolated nodes under a sparse mask. It does not detect cycles or enforce connectivity. Only meaningful for spanning-tree tasks. Automatically disabled in Scalable Mode.
 - Summary display formatting is set on the runner call itself, e.g. `run_gnn_suite(..., display_decimals=6, display_truncate=True)`.
 
@@ -763,7 +763,7 @@ The dense pipeline exposes `cfg.threshold_metric` and `cfg.select_by` for config
 
 ### Encoder normalisation in the GNN suite
 
-All GNN encoders use LayerNorm. The single knob `cfg.learnable_layer_norm` controls whether those LayerNorm modules use learnable affine parameters (`True` = standard, `False` = non-affine). This setting is shared across the GNN suite for comparability and does not apply to the dense pipeline. GPS also owns additional structural encoding knobs for LapPE and RWSE.
+All GNN encoders use LayerNorm. The single knob `cfg.learnable_layer_norm` controls whether those LayerNorm modules use learnable affine parameters (`True` = learnable, `False` = affine parameters retained but frozen at their initial identity values). This setting is shared across the GNN suite for comparability and does not apply to the dense pipeline. GPS also owns additional structural encoding knobs for LapPE and RWSE.
 
 ### Scalable Mode uses a reduced decoder feature path
 

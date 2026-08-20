@@ -1602,9 +1602,10 @@ class GNNTrainConfig:
     """
     Class-imbalance policy:
         _pos_weight is the default for GNN binary BCE training. When
-        neg_pos_ratio is set, it replaces _pos_weight for the BCE term with
-        target-ratio negative balancing plus unweighted BCE. Auxiliary losses,
-        when enabled, may still operate on the full supervised logits.
+        neg_pos_ratio is positive, it replaces _pos_weight for the BCE term with
+        target-ratio negative balancing plus unweighted BCE. None or a non-positive
+        value disables ratio balancing. Auxiliary losses, when enabled, may still
+        operate on the full supervised logits.
     """
     epochs: int = 40
     lr: float = 3e-4
@@ -1625,12 +1626,12 @@ class GNNTrainConfig:
     gps_lap_pe_sign_flip: bool = True  # training-time sign augmentation for GPS-owned LapPE
     gps_rwse_steps: int = 16  # optional GPS-owned RWSE columns; 0 disables RWSE
     gnn_zero_supervised: bool = False  # if True, zero supervised cells in A before message passing
-    learnable_layer_norm: bool = True  # if False, use non-affine LayerNorm across all GNN encoders
+    learnable_layer_norm: bool = True  # if False, freeze LayerNorm affine parameters across all GNN encoders
 
     # Optimiser/scheduler
     scheduler: str = "cosine"  # ["none", "cosine"]
 
-    # Sampling
+    # Sampling: None or <= 0 disables ratio sampling; > 0 sets target neg:pos ratio
     neg_pos_ratio: Optional[float] = None
 
     # Tree-specific auxiliary losses (used only in spanning-tree-style tasks)
