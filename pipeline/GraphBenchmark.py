@@ -558,7 +558,7 @@ class GraphBenchmark:
         r0, r1, r2 = (Decimal(str(float(r))) for r in ratios)
         if min(r0, r1, r2) < 0 or abs(r0 + r1 + r2 - 1) > Decimal("1e-6"):
             raise ValueError(f"[PIPELINE SPLIT CONFIG] ratios must be non-negative and sum to 1.0; got {tuple(ratios)}.")
-        
+
         a = int(r0 * n)
         b = int((r0 + r1) * n)
         tr, va, te = idx[:a], idx[a:b], idx[b:]
@@ -567,7 +567,8 @@ class GraphBenchmark:
             if float(ratios[0]) == 0.0:
                 print(
                     "[PIPELINE SPLIT CONFIG] Train ratio is 0.0, so no training will be performed. "
-                    "The reported validation/test metrics are those of a randomly initialised model.",
+                    "The reported validation/test metrics are those of a randomly initialised model. "
+                    "RF does not undergo random initialisation and reports NaNs instead.",
                     flush=True
                 )
             else:

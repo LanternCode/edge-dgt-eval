@@ -123,38 +123,21 @@ def pairwise_batch_from_adj(A_batch: Tensor, keys: Sequence[str], *, is_directed
 
 
 def pairwise_for_pairs(
-        A: Tensor,
+        A01: Tensor,
         src: Tensor,
         dst: Tensor,
         keys: Sequence[str],
         *,
+        row_deg: Tensor,
+        col_deg: Tensor,
         is_directed: bool = True,
-        row_deg: Optional[Tensor] = None,
-        col_deg: Optional[Tensor] = None,
-        chunk_size: int = 4096,
-        prebinarized: bool = False
+        chunk_size: int = 4096
 ) -> Dict[str, Tensor]:
     """
-    Compute pairwise features only for specific (src, dst) pairs.
+    Compute pairwise features only for specific (src, dst) pairs from a pre-binarized
+    dense float32 adjacency and precomputed row/column degrees.
     Pair rows are processed in chunks so temporary memory is O(chunk_size * N).
     """
-    if prebinarized:
-        A01 = A.to_dense() if A.is_sparse else A
-        A01 = A01.to(dtype=torch.float32)
-    elif A.is_sparse:
-        A01 = (A.to_dense() > 0).to(dtype=torch.float32)
-    else:
-        A01 = torch.gt(A, 0).to(dtype=torch.float32)
-
-    if row_deg is None:
-        row_deg = A01.sum(dim=1)
-    else:
-        row_deg = row_deg.to(device=A01.device, dtype=torch.float32)
-    if col_deg is None:
-        col_deg = A01.sum(dim=0) if is_directed else row_deg
-    else:
-        col_deg = col_deg.to(device=A01.device, dtype=torch.float32)
-
     allowed = {"cn", "jaccard", "adamic_adar"}
     for key in keys:
         if key not in allowed:

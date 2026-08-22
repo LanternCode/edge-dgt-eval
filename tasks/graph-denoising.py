@@ -1158,7 +1158,6 @@ if __name__ == "__main__":
             dropedge_p=0.0,
             scheduler=str(args.gnn_scheduler),
             neg_pos_ratio=1.0,
-            pairwise_on_demand=True,
             gnn_zero_supervised=True,
             batch_size=1,
             grad_clip=float(args.gnn_grad_clip)

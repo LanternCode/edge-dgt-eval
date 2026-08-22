@@ -1,20 +1,16 @@
 # SPDX-License-Identifier: CC-BY-SA-4.0
 
 """
-gnn_bridge.py
-
-Thin adapter to map raw graph tuples (A, node_feats, edge_feats, meta) into
+Bridge to map raw graph tuples (A, node_feats, edge_feats, meta) into
 model-ready tensors with consistent shape conventions, per-graph
 standardisation via FeatureRegistry helpers, and shared utils.features helpers for
 pairwise edge features. This module intentionally delegates:
-
   - Pairwise features -> utils.features.pairwise_batch_from_adj / utils.features.pairwise_for_pairs
   - Self-loops        -> Adjacency A is used as given for feature assembly and propagation.
                          The Edge-Masked Transformer adds temporary self-loops only to its
                          internal attention allow-mask. Supervision/evaluation policy is
                          handled by the shared masking logic.
   - Standardisation   -> per-graph z-scoring via FeatureRegistry.zscore_nodes_per_graph/zscore_edges_per_graph
-
 This avoids duplicated math and keeps feature semantics aligned across models while sharing core preprocessing utilities.
 
 Fe/Fn conventions:
@@ -34,9 +30,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 from .EdgeClassification import (
-    _format_duration, _normalise_feature_spec, _pick_probe_loader, _pos_weight, _reset_pipeline_runtime_state,
-    effective_mask, FeatureRegistry, _task_to_meta_dict, finalise_summary, _resolve_loaders,
-    get_optimal_threshold, save_pipeline_checkpoint
+    _cuda_gc, _cuda_peak_stats, _cuda_reset_peak_stats, _format_duration, _normalise_feature_spec,
+    effective_mask, FeatureRegistry, _task_to_meta_dict, finalise_summary, _resolve_loaders, _pos_weight,
+    get_optimal_threshold, save_pipeline_checkpoint, _reset_pipeline_runtime_state, _pick_probe_loader
 )
 from ._utils.features import pairwise_for_pairs, pairwise_batch_from_adj, shortest_path_from_adj
 from ._utils.run_lifecycle import begin_or_attach_run
@@ -267,9 +263,6 @@ def _assemble_features_for_graph(
     # This graph's node count before batch padding (N above may be the padded, batch-shared size)
     N_unpadded = int(nm_vec.sum().item())
 
-    # Float forms used for multiplication
-    em_f = em_bool.float()
-
     # ----------------------------
     # 1) Build Node Features (X)
     # ----------------------------
@@ -442,7 +435,8 @@ def _assemble_features_for_graph(
 
         E_mask_b = em_bool.unsqueeze(0)
         E = FeatureRegistry.zscore_edges_per_graph(E_b, mask=E_mask_b).squeeze(0)
-        E = E * em_f.unsqueeze(-1)
+        E = E * em_bool.unsqueeze(-1).to(E.dtype)
+
     elif extra_edge_mask is not None:
         E_local = (
             torch.empty((0,), device=E.device, dtype=torch.long),
@@ -1357,14 +1351,13 @@ class GraphEdgeClassifier(nn.Module):
 
         if self.encoder_type in ("sage", "gin", "gps"):
             if as_list:
-                if A_for_enc.dim() == 3:
-                    return [A_for_enc[b] if A_for_enc[b].is_sparse else A_for_enc[b].to_sparse_coo()
-                            for b in range(A_for_enc.size(0))]
-            elif not A_for_enc.is_sparse:
+                return [A_for_enc[b] if A_for_enc[b].is_sparse else A_for_enc[b].to_sparse_coo()
+                        for b in range(A_for_enc.size(0))]
+            if not A_for_enc.is_sparse:
                 return A_for_enc.to_sparse_coo()
 
         return A_for_enc
-        
+
     def _encode_batch(
             self,
             A: torch.Tensor,
@@ -1523,10 +1516,8 @@ class GraphEdgeClassifier(nn.Module):
         pairwise_keys = list(FeatureRegistry.HEAVY_PAIRWISE_KEYS)
         pairwise_feats = pairwise_for_pairs(
             A01, src, dst, pairwise_keys,
-            is_directed=is_directed,
-            row_deg=row_deg,
-            col_deg=col_deg,
-            prebinarized=True
+            row_deg=row_deg, col_deg=col_deg,
+            is_directed=is_directed
         )
         cn = pairwise_feats["cn"]
         jacc = pairwise_feats["jaccard"]
@@ -1712,16 +1703,6 @@ def _tree_count_penalty(
     return loss.mean()
 
 
-def _strip_adj_from_edge_keys(feature_schema: Dict[str, Any]) -> Dict[str, Any]:
-    if "adj" not in feature_schema.get("edge_keys", []):
-        return feature_schema
-
-    return {
-        **feature_schema,
-        "edge_keys": [k for k in feature_schema["edge_keys"] if k != "adj"]
-    }
-
-
 # -------------------------------- Model factory --------------------------------
 def _build_gnn_model(
     encoder: str,
@@ -1894,8 +1875,8 @@ def _gnn_eval_split(
 
         metrics["f1"] = metrics["F1_macro"]
         if y_prob is not None:
-            metrics["_prob"] = y_prob.tolist()
-        metrics["_y"] = y_true.astype(int).tolist()
+            metrics["_prob"] = y_prob
+        metrics["_y"] = y_true.astype(int)
         return metrics, None
     else:
         if not all_logits:
@@ -1949,8 +1930,8 @@ def _gnn_eval_split(
         else:
             metrics["auroc"], metrics["auprc"] = float("nan"), float("nan")
 
-        metrics["_prob"] = p.tolist()
-        metrics["_y"] = y_i.astype(int).tolist()
+        metrics["_prob"] = p
+        metrics["_y"] = y_i.astype(int)
         return metrics, float(thr)
 
 
@@ -1979,9 +1960,6 @@ def train_one_gnn(
 
     train_loader, val_loader, test_loader = loaders
     probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
-
-    # Remove 'adj' from edge features
-    feature_schema = _strip_adj_from_edge_keys(feature_schema)
 
     # Build Model
     A0, feats0, _, M0 = next(iter(probe_loader))
@@ -2150,6 +2128,18 @@ def train_one_gnn(
         model.load_state_dict(best_state, strict=True)
 
     test_metrics, _ = _eval_split(test_loader, best_thr)
+
+    if best_val_metrics is not None:
+        if "_prob" in best_val_metrics:
+            best_val_metrics["_prob"] = best_val_metrics["_prob"].tolist()
+        if "_y" in best_val_metrics:
+            best_val_metrics["_y"] = best_val_metrics["_y"].tolist()
+
+    if "_prob" in test_metrics:
+        test_metrics["_prob"] = test_metrics["_prob"].tolist()
+    if "_y" in test_metrics:
+        test_metrics["_y"] = test_metrics["_y"].tolist()
+
     print(f"[{encoder.upper()}] Test f1: {test_metrics.get('f1', 0.0):.{disp_dec}f}")
 
     meta = {
@@ -2206,7 +2196,6 @@ def train_one_gnn_edges(
 
     train_loader, val_loader, test_loader = loaders
     probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
-    feature_schema = _strip_adj_from_edge_keys(feature_schema)
 
     # Build Model
     A0, feats0, _, M0 = next(iter(probe_loader))
@@ -2381,6 +2370,18 @@ def train_one_gnn_edges(
         model.load_state_dict(best_state, strict=True)
 
     test_metrics, _ = _eval_split(test_loader, best_thr)
+
+    if best_val_metrics is not None:
+        if "_prob" in best_val_metrics:
+            best_val_metrics["_prob"] = best_val_metrics["_prob"].tolist()
+        if "_y" in best_val_metrics:
+            best_val_metrics["_y"] = best_val_metrics["_y"].tolist()
+
+    if "_prob" in test_metrics:
+        test_metrics["_prob"] = test_metrics["_prob"].tolist()
+    if "_y" in test_metrics:
+        test_metrics["_y"] = test_metrics["_y"].tolist()
+
     print(f"[{encoder.upper()}] Test f1: {test_metrics.get('f1', 0.0):.{disp_dec}f}")
 
     meta = {
@@ -2483,6 +2484,8 @@ def run_gnn_suite(
         print(f"Running GNN encoder: {enc.upper()}")
         print("=" * 80)
 
+        _cuda_reset_peak_stats()
+
         out = train_one_gnn(enc, task, cfg, loaders=shared_loaders, feature_schema=shared_feature_schema)
         entry = {
             "val": out.get("val", {}),
@@ -2491,6 +2494,10 @@ def run_gnn_suite(
             "ckpt": out.get("ckpt")
         }
         results_target[enc] = entry
+
+        _cuda_peak_stats(enc.lower())
+        _cuda_gc(f"after-{enc.lower()}")
+
         _elapsed = out.get("elapsed_seconds")
         if _elapsed is not None:
             print(f"[TIME] Training total: {_format_duration(_elapsed)}")
@@ -2585,6 +2592,8 @@ def run_gnn_edges_suite(
         print(f"Running GNN encoder: {enc.upper()} (Scalable Mode)")
         print("=" * 80)
 
+        _cuda_reset_peak_stats()
+
         out = train_one_gnn_edges(
             enc, task, cfg,
             loaders=shared_loaders,
@@ -2598,6 +2607,10 @@ def run_gnn_edges_suite(
         }
 
         results_target[enc] = entry
+
+        _cuda_peak_stats(enc.lower())
+        _cuda_gc(f"after-{enc.lower()}")
+
         _elapsed = out.get("elapsed_seconds")
         if _elapsed is not None:
             print(f"[TIME] Training total: {_format_duration(_elapsed)}")

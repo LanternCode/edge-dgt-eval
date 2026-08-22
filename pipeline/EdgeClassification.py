@@ -87,8 +87,9 @@ Pairwise features:
     configured redaction. `degree` is a 1D node feature. `endpoint_degree` expands to the pairwise
     endpoint channels `deg_row` and `deg_col`; `deg_diff` is their absolute difference.
     If `allow_adj_channel=False` and no dense features are requested, `run_pipeline_for_task(...)`
-    temporarily uses a default structural feature set during loader resolution, then restores the
-    caller's original `task.hooks.feature_set`.
+    uses the default structural feature set for the dense model, while temporarily requesting
+    only `degree` and `clustering_coeff` during loader resolution. It then restores the caller's original
+    `task.hooks.feature_set`; the remaining structural channels are derived during BCHW assembly.
     In dense models, 1D node features are broadcast to row/col channels internally.
     In GNN models, 1D inputs are node features and square canonical or typed custom `(N, N)` inputs are edge features.
 
@@ -239,7 +240,11 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
             L = L.float()
 
         if num_classes > 1:
-            valid = torch.isfinite(L) & (L == L.round()) & (L >= 0) & (L < num_classes)
+            if L.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+                valid = (L >= 0) & (L < num_classes)
+            else:
+                valid = torch.isfinite(L) & (L == L.round()) & (L >= 0) & (L < num_classes)
+
             if not bool(valid.all()):
                 raise ValueError(
                     f"[INVALID MULTICLASS LABEL] Multiclass labels must be integer class IDs in [0, {num_classes - 1}]."
@@ -296,18 +301,20 @@ def effective_mask(
     if mask.dtype != torch.bool:
         mask = mask > 0.5
 
-    if A.dtype != torch.bool:
-        A_bool = A > 0.5
-    else:
-        A_bool = A
-
     m = mask
 
     if m.dim() == 2:
         m = m.unsqueeze(0)
 
-    if not directed and not torch.equal(m, m.transpose(-1, -2)):
-        raise ValueError("[INVALID MASK] Undirected task masks must be symmetric.")
+    if not directed:
+        if not torch.equal(m, m.transpose(-1, -2)):
+            raise ValueError("[INVALID MASK] Undirected task masks must be symmetric.")
+        return torch.triu(m, diagonal=1)
+
+    if A.dtype != torch.bool:
+        A_bool = A > 0.5
+    else:
+        A_bool = A
 
     if A_bool.dim() == 2:
         A_bool = A_bool.unsqueeze(0)
@@ -317,10 +324,6 @@ def effective_mask(
 
     # Off-diagonal candidates come from the supervision mask
     offdiag = m & (~eye)
-
-    # Undirected -> evaluate each off-diagonal edge only once
-    if not directed:
-        return torch.triu(offdiag, diagonal=1)
 
     # Directed only: include diagonal candidates where a self-loop is actually present in A
     diag_present = m & A_bool & eye
@@ -340,6 +343,7 @@ def _build_meta(
     """
     allow_adj_task = bool(getattr(getattr(task, "hooks", object()), "allow_adj_channel", False))
     tx_force = bool(getattr(cfg, "tx_force_adj_channel", True))
+    manifest = list(getattr(registry, "manifest", []))
 
     meta = dict(
         # model
@@ -347,7 +351,7 @@ def _build_meta(
         best_val_threshold=(float(best_thr) if best_thr is not None else None),
 
         # registry / features (effective)
-        manifest=list(getattr(registry, "manifest", [])),
+        manifest=manifest,
         use_mask_channel=bool(getattr(registry, "use_mask_channel", False)),
         directed=bool(getattr(registry, "directed", True)),
         supervised_redaction_policy=str(getattr(registry, "supervised_redaction_policy", "adj_only")),
@@ -361,8 +365,8 @@ def _build_meta(
 
         # pipeline-resolved inputs (useful for reproducibility)
         feature_keys=getattr(runtime, "feature_keys", None),
-        keep_idx=getattr(runtime, "keep_idx", None),
-        eff_in_ch=getattr(runtime, "eff_in_ch", None),
+        keep_idx=None if model_key == "rf" else list(range(len(manifest))),
+        eff_in_ch=None if model_key == "rf" else len(manifest),
 
         # training config (subset)
         cfg=dict(
@@ -447,8 +451,6 @@ class FeatureRegistry:
         "cn", "jaccard", "adamic_adar"
     })
 
-    # Keep a list of dynamically padded features to avoid clogging the IO stream with duplicate warnings
-    _warned_pad_features: ClassVar[Set[str]] = set()
     _stats_cache: ClassVar[Dict] = {}
 
     def __init__(
@@ -611,18 +613,7 @@ class FeatureRegistry:
                                     f"Silent cropping is unsupported as it can cause undocumented side effects. "
                                     f"If this is intended, please crop the feature manually before passing it to the pipeline."
                                 )
-                            if (
-                                k not in FeatureRegistry.CANONICAL
-                                and k not in self.custom_feature_types
-                                and k not in FeatureRegistry._warned_pad_features
-                            ):
-                                print(
-                                    f"[WARN] Dimension mismatch for custom 2D feature '{k}'. "
-                                    f"Got {tuple(M.shape)} but expected ({N}, {N}) to match padded batch. "
-                                    f"Padding with zeros to avoid a crash."
-                                )
-                                FeatureRegistry._warned_pad_features.add(k)
-
+                            
                             pad_r = max(0, N - M.shape[0])
                             pad_c = max(0, N - M.shape[1])
                             M = torch.nn.functional.pad(M, (0, pad_c, 0, pad_r), value=0.0)
@@ -827,13 +818,10 @@ class FeatureRegistry:
         flat = E.reshape(B, H * W, C)
 
         if mask is not None:
-            # Accept (B, N, N) or (B, 1, N, N); broadcast over channels.
-            if mask.dim() == 4 and mask.size(1) == 1:
-                mask = mask.squeeze(1)
             # Reshape explicitly to match H*W to avoid accidental mismatches.
             m = mask.reshape(B, H * W, 1).to(device=E.device, dtype=E.dtype)
 
-            # avoid empty division
+            # Avoid empty division
             count = torch.clamp(m.sum(dim=1, keepdim=True), min=1.0)
             mean = (flat * m).sum(dim=1, keepdim=True) / count
             var = ((flat - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
@@ -912,8 +900,8 @@ class TaskHooks:
     Parameter matching is alias-based and invocation is positional. Keyword-only
     parameters and arbitrary **kwargs are not supported.
 
-    - feature_set: True for all canonical features, False for none, or a list containing
-      canonical feature names/macros and typed custom declarations `(name, "node"|"edge")`.
+    - feature_set: True for the orientation-aware automatic canonical feature set, False for none,
+      or a list containing canonical feature names/macros and typed custom declarations `(name, "node"|"edge")`.
     - orientation: None | "dag"; passed to *_orient_to_directed on A_obs. DAG mode takes precedence over ensure_connected.
     - ensure_connected: If True, connect components using proportional multi-stitching. Ignored when orientation="dag".
     - allow_adj_channel: If True, include adjacency as an explicit numerical feature.
@@ -1142,19 +1130,8 @@ class ProvidedSplitsTask(TaskSpec):
 
             # Single-graph case: split definitions are masks
             if _is_square_matrix(train) or _is_square_matrix(val) or _is_square_matrix(test):
-                safe_splits = dict(bench.splits)
-                for k in ("train", "val", "test"):
-                    if k not in safe_splits:
-                        ref = train if _is_square_matrix(train) else (val if _is_square_matrix(val) else test)
-                        safe_splits[k] = (
-                            torch.zeros_like(ref, dtype=torch.bool)
-                            if isinstance(ref, torch.Tensor)
-                            else np.zeros_like(ref, dtype=bool)
-                        )
-                bench_view = copy.copy(bench)
-                bench_view.splits = safe_splits
                 return _build_single_graph_loaders_from_bench(
-                    bench_view, self.hooks, batch_size=bs, num_workers=nw, task=self
+                    bench, self.hooks, batch_size=bs, num_workers=nw, task=self
                 )
 
             # Pre-divided split collections: preserve membership and create loaders directly
@@ -1346,10 +1323,8 @@ def _normalise_feature_set(x, directed: bool) -> List[str]:
     return feature_list
 
 
-def _resolve_loader_pin_memory(owner: Any = None) -> bool:
-    """Resolve DataLoader pin_memory with a backwards-compatible CUDA-aware default."""
-    if owner is None:
-        return torch.cuda.is_available()
+def _resolve_loader_pin_memory(owner: Any) -> bool:
+    """Resolve DataLoader pin_memory with a CUDA-aware default."""
     val = getattr(owner, "pin_memory", None)
     if val is None:
         return torch.cuda.is_available()
@@ -1359,7 +1334,7 @@ def _resolve_loader_pin_memory(owner: Any = None) -> bool:
 def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, num_workers: int = 0, task=None):
     """
     Build train/val/test DataLoaders for the common single-graph case, using the
-    task/benchmark's `extract_features` function and the provided split masks.
+    benchmark's `extract_features` function and the provided split masks.
 
     Each split loader wraps exactly one graph sample; train/val/test differ only by
     the supervision mask, so shuffling and DataLoader generator seeding are irrelevant here.
@@ -1393,15 +1368,8 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
         else:
             feats_np = bench.extract_features(A_np, feature_set=feature_list)
     else:
-        # If the extractor lives on the task, try that as well
-        if task_obj and hasattr(task_obj, 'extract_features'):
-            if "directed" in inspect.signature(task_obj.extract_features).parameters:
-                feats_np = task_obj.extract_features(A_np, feature_set=feature_list, directed=directed)
-            else:
-                feats_np = task_obj.extract_features(A_np, feature_set=feature_list)
-        else:
-            # Without bench/task extract_features, canonical auto-derivation is unavailable
-            feats_np = {}
+        # Without bench extract_features, canonical auto-derivation is unavailable
+        feats_np = {}
 
     # Ensure numpy dtype/shape sanity and convert to torch
     feats_t = {}
@@ -1471,9 +1439,11 @@ def _augment_with_canonical_features(ds_like, bench, hooks, directed):
 
     The first sample is intentionally the authoritative split-schema probe.
     This is not a per-sample repair pass. If a requested canonical key is absent
-    from sample 0, the dataset is wrapped and that feature is derived for every
-    item on access. If the key is present in sample 0, the split is trusted to
-    provide it consistently and later samples are not scanned or repaired.
+    from sample 0 and the benchmark exposes extract_features, the dataset is wrapped
+    and that feature is derived for every item on access. Without a benchmark
+    extractor, loader-side canonical auto-derivation is unavailable. If the key is
+    present in sample 0, the split is trusted to provide it consistently and later
+    samples are not scanned or repaired.
     """
     requested = _normalise_feature_set(getattr(hooks, "feature_set", False), directed=directed)
     if not requested:
@@ -2151,6 +2121,41 @@ def _format_duration(seconds: float) -> str:
     return " ".join(parts)
 
 
+def _cuda_reset_peak_stats():
+    """
+    Reset CUDA peak-memory counters for the next model.
+    Safe on CPU-only machines.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _cuda_peak_stats(tag: str = ""):
+    """
+    Print peak CUDA tensor allocation and allocator reservation in GiB.
+    Safe on CPU-only machines (no output).
+    """
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    gib = 1024 ** 3
+    peak_alloc = torch.cuda.max_memory_allocated() / gib
+    peak_reserv = torch.cuda.max_memory_reserved() / gib
+
+    label = f" {tag}" if tag else ""
+    print(
+        f"[CUDA.PEAK]{label}: "
+        f"allocated={peak_alloc:.3f} GiB | "
+        f"reserved={peak_reserv:.3f} GiB",
+        flush=True
+    )
+
+
 def _cuda_gc(tag: str = ""):
     """
     Run Python GC + CUDA cache cleanup.
@@ -2168,10 +2173,10 @@ def _cuda_gc(tag: str = ""):
             alloc_before = torch.cuda.memory_allocated()
             reserv_before = torch.cuda.memory_reserved()
 
-        # cleanup
+        # Cleanup
+        gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-        gc.collect()
 
         if tag:
             gib = 1024 ** 3
@@ -2279,10 +2284,10 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     """
     Train a single model (mlp | deep_mlp | cnn | transformer) and evaluate on Val/Test.
 
-    This version:
-      - Never includes 'adj' in feature_keys (it's handled by the registry/manifest).
-      - Takes the fitted registry.manifest as the final channel list; keep_idx is the identity range over it.
-      - Uses the same stack -> standardise manifest-channel contract in both train and eval.
+    This method:
+      - Never includes 'adj' in feature_keys (it's handled by the registry/manifest);
+      - Takes the fitted registry.manifest as the final channel list;
+      - Uses the same stack -> standardise manifest-channel contract in both train and eval;
       - Leaves your optimiser/scheduler structure unchanged (uses existing 'criterion', 'optimiser', 'scaler' names).
     """
     # ------------------------------------------------------------
@@ -2329,8 +2334,8 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     manifest_names = list(getattr(registry, "manifest", feature_keys))
     print("registry.manifest:", manifest_names)
 
-    # ------------------------------------------------------------
-    # 2) Keep indices by NAME (gate 'adj' by task/TX override; dedup 'adj')
+    # -----------------------------------------------------------------------------
+    # 2) Effective input-channel semantics
     # -----------------------------------------------------------------------------
     # There are THREE distinct “masks”/concepts:
     #   (A) Supervision/Evaluation mask  → built by effective_mask(...). Always used.
@@ -2366,17 +2371,12 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     # -----------------------------------------------------------------------------
     # The fitted manifest is already the final ordered channel list.
     names = list(manifest_names)
-    keep_idx = list(range(len(manifest_names)))
     eff_in_ch = len(manifest_names)
     if eff_in_ch == 0:
-        raise ValueError("Effective in_channels is 0. Enable allow_adj_channel or tx_force_adj_channel.")
+        raise ValueError("[NO FEATURES DETECTED] Effective in_channels is 0. Enable allow_adj_channel or tx_force_adj_channel.")
 
     if model_key in ("transformer", "cnn"):
         print(f"[{model_key.upper()}] using channels:", names)
-
-    # expose dense runtime state for eval / checkpoint metadata
-    runtime.keep_idx = keep_idx
-    runtime.eff_in_ch = eff_in_ch
 
     # ------------------------------------------------------------
     # 3) Build model with effective in_channels (your existing recipes)
@@ -2667,6 +2667,12 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         fixed_threshold=thr, criterion=criterion
     )
 
+    for metrics in (val_m, test_m):
+        if "_prob" in metrics:
+            metrics["_prob"] = metrics["_prob"].tolist()
+        if "_y" in metrics:
+            metrics["_y"] = metrics["_y"].tolist()
+
     # ---------------------
     # Save one checkpoint per (task, timestamp, model) under saved_checkpoints/<task>/<timestamp>/<model_key>.pth
     # prefer the best validation weights if you tracked them; otherwise current
@@ -2888,11 +2894,8 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
         return {
             "loss/edge": float(loss_avg),
             "accuracy": float(acc), "precision": float(prec), "recall": float(rec), "f1": float(f1),
-            "auroc": auroc, "auprc": auprc,
-            "thr": best_thr,
-            "bacc": float(bacc),
-            "_prob": prob.tolist(),  # per-edge probabilities in dataset order
-            "_y": y_all.astype(int).tolist(),
+            "auroc": auroc, "auprc": auprc, "thr": best_thr, "bacc": float(bacc),
+            "_prob": prob, "_y": y_all.astype(int)
         }
 
     else:
@@ -2936,13 +2939,10 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
             AUPRC_macro = float(np.mean(aprs))
 
         return {
-            "loss/edge": float(loss_avg),
-            "accuracy": float(acc),
+            "loss/edge": float(loss_avg), "accuracy": float(acc),
             "P_macro": P_macro, "R_macro": R_macro, "F1_macro": F1_macro, "f1": F1_macro,
-            "AUC_macro": AUC_macro, "AUPRC_macro": AUPRC_macro,
-            "BAcc_macro": BAcc_macro,
-            "_prob": prob.astype(np.float32).tolist(),
-            "_y": y_all.astype(int).tolist(),
+            "AUC_macro": AUC_macro, "AUPRC_macro": AUPRC_macro, "BAcc_macro": BAcc_macro,
+            "_prob": prob.astype(np.float32), "_y": y_all.astype(int)
         }
 
 
@@ -3024,8 +3024,7 @@ def run_random_forest_for_task(
         with torch.no_grad():
             for X_c, y_c in _iter_split_rows(loader):
                 if X_res is None:
-                    alloc_size = int(cap) if (enforce_cap and max_edges and (num_classes > 1 or is_global_capped_binary)) \
-                        else (int(max_pos + max_neg) if enforce_cap and max_edges else 0)
+                    alloc_size = int(cap) if enforce_cap and max_edges else 0
                     X_res = np.empty((alloc_size, X_c.shape[1]), dtype=np.float32) if alloc_size else []
                     y_res = np.empty((alloc_size,), dtype=np.int64 if num_classes > 1 else np.float32) if alloc_size else []
 
@@ -3371,11 +3370,7 @@ def run_random_forest_for_task(
         task=task,
         registry=registry,
         cfg=cfg,
-        runtime=SimpleNamespace(
-            feature_keys=list(rf_keys),
-            keep_idx=None,
-            eff_in_ch=None,
-        ),
+        runtime=SimpleNamespace(feature_keys=list(rf_keys)),
         best_thr=thr
     )
     meta["rf"] = {
@@ -3573,7 +3568,6 @@ def finalise_summary(results: Dict[str, Any], task, header: Optional[str] = None
 
 def _reset_pipeline_runtime_state(task=None) -> None:
     FeatureRegistry._stats_cache.clear()
-    FeatureRegistry._warned_pad_features.clear()
 
     if task is not None:
         for attr in (
@@ -3621,7 +3615,7 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
         - Infers eval mask policy from task.directed.
         - Resolves canonical feature_keys once (no 'adj').
         - For each model, configures the effective mask-channel setting, re-fits FeatureRegistry on the train split,
-          builds keep_idx (handles adj gating), and runs the shared trainer/evaluator.
+          and runs the shared trainer/evaluator using the fitted manifest as the final channel list.
         - Saves checkpoints under saved_checkpoints/<task.name>/<timestamp>/<model>.pth with meta bundle.
         - Returns the active run bundle in the same {"results": ..., "metadata": ...} shape
           used by the rest of the pipeline.
@@ -3664,19 +3658,20 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
     )
 
     # Supported dense policy: when adjacency input is disabled and no dense features were requested,
-    # use the default structural feature set for dense loader resolution without retaining it on the task
+    # use the default structural feature set without retaining it on the task
     _restore_feature_set = False
     _original_feature_set = None
     if not feature_keys and not allow_adj:
         feature_keys = ["degree", "deg_row", "deg_col", "clustering_coeff", "cn", "jaccard", "adamic_adar"]
+        loader_feature_keys = ["degree", "clustering_coeff"]
         if hooks is not None:
             _original_feature_set = hooks.feature_set
             task._dense_generation_feature_set_override = _original_feature_set
-            hooks.feature_set = list(feature_keys)
+            hooks.feature_set = list(loader_feature_keys)
             _restore_feature_set = True
         print(
             "[WARN] Dense no-feature mode is unavailable when allow_adj_channel=False. "
-            "Using the default dense structural feature set for loader resolution: "
+            "Using the default dense structural feature set: "
             f"{feature_keys}"
         )
 
@@ -3694,11 +3689,7 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
 
     # Expose dense runtime state to subroutines without mutating cfg
     print("feature_keys:", feature_keys)
-    runtime = SimpleNamespace(
-        feature_keys=list(feature_keys),
-        keep_idx=None,
-        eff_in_ch=None,
-    )
+    runtime = SimpleNamespace(feature_keys=list(feature_keys))
 
     seen_models = set()
     deduped_models = []
@@ -3714,6 +3705,8 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
         print(f"Running model: {mk.upper()}")
         print("=" * 80)
         _model_elapsed = None
+
+        _cuda_reset_peak_stats()
 
         if mk in ("mlp", "deep_mlp", "cnn", "transformer"):
             val_m, test_m, thr, ckpt, elapsed = train_and_eval_one_model(
@@ -3759,6 +3752,7 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
                 f"Allowed dense keys are: mlp, deep_mlp, cnn, transformer, rf."
             )
 
+        _cuda_peak_stats(mk.lower())
         _cuda_gc(f"after-{mk.lower()}")
         if _model_elapsed is not None:
             print(f"[TIME] Training total: {_format_duration(_model_elapsed)}")

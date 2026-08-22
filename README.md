@@ -128,8 +128,8 @@ def label_fn(A_obs: np.ndarray) -> np.ndarray:
 hooks = TaskHooks(
     label_fn=label_fn,
     feature_set=[
-        # Replace with the canonical/custom features your task needs
-        # Set to True to request all features available
+        # Add the canonical/custom features your task needs, ex. "powers", "adamic_adar"
+        # Replace the list with True to request the default orientation-aware canonical set
     ],
     allow_adj_channel=True
 )
@@ -463,7 +463,7 @@ Notes:
 | `hooks.allow_adj_channel=True` | All dense models | Include `adj` for all models |
 | `cfg.tx_force_adj_channel=True` | Transformer only | Force `adj` for TX even if hooks say no |
 
-When `hooks.allow_adj_channel=False`, dense no-feature mode is unavailable. In that case, `run_pipeline_for_task(...)` temporarily uses the default dense structural feature set during loader resolution, then restores the caller's original `task.hooks.feature_set`.
+When `hooks.allow_adj_channel=False`, dense no-feature mode is unavailable. In that case, `run_pipeline_for_task(...)` uses the default structural feature set for the dense model, but temporarily requests only `degree` and `clustering_coeff` during loader resolution before restoring the caller's original `task.hooks.feature_set`. The remaining structural channels are derived from adjacency during BCHW assembly.
 
 GNN encoders never consume `adj` as a feature channel — they receive it as the propagation matrix.
 
@@ -481,14 +481,14 @@ Interaction with channel statistics: statistics are fitted only on positions sel
 
 #### GNN-side redaction
 
-The GNN pipeline uses a separate flag, `cfg.gnn_zero_supervised`, which controls whether supervised edges are zeroed in the adjacency matrix before message passing.
+The GNN pipeline uses a separate flag, `cfg.gnn_zero_supervised`, which controls whether supervised edges are zeroed in the adjacency matrix before GNN feature assembly and message passing.
 
 | Value | Behaviour |
 |-------|----------|
 | `False` (default) | No redaction; the GNN encoder sees the full observed adjacency |
-| `True` | Zeros the adjacency at supervised `(i, j)` positions before encoding, functionally equivalent to `supervised_redaction_policy="adj_only"` on the dense side |
+| `True` | Zeros the adjacency at supervised `(i, j)` positions before encoding |
 
-`gnn_zero_supervised` controls the shared adjacency path for every GNN encoder. GPS computes its LapPE/RWSE and local message-passing topology from the same adjacency visible to the model. This does not globally blank user-supplied edge feature tensors.
+`gnn_zero_supervised` controls the shared adjacency path for every GNN encoder. It is analogous to dense `supervised_redaction_policy="adj_only"` only with respect to the adjacency visible to the model; the complete feature representations are not functionally equivalent. GPS computes its LapPE/RWSE and local message-passing topology from the same redacted adjacency. Structural features computed inside GNN feature assembly from that adjacency also reflect the redaction. Edge-feature tensors already present in the sample feature dictionaries, including canonical features materialised during dataset construction, remain as supplied and are not globally blanked or recomputed by `gnn_zero_supervised`.
 
 ### Existing-edge-only evaluation
 
@@ -505,7 +505,7 @@ Use `True` for tasks where the objective operates exclusively on existing edges 
 
 Canonical and custom features follow different ownership rules:
 
-- **Canonical features** are pipeline-owned and remain plain strings in `hooks.feature_set`. If requested, the pipeline makes them available.
+- **Canonical features** are pipeline-owned plain strings in `hooks.feature_set`. Generated datasets use `GraphBenchmark` derivation. For pre-divided or single-graph data, loader-side derivation of canonical features that are not already supplied requires the benchmark to expose `extract_features(...)`.
 - **Custom features** are user-owned. Declare each custom name and its type directly in `hooks.feature_set` as `(name, "node")` or `(name, "edge")`, and provide its tensor in the sample feature dictionaries wherever it is used.
 - Custom feature types are part of the task declaration and therefore do not depend on run-scoped registration state.
 - `adj`, `mask`, and `_N` are reserved pipeline names and cannot be declared as custom features. Canonical feature names also cannot be redeclared as custom.
@@ -524,11 +524,11 @@ hooks = TaskHooks(
 )
 ```
 
-The custom type is mandatory; custom node/edge semantics are not inferred from a square tensor. Canonical strings, macros, `True`, and `False` retain their existing meaning.
+The custom type is mandatory; custom node/edge semantics are not inferred from a square tensor. Canonical strings, macros, `True`, and `False` retain their existing meaning. In the dense pipeline, supported custom node features are 1-D node vectors expanded to row/column channels, while supported custom edge features are 2-D pairwise matrices; tensor shapes that contradict the declared feature type are outside the supported dense-input contract.
 
-For supported pre-divided datasets, canonical-feature availability is a **split-level schema decision, not a per-sample repair pass**. The first sample of each split is the schema probe. If a requested canonical key is absent from that probe, the pipeline wraps the split and derives that feature from every item's adjacency on access. If the key is present in the probe, the split is treated as already providing that feature and later samples are not scanned or repaired individually. A canonical key supplied by a pre-divided dataset must therefore be supplied consistently across that split; omission or `None` in later samples is inconsistent user data, not a request for pipeline re-derivation. Custom features remain user-supplied and may be present only where the user provides them.
+For supported pre-divided datasets, canonical-feature availability is a **split-level schema decision, not a per-sample repair pass**. The first sample of each split is the schema probe. If a requested canonical key is absent from that probe and the benchmark exposes `extract_features(...)`, the pipeline wraps the split and derives that feature from every item's adjacency on access. If the benchmark does not expose `extract_features(...)`, requested canonical features that require loader-side derivation must already be supplied by the dataset. If the key is present in the probe, the split is treated as already providing that feature and later samples are not scanned or repaired individually. A canonical key supplied by a pre-divided dataset must therefore be supplied consistently across that split; omission or `None` in later samples is inconsistent user data, not a request for pipeline re-derivation. Custom features remain user-supplied and may be present only where the user provides them.
 
-Non-square 2D inputs are treated as node features when no explicit custom type is available. `(F, N)` node inputs are transposed to `(N, F)` when the second dimension matches the graph dimension.
+Where schema inference is used outside the dense custom-feature path, non-square 2D inputs may be classified as node features when no explicit custom type is available, and `(F, N)` node inputs are transposed to `(N, F)` when the second dimension matches the graph dimension. This does not extend dense-model support to multi-column custom node features.
 
 ### Feature macros
 
@@ -894,7 +894,7 @@ Only the documented runner entry points and task shapes are supported. Direct in
 | `_GCNEncoder`, `_SAGEEncoder`, `_GINEncoder`, `_EdgeMaskedTransformer`, `_GPSEncoder` | Expect pre-normalised adjacency and feature tensors |
 | `_EdgeFeatureDecoder` | Expects node embeddings from a compatible encoder |
 | `GraphEdgeClassifier` | Runtime state (`feature_schema`, `dropedge_p`, `lap_pe_k`, `learnable_layer_norm`, pairwise-mode flags) is injected by the GNN runners after construction; direct instantiation is unsupported |
-| `_eval_split` (`EdgeClassification`) | Coupled to registry state and `keep_idx` from training setup |
+| `_eval_split` (`EdgeClassification`) | Coupled to registry state from training setup |
 | `_gnn_eval_split` | Coupled to model attributes set during training |
 | `_build_single_graph_loaders_from_bench` | Assumes `_coerce_bench` has validated inputs |
 | `GraphBenchmark._compile_label_fn` | Assumes parameter names follow alias conventions |

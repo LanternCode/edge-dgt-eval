@@ -211,7 +211,7 @@ class FacebookLouvainTask(ProvidedSplitsTask):
             directed=False,
             hooks=hooks,
             eval_on_existing_edges_only=True,
-            num_workers=4,
+            num_workers=0,
             seed=seed
         )
 
