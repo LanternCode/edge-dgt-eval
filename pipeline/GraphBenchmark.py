@@ -58,7 +58,6 @@ class GraphBenchmark:
 
         # Warning state tracking
         self._warned_shapes = set()
-        self._warned_shape_cycle_reroll = False
         self._warned_generation_errors = set()
 
     # ------------------------------------------------------------------ #
@@ -249,24 +248,10 @@ class GraphBenchmark:
                         self._warned_shapes.add(s)
 
             if not valid_shapes:
-                # Edge case: The requested num_nodes is too small for any of the configured shapes.
-                fallback_types = [t for t in getattr(self, 'graph_types', []) if t != 'shape_cycle']
-                
-                if fallback_types:
-                    if not self._warned_shape_cycle_reroll:
-                        print(f"[WARN] num_nodes={num_nodes} is too small for any valid shapes. Re-rolling to a different graph family.")
-                        self._warned_shape_cycle_reroll = True
-                    
-                    new_type = rng.choice(fallback_types)
-                    return self.generate_graph(new_type, num_nodes, directed=directed, rng=rng)
-                else:
-                    # No other graph families available to fall back on. Exit the pipeline.
-                    raise ValueError(
-                        f"[DATASET GENERATOR] Cannot generate 'shape_cycle' with N={num_nodes}. "
-                        f"The smallest configured shape requires more nodes, and no alternative "
-                        f"graph families are available in `graph_types` to fall back on. "
-                        f"The pipeline will now exit."
-                    )
+                raise ValueError(
+                    f"[DATASET GENERATOR] Cannot generate 'shape_cycle' with N={num_nodes}. "
+                    f"The smallest configured shape requires more nodes."
+                )
             else:
                 shape = rng.choice(valid_shapes)
                 L = shape_to_len[shape]
@@ -425,8 +410,10 @@ class GraphBenchmark:
                         self._warned_generation_errors.add(gtype)
                     
                     attempts += 1
-                    gtype = local_rng.choice(self.graph_types)
-            
+                    gtype = local_rng.choice(
+                        [t for t in self.graph_types if t != gtype] or self.graph_types
+                    )
+
             if G is None:
                 raise RuntimeError(
                     f"[DATASET GENERATOR] Aborting: Failed to generate a graph with N={N} "
@@ -544,11 +531,10 @@ class GraphBenchmark:
         num_workers: int = 0
     ) -> Tuple[DataLoader, DataLoader, DataLoader]:
         """
-        Split a dataset into train/val/test loaders using integer cut points.
+        Split a dataset into train/val/test loaders according to the requested ratios.
 
-        Zero-sized splits are allowed. Because the split boundaries are computed with
-        floor-style integer truncation, a positive ratio may still produce an empty split
-        on a small dataset.
+        A zero ratio produces an empty split. Every positive-ratio split receives at least
+        one sample when enough samples exist to populate all requested splits.
         """
         n = len(cast(Sized, dataset))
         idx = np.arange(n)
@@ -559,32 +545,24 @@ class GraphBenchmark:
         if min(r0, r1, r2) < 0 or abs(r0 + r1 + r2 - 1) > Decimal("1e-6"):
             raise ValueError(f"[PIPELINE SPLIT CONFIG] ratios must be non-negative and sum to 1.0; got {tuple(ratios)}.")
 
-        a = int(r0 * n)
-        b = int((r0 + r1) * n)
-        tr, va, te = idx[:a], idx[a:b], idx[b:]
-
-        if len(tr) == 0:
-            if float(ratios[0]) == 0.0:
-                print(
-                    "[PIPELINE SPLIT CONFIG] Train ratio is 0.0, so no training will be performed. "
-                    "The reported validation/test metrics are those of a randomly initialised model. "
-                    "RF does not undergo random initialisation and reports NaNs instead.",
-                    flush=True
-                )
-            else:
-                print(
-                    f"[PIPELINE SPLIT CONFIG] Train ratio {ratios[0]} rounded down to an empty split on {n} sample(s). "
-                    f"Split boundaries use integer cut points and the test split takes the remainder, so all truncated samples land in test. "
-                    f"Increase num_graphs or adjust ratios if this was not intended. "
-                    f"(train={len(tr)}, val={len(va)}, test={len(te)})",
-                    flush=True
-                )
-        elif len(va) == 0 and float(ratios[1]) > 0.0:
-            print(
-                f"[PIPELINE SPLIT CONFIG] Val ratio {ratios[1]} rounded down to an empty split on {n} sample(s). "
-                f"Threshold tuning and checkpoint selection will have no data.",
-                flush=True
+        requested = (r0, r1, r2)
+        if n < sum(r > 0 for r in requested):
+            raise ValueError(
+                f"[PIPELINE SPLIT CONFIG] {n} sample(s) cannot populate every split requested "
+                f"by ratios={tuple(ratios)}. Each positive-ratio split requires at least one sample."
             )
+
+        counts = [1 if r > 0 else 0 for r in requested]
+        while sum(counts) < n:
+            i = max(
+                range(3),
+                key=lambda j: requested[j] * n - counts[j]
+            )
+            counts[i] += 1
+
+        a = counts[0]
+        b = a + counts[1]
+        tr, va, te = idx[:a], idx[a:b], idx[b:]
 
         train_ds = Subset(dataset, tr)
         val_ds   = Subset(dataset, va)

@@ -29,7 +29,6 @@ class _ActiveRun:
     quiet: bool
     display_decimals: int
     display_truncate: bool
-    open: bool = True
 
 
 _LOCK = threading.RLock()
@@ -56,14 +55,11 @@ def _finalise_open_run_locked() -> None:
     Summary printing is optional via `quiet`, but reset is unconditional.
     """
     global _ACTIVE_RUN
-
     run = _ACTIVE_RUN
-    if run is None or not run.open:
-        _ACTIVE_RUN = None
+    if run is None:
         return
 
     _ACTIVE_RUN = None
-    run.open = False
     _stamp_bundle(run.bundle, run.stages, is_open=False)
 
     run_meta = run.bundle.setdefault("metadata", {}).setdefault("run", {})
@@ -196,13 +192,10 @@ def begin_or_attach_run(
         The active run bundle to be populated by the caller.
     """
     global _ACTIVE_RUN
-
     install_boundary_hooks()
 
     with _LOCK:
-        had_active_run = _ACTIVE_RUN is not None and _ACTIVE_RUN.open
-
-        if had_active_run:
+        if _ACTIVE_RUN is not None:
             active = _ACTIVE_RUN
 
             if can_attach(list(active.stages), stage, active.task_key, task_key):

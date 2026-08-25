@@ -1598,6 +1598,11 @@ class GNNTrainConfig:
         value disables ratio balancing. Auxiliary losses, when enabled, may still
         operate on the full supervised logits.
     """
+    def __new__(cls, *args, **kwargs):
+        obj = super().__new__(cls)
+        obj._batch_size_explicit = len(args) >= 5 or "batch_size" in kwargs
+        return obj
+
     epochs: int = 40
     lr: float = 3e-4
     weight_decay: float = 1e-4
@@ -1669,21 +1674,16 @@ def _balance_binary_negpos(y_sel: torch.Tensor, ratio: float) -> torch.Tensor:
 
 def _tree_count_penalty(
     logits: torch.Tensor,
+    supervision_mask: torch.Tensor,
     mask: torch.Tensor,
-    A: torch.Tensor,
-    *,
-    directed: bool = False,
-    edges_only: bool = True
+    A: torch.Tensor
 ) -> torch.Tensor:
     """
     Encourage the total predicted edge count to match the tree edge count (N - 1).
     Uses L1 loss normalised by N to maintain O(1) scale with the primary BCE loss.
     """
     Z = logits
-    m = effective_mask(mask, A, directed)
-
-    if edges_only:
-        m = m & (A > 0.5)
+    m = supervision_mask
 
     probs = torch.sigmoid(Z)
     pred_edge_count = (probs * m).sum(dim=(1, 2))
@@ -2038,7 +2038,11 @@ def train_one_gnn(
             prebalanced_binary = False
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
-                idx = _supervised_indices(mask, A, is_directed, edges_only)
+                supervision_mask = effective_mask(mask, A, is_directed)
+                if edges_only:
+                    supervision_mask = supervision_mask & (A > 0.5)
+
+                idx = torch.nonzero(supervision_mask, as_tuple=False)
                 if idx.numel() == 0:
                     continue
 
@@ -2085,10 +2089,7 @@ def train_one_gnn(
 
             # This penalises deviation from expected tree density (N-1 edges)
             if bool(getattr(cfg, "use_tree_aux_loss", False)) and logits is not None:
-                aux = _tree_count_penalty(
-                    logits, mask, A=A,
-                    directed=is_directed, edges_only=edges_only
-                )
+                aux = _tree_count_penalty(logits, supervision_mask, mask, A=A)
                 loss = loss + aux
 
             if not torch.isfinite(loss):
@@ -2548,6 +2549,11 @@ def run_gnn_edges_suite(
           on the fly from the adjacency.
     """
     canon = _canonicalise_encoders(encoders)
+    batch_size_explicit = (
+        getattr(cfg, "_batch_size_explicit", False)
+        if isinstance(cfg, GNNTrainConfig)
+        else ("batch_size" in cfg if isinstance(cfg, dict) else hasattr(cfg, "batch_size"))
+    )
     cfg = _coerce_train_cfg(cfg)
     cfg.display_decimals = int(display_decimals)
     cfg.display_truncate = bool(display_truncate)
@@ -2578,8 +2584,12 @@ def run_gnn_edges_suite(
             directed=task.directed
         )
 
-    if int(getattr(cfg, "batch_size", 16)) != 1:
-        print("[WARN] Scalable Mode processes one graph at a time; the configured batch_size is ignored.", flush=True)
+    if batch_size_explicit and int(cfg.batch_size) != 1:
+        print(
+            f"[WARN] Scalable Mode processes one graph at a time; configured "
+            f"batch_size={cfg.batch_size} is ignored and batch_size=1 will be used.",
+            flush=True
+        )
     cfg.batch_size = 1
 
     shared_loaders = _resolve_loaders(task, cfg, batch_size=1)
@@ -2776,7 +2786,7 @@ def _infer_feature_schema(
                     if not torch.is_tensor(v):
                         continue
                     _classify_and_register(k, v, N_unpadded)
-                    if seeking is not None:
+                    if seeking is not None and (k in seen_nodes or k in seen_edges):
                         seeking.discard(k)
 
                 # All requested keys found — stop scanning entirely
@@ -2792,14 +2802,12 @@ def _infer_feature_schema(
         seen_edges.add("shortest_path")
         edge_keys.append("shortest_path")
 
-    # Warn about requested features absent from all loaders.
-    # Unlike the dense pipeline (which zero-fills missing channels at a known shape),
-    # the GNN schema cannot infer dimensionality for features it has never observed.
+    # The GNN schema cannot infer dimensionality for absent or unusable features
     if seeking:
         print(
-            f"[WARN] Requested feature(s) {sorted(seeking)} were not found in any loader "
-            f"batch and will be absent from the GNN feature schema. If these features are "
-            f"expected, ensure they are present in the dataset's feature dictionaries.",
+            f"[WARN] Requested feature(s) {sorted(seeking)} were not found as usable tensors in any loader "
+            f"batch and will be absent from the GNN feature schema. If these features are expected, "
+            f"ensure they are present with a supported shape/type in the dataset's feature dictionaries.",
             flush=True
         )
 

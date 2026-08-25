@@ -104,7 +104,6 @@ import gc
 import random
 import warnings
 import math
-import dataclasses as _dc
 import numpy as np
 import torch
 import torch.nn as nn
@@ -116,7 +115,7 @@ from ._utils.run_lifecycle import begin_or_attach_run, get_active_run_checkpoint
 from .GraphBenchmark import GraphBenchmark
 from types import SimpleNamespace
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import List, Dict, Tuple, Optional, Callable, Union, Sequence, ClassVar, FrozenSet, Set, Literal, Any
 from torch.utils.data import DataLoader, Dataset
 from sklearn.ensemble import RandomForestClassifier
@@ -931,8 +930,9 @@ class ProvidedSplitsTask(TaskSpec):
         num_graphs: How many graphs to sample. Passed through to GraphBenchmark.
         min_nodes / max_nodes: Node count bounds for sampling.
         ratios: Train/val/test fractions for GraphBenchmark.make_loaders.
-            Zero-sized splits are allowed. Splits are formed via integer cut points,
-            so on small datasets a positive fraction may still round down to an empty split.
+            A zero ratio explicitly requests an empty split. Every positive ratio receives
+            at least one graph. If num_graphs is smaller than the number of positive-ratio
+            splits, generated tasks raise before graph generation.
         num_classes: Optional override for multi-class tasks (default 1).
         eval_on_existing_edges_only: If True, loss/metrics are evaluated only on observed edges (mask ∩ A).
         show_progress: Whether to show GraphBenchmark sampling progress.
@@ -1155,6 +1155,13 @@ class ProvidedSplitsTask(TaskSpec):
         # Generative benchmark path
         if self.num_graphs is None or int(self.num_graphs) < 1:
             raise ValueError("[INVALID CONFIGURATION] Generated datasets require num_graphs >= 1.")
+
+        if int(self.num_graphs) < sum(float(r) > 0.0 for r in self.ratios):
+            raise ValueError(
+                f"[PIPELINE SPLIT CONFIG] num_graphs={self.num_graphs} cannot populate every "
+                f"split requested by ratios={tuple(self.ratios)}. Each positive-ratio split "
+                f"requires at least one graph."
+            )
 
         # Don't resample new graphs; re-batch the existing ones
         ds = getattr(self, "_active_run_dataset", None)
@@ -1379,7 +1386,7 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
             feats_t[k] = torch.as_tensor(float(vv), dtype=torch.float32)
         elif vv.ndim == 2:
             # Allow N x N (pairwise) OR N x F / F x N (node features)
-            if vv.shape == (A.shape[0], A.shape[0]) or A.shape[0] in vv.shape:
+            if A.shape[0] in vv.shape:
                 feats_t[k] = torch.from_numpy(vv.astype(np.float32))
             else:
                 print(
@@ -1388,13 +1395,13 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
                 )
                 continue
         elif vv.ndim == 1:
-            # node feature: length N
+            # Node feature: length N
             if vv.shape[0] != A.shape[0]:
                 print(f"[WARN] feature '{k}' has length {vv.shape[0]}; expected {A.shape[0]}. Skipping.")
                 continue
             feats_t[k] = torch.from_numpy(vv.astype(np.float32))
         else:
-            # ignore non 1D/2D features
+            # Ignore non 1D/2D features
             continue
 
     # Labels from hooks.label_fn with the same dispatch rules as GraphBenchmark.generate_dataset()
@@ -1600,43 +1607,26 @@ def _task_to_meta_dict(task):
             isinstance(x, (int, float, str, bool, type(None))) for x in v
         )
 
-    if _dc.is_dataclass(task):
-        # Shallow field extraction to avoid catastrophic deep-copies of datasets/loaders
-        merged = {f.name: getattr(task, f.name) for f in _dc.fields(task)}
-        merged.update(getattr(task, "__dict__", {}))
+    # Supported runner inputs are ProvidedSplitsTask or subclasses, hence dataclass-backed.
+    merged = {f.name: getattr(task, f.name) for f in fields(task)}
+    merged.update(getattr(task, "__dict__", {}))
 
-        # Preserve only public primitive metadata, dropping private runtime state and heavy objects
-        safe_scalar_types = (int, float, str, bool, type(None))
-        d = {
-            k: v for k, v in merged.items()
-            if not str(k).startswith("_") and (
-                isinstance(v, safe_scalar_types) or _is_safe_sequence(v)
-            )
-        }
+    # Preserve only public primitive metadata, dropping private runtime state and heavy objects
+    safe_scalar_types = (int, float, str, bool, type(None))
+    d = {
+        k: v for k, v in merged.items()
+        if not str(k).startswith("_") and (
+            isinstance(v, safe_scalar_types) or _is_safe_sequence(v)
+        )
+    }
 
-        # Sanitise raw hooks object to prevent pickling crashes on callables
-        safe_hooks = _get_safe_hooks(merged.get("hooks"))
-        if safe_hooks:
-            d["hooks"] = safe_hooks
-
-        # Deepcopy after hook sanitisation so the copied payload stays lightweight and checkpoint-safe
-        return copy.deepcopy(d)
-
-    if isinstance(task, dict):
-        return dict(task)
-
-    # Shallow pick of common fields from SimpleNamespace-like tasks
-    keys = (
-        "name", "directed", "eval_on_existing_edges_only",
-        "num_graphs", "min_nodes", "max_nodes", "ratios"
-    )
-    meta = {k: getattr(task, k) for k in keys if hasattr(task, k)}
-
-    # Summarise hooks without trying to serialise callables
-    safe_hooks = _get_safe_hooks(getattr(task, "hooks", None))
+    # Sanitise raw hooks object to prevent pickling crashes on callables
+    safe_hooks = _get_safe_hooks(merged.get("hooks"))
     if safe_hooks:
-        meta["hooks"] = safe_hooks
-    return meta
+        d["hooks"] = safe_hooks
+
+    # Deepcopy after hook sanitisation so the copied payload stays lightweight and checkpoint-safe
+    return copy.deepcopy(d)
 
 
 # ============================================================
@@ -2412,12 +2402,23 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         ).to(DEVICE)
 
     elif model_key == "transformer":
-        # Size TX from the observed graph size
+        # Size TX from the largest graph size known for the resolved task
         probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
         A_probe, _, _, _ = next(iter(probe_loader))
         N_ref = int(A_probe.shape[-1])
+
         if getattr(task, "_active_run_dataset", None) is not None and getattr(task, "max_nodes", None) is not None:
+            # Generated datasets have a configured upper bound
             N_ref = max(N_ref, int(task.max_nodes))
+        else:
+            # Pre-divided datasets may contain larger graphs outside the probe batch
+            splits = getattr(getattr(task, "_bench_instance", None), "splits", {})
+            predivided = [split for split in splits.values() if isinstance(split, (Dataset, list, tuple))]
+            if predivided:
+                N_ref = max(
+                    N_ref,
+                    max(int(split[i][0].shape[0]) for split in predivided for i in range(len(split)))
+                )
 
         budget = _get("tx_token_budget", 1024)
         use_dec = _get("tx_use_decoder", True)
@@ -2772,25 +2773,23 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
                 all_y_sel.append(y_sel_cpu)
             continue
 
-        # --- Full-grid path for spatial models (cnn, transformer) ---
+        # ------------------------------------------------------------
+        # Full-grid path for spatial models (cnn, transformer)
+        # ------------------------------------------------------------
+        # Skip batches with no supervised pairs before BCHW assembly / model forward.
+        m_cpu = effective_mask(mask, A, registry.directed)
+        if edges_only is True:
+            m_cpu = m_cpu & (A > 0.5)
+        if not m_cpu.any():
+            continue
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
                                 enabled=torch.cuda.is_available()):
             logits = forward_logits_common(
                 A, feats, mask,
-                registry=registry,
-                feature_keys=feature_keys,
-                model_key=model_key,
-                model=model,
-                device=DEVICE,
+                registry=registry, feature_keys=feature_keys,
+                model_key=model_key, model=model, device=DEVICE
             )
-
-        # Build an effective mask on the CPU, then index
-        m_cpu = effective_mask(mask, A, registry.directed)
-        if edges_only is True:
-            m_cpu = m_cpu & (A > 0.5)
-
-        if not m_cpu.any():
-            continue
 
         idx_cpu = torch.nonzero(m_cpu, as_tuple=False)  # (E,3): [b,i,j]
         dev = logits.device
@@ -2993,16 +2992,16 @@ def run_random_forest_for_task(
 
     def _iter_split_rows(loader: DataLoader):
         for A, feats, L, mask in loader:
-            x_bchw = registry.stack_channels_BCHW(
-                A, feats, mask, rf_keys, include_adj=("adj" in getattr(registry, "manifest", []))
-            )
-            x_bchw = registry.standardise_bchw(x_bchw)
-
             m = effective_mask(mask, A, registry.directed)
             if edges_only:
                 m = m & (A > 0.5)
             if not m.any():
                 continue
+
+            x_bchw = registry.stack_channels_BCHW(
+                A, feats, mask, rf_keys, include_adj=("adj" in getattr(registry, "manifest", []))
+            )
+            x_bchw = registry.standardise_bchw(x_bchw)
 
             idx = torch.nonzero(m, as_tuple=False)
             X_c = x_bchw[idx[:, 0], :, idx[:, 1], idx[:, 2]].numpy()

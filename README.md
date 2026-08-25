@@ -210,9 +210,7 @@ bundle = run_gnn_edges_suite(task, encoders=["sage"], cfg=cfg)
 
 ### Supported task shapes
 
-All three runners accept only **`ProvidedSplitsTask` (or a subclass)**.
-
-It supports generated multi-graph datasets with ratio-based splitting, pre-divided datasets exposed through `bench.splits`, and single-graph benchmarks whose `bench.splits` contains boolean split masks. Ratio-based splitting uses integer cut points; zero-sized splits are allowed.
+All three runners accept only **`ProvidedSplitsTask` (or a subclass)**. It supports generated multi-graph datasets with ratio-based splitting, pre-divided datasets exposed through `bench.splits`, and single-graph benchmarks whose `bench.splits` contains boolean split masks. For generated ratio-based splitting, a zero ratio explicitly requests an empty split and every positive-ratio split receives at least one graph. If `num_graphs` is smaller than the number of positive-ratio splits, the task raises before graph generation. Pre-divided datasets may still provide empty individual splits.
 
 ### Run semantics
 
@@ -601,13 +599,15 @@ ProvidedSplitsTask._build_loaders()
   │
   └─ No splits?
        → first loader resolution in a run:
-            bench.sample_specs → bench.generate_dataset → build loaders → cache on task
+            bench.sample_specs → bench.generate_dataset → Wrap with mask_policy → build loaders → cache on task
        → later compatible loader resolutions in the same run:
             reuse cached loaders directly
        → next top-level run:
             clear run cache and regenerate for auto-generated tasks
 
 ```
+
+`mask_policy` is **fill-if-absent**, not an override. If a sample already supplies both its label matrix and evaluation mask, that supplied mask is preserved unchanged. The configured `mask_policy` constructs an evaluation mask only when the sample does not already provide one.
 
 ### Loader → Model (Dense)
 
@@ -809,6 +809,14 @@ These rules avoid an implicit per-sample data-repair pass over user-provided dat
 ### Dense normalisation uses a bounded 1,024-batch statistics pass
 
 Dense channel mean/std fitting consumes at most 1,024 batches from the training loader. It is a bounded estimate of the training distribution, not an exhaustive whole-dataset reduction. For training loaders longer than 1,024 batches, the fitted statistics may depend on batch size and loader order because those determine which examples are observed within the bounded pass. The fitted statistics are then reused for validation/test standardisation and by compatible dense-model stages through the normal statistics cache.
+
+### Generated common-neighbour computation intentionally remains separate from the power cache
+
+On the generated-data path, adjacency is binary and undirected adjacency is symmetric. When `extract_features(...)` needs both `power_2` (or another feature that requires the A² cache) and `cn` / `jaccard`, the cached `A²` and the common-neighbour matrix are therefore numerically identical. The pairwise helper nevertheless computes common neighbours independently.
+
+This duplicate work is retained deliberately. `pairwise_batch_from_adj(...)` computes the common-neighbour matrix once for both `cn` and `jaccard`, while `extract_features(...)` also serves pre-divided and single-graph callers whose adjacency has not necessarily passed through the generated-data sanitisation path. Reusing the power cache would therefore require guarded special handling and changes to the shared Jaccard/common-neighbour path rather than a simple removal of one matrix multiplication.
+
+A generated-path variant that reused the existing matrix was measured after review. The isolated change was approximately neutral (~1.05× on the undirected probe) and slightly slower on the directed probe, so there is no demonstrated net performance benefit. Treat the duplicate computation as known and accepted unless a supported-path profile demonstrates a material end-to-end saving with the full `cn` / `jaccard` integration accounted for.
 
 ### GPS structural encodings are recomputed per batch, not cached
 
