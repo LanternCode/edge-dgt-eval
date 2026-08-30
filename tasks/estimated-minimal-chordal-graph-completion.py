@@ -37,14 +37,11 @@ def label_minimal_chordal_completion(A: np.ndarray) -> np.ndarray:
 
 
 class ChordalCompletionBenchmark(GraphBenchmark):
-    def __init__(self, num_graphs, min_nodes, max_nodes, graph_types, **kwargs):
+    def __init__(self, min_nodes, max_nodes, graph_types, **kwargs):
         self.valid_types = graph_types
         self.node_range = (min_nodes, max_nodes)
 
         super().__init__(
-            num_graphs=num_graphs,
-            min_nodes=min_nodes,
-            max_nodes=max_nodes,
             graph_types=graph_types,
             **kwargs
         )
@@ -121,10 +118,8 @@ class ChordalCompletionBenchmark(GraphBenchmark):
 
 # Inform the pipeline about task-specific graph families
 bench = ChordalCompletionBenchmark(
-    num_graphs=1000,
-    min_nodes=6,
-    max_nodes=140,
-    graph_types=["cycle", "grid", "tree", "er", "ba"]
+    graph_types=["cycle", "grid", "tree", "er", "ba"],
+    min_nodes=6, max_nodes=140
 )
 
 hooks = TaskHooks(
@@ -145,7 +140,10 @@ task = ProvidedSplitsTask(
     hooks=hooks,
     ratios=(0.8, 0.1, 0.1),
     bench=bench,
-    mask_policy="non_edges"
+    mask_policy="non_edges",
+    num_graphs=1000,
+    min_nodes=6,
+    max_nodes=140
 )
 
 # Define the config used by the TNN pipeline
@@ -160,8 +158,9 @@ gnn_encoders = ["gcn", "sage", "gin", "edge_tx", "gps"]
 gnn_cfg = GNNTrainConfig(
     epochs=120,
     weight_decay=1e-3,
-    lap_pe_k=8
+    lap_pe_k=8,
+    early_stop_patience=10
 )
 
-# Run the GNN pipeline on all four models
+# Run the GNN pipeline on all five models
 run_gnn_suite(task, gnn_encoders, gnn_cfg)

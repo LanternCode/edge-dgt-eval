@@ -22,8 +22,8 @@ class MinimalFillBenchmark(GraphBenchmark):
     """
     def __init__(self, dataset_path: str, features_path: Optional[str] = None):
         super().__init__()
-        # Default feature path convention: dataset.jsonl -> dataset.jsonl.features.pt
-        features_path = features_path or (dataset_path + ".features.pt")
+        # Default feature path convention: dataset.jsonl -> dataset.jsonl.features.current.pt
+        features_path = features_path or (dataset_path + ".features.current.pt")
 
         if not os.path.exists(dataset_path):
             raise FileNotFoundError(f"Missing dataset: {dataset_path}")
@@ -108,7 +108,7 @@ class MinimalFillBenchmark(GraphBenchmark):
 
 bench = MinimalFillBenchmark(
     dataset_path="data/minfill_true_1000/min_fill_dataset.jsonl",
-    features_path="data/minfill_true_1000/min_fill_dataset.jsonl.features.pt"
+    features_path="data/minfill_true_1000/min_fill_dataset.jsonl.features.current.pt"
 )
 
 hooks = TaskHooks(
@@ -149,7 +149,7 @@ gnn_cfg = GNNTrainConfig(
     neg_pos_ratio=4.0
 )
 
-# Run the GNN pipeline on all four models
+# Run the GNN pipeline on all five models
 run_gnn_suite(
     task=task,
     encoders=["gcn", "sage", "gin", "edge_tx", "gps"],

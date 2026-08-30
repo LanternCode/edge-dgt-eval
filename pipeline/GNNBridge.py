@@ -437,12 +437,6 @@ def _assemble_features_for_graph(
         E = FeatureRegistry.zscore_edges_per_graph(E_b, mask=E_mask_b).squeeze(0)
         E = E * em_bool.unsqueeze(-1).to(E.dtype)
 
-    elif extra_edge_mask is not None:
-        E_local = (
-            torch.empty((0,), device=E.device, dtype=torch.long),
-            torch.empty((0, 0), device=E.device, dtype=E.dtype)
-        )
-
     if extra_edge_mask is not None:
         return X, (E, E_local)
     return X, E
@@ -883,10 +877,6 @@ class _GPSEncoder(nn.Module):
 
             if current_ids.numel():
                 pos = torch.searchsorted(edge_ids, current_ids)
-                if torch.any(pos >= edge_ids.numel()):
-                    raise RuntimeError("[GPS] Message passing edge is missing from local edge features.")
-                if not torch.equal(edge_ids[pos], current_ids):
-                    raise RuntimeError("[GPS] Local edge features are misaligned with message passing edges.")
                 edge_attr = edge_values[pos]
             else:
                 edge_attr = edge_values.new_zeros((0, self.edge_dim))
@@ -976,7 +966,6 @@ class _EdgeFeatureDecoder(nn.Module):
         """
         super().__init__()
         self.directed = directed
-        self.num_classes = num_classes
 
         # Input: 4 raw combinations of node embeddings + original edge features
         in_dim = 4 * dim + edge_dim
@@ -987,85 +976,7 @@ class _EdgeFeatureDecoder(nn.Module):
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, out_dim)
         )
-        self.register_buffer("_cached_tril_mask", torch.empty(0, 0, dtype=torch.bool), persistent=False)
 
-    def forward(self, Z_batch: List[torch.Tensor], node_mask: torch.Tensor, E_batch: List[torch.Tensor]) -> torch.Tensor:
-        """
-        Args:
-            Z_batch: List of (N, d) node embeddings per graph.
-            node_mask: (B, N) bool mask indicating valid nodes.
-            E_batch: List of (N, N, Fe) edge feature matrices per graph.
-
-        Returns:
-            Logits tensor of shape (B, N, N) if binary, or (B, N, N, K) if multiclass.
-        """
-        if not self.directed and len(Z_batch) > 0:
-            N_max = Z_batch[0].shape[0]
-            if self._cached_tril_mask.device != Z_batch[0].device or self._cached_tril_mask.shape[0] != N_max:
-                self._cached_tril_mask = torch.tril(torch.ones(N_max, N_max, dtype=torch.bool, device=Z_batch[0].device), diagonal=-1)
-            tril_mask = self._cached_tril_mask
-        else:
-            tril_mask = None
-
-        outs = []
-        for b, Z in enumerate(Z_batch):
-            N, _ = Z.shape
-            nm_bool = node_mask[b].bool()
-            mask_2d = nm_bool[:, None] & nm_bool[None, :]
-
-            if not self.directed:
-                mask_2d = torch.triu(mask_2d, diagonal=1)
-
-            # Get indices of only the valid (i, j) pairs
-            row_idx, col_idx = torch.nonzero(mask_2d, as_tuple=True)
-            if row_idx.numel() == 0:
-                outs.append(torch.zeros((N, N) if self.num_classes <= 1 else (N, N, self.num_classes), 
-                                        device=Z.device, dtype=Z.dtype))
-                continue
-
-            # Extract only valid node embeddings
-            zi = Z[row_idx]
-            zj = Z[col_idx]
-
-            # Extract only valid edge features
-            if not self.directed:
-                E_valid = E_batch[b][row_idx, col_idx]
-                E_valid_rev = E_batch[b][col_idx, row_idx]
-            else:
-                E_valid = E_batch[b][row_idx, col_idx]
-
-            # Concatenate as a flattened 2D tensor (V, features)
-            diff_abs = (zi - zj).abs()
-            prod = zi * zj
-            phi_valid = torch.cat([zi, zj, diff_abs, prod, E_valid], dim=-1)
-
-            # Run the MLP only on valid pairs
-            s_valid = self.scorer(phi_valid)
-
-            # Evaluate reverse orientation mathematically identically to score_pairs
-            if not self.directed:
-                phi_rev = torch.cat([zj, zi, diff_abs, prod, E_valid_rev], dim=-1)
-                s_valid = 0.5 * (s_valid + self.scorer(phi_rev))
-
-            # Scatter back into a dense N x N grid
-            out_dim = s_valid.size(-1)
-            s = torch.zeros((N, N, out_dim), device=Z.device, dtype=s_valid.dtype)
-            s[row_idx, col_idx] = s_valid
-
-            # Enforce symmetry for undirected graphs
-            if not self.directed:
-                s_T = s.transpose(0, 1)
-                s[tril_mask] = s_T[tril_mask]
-
-            # Remove singleton dimension for binary tasks -> (N, N)
-            if self.num_classes <= 1:
-                s = s.squeeze(-1)
-
-            outs.append(s)
-
-        # Stack batch -> (B, N, N) or (B, N, N, K)
-        return torch.stack(outs, dim=0)
-    
     def score_pairs(self, z_u, z_v, edge_feats, edge_feats_rev=None):
         """Score M specific pairs without materialising N×N."""
         diff_abs = (z_u - z_v).abs()
@@ -1214,7 +1125,7 @@ class GraphEdgeClassifier(nn.Module):
     Flow:
       1. Prepare features (standardise, mask).
       2. Encode nodes -> Z (List of N x d).
-      3. Decode edges -> Logits (B x N x N [x K]).
+      3. Decode the selected edge pairs required by the active GNN runner.
     """
     def __init__(
         self,
@@ -1361,7 +1272,7 @@ class GraphEdgeClassifier(nn.Module):
     def _encode_batch(
             self,
             A: torch.Tensor,
-            feats: Union[Dict[str, torch.Tensor], List[Dict[str, torch.Tensor]]],
+            feats: List[Dict[str, torch.Tensor]],
             mask: torch.Tensor
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         """
@@ -1417,39 +1328,12 @@ class GraphEdgeClassifier(nn.Module):
 
         return Z_batch, E_batch, node_mask
 
-    def forward(
-            self,
-            A: torch.Tensor,
-            feats: Union[Dict[str, torch.Tensor], List[Dict[str, torch.Tensor]]],
-            mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Executes the full encode-decode pass for the edge classifier.
-
-        Adjacency routing note:
-            For SAGE, GIN, and GPS, adjacency is routed to sparse COO before encoder use.
-            This may look like an optimisation target but it is not treated as a
-            planned change by itself. Any attempt to alter this path should be
-            justified by profiling on a supported code path and must not
-            change DropEdge, masking, or training semantics.
-
-        Args:
-            A: (B, N, N) Adjacency matrix.
-            feats: List of feature dicts per graph.
-            mask: (B, N, N) Validity mask.
-
-        Returns:
-            Logits: (B, N, N) or (B, N, N, K).
-        """
-        Z_batch, E_batch, node_mask = self._encode_batch(A, feats, mask)
-        return self.dec(Z_batch, node_mask, E_batch)
-
     def score_pairs_selected(
         self,
         A: torch.Tensor,
-        feats: Union[Dict[str, torch.Tensor], List[Dict[str, torch.Tensor]]],
+        feats: List[Dict[str, torch.Tensor]],
         mask: torch.Tensor,
-        idx: torch.Tensor,
+        idx: torch.Tensor
     ) -> torch.Tensor:
         """
         Computes logits only for the selected (b, i, j) pairs using the full-matrix
@@ -1459,7 +1343,6 @@ class GraphEdgeClassifier(nn.Module):
             Logits: (M,) if binary, or (M, K) if multiclass. Row i corresponds to row i of `idx`.
         """
         Z_batch, E_batch, _ = self._encode_batch(A, feats, mask)
-        dev = A.device
 
         M = int(idx.shape[0])
         out = None
@@ -1481,11 +1364,6 @@ class GraphEdgeClassifier(nn.Module):
                 shape = (M,) if s_b.dim() == 1 else (M, s_b.shape[-1])
                 out = torch.zeros(shape, device=s_b.device, dtype=s_b.dtype)
             out[keep] = s_b
-
-        if out is None:
-            if self.num_classes > 1:
-                return torch.empty((0, self.num_classes), device=dev, dtype=Z_batch[0].dtype)
-            return torch.empty((0,), device=dev, dtype=Z_batch[0].dtype)
 
         return out
 
@@ -1595,8 +1473,7 @@ class GNNTrainConfig:
         _pos_weight is the default for GNN binary BCE training. When
         neg_pos_ratio is positive, it replaces _pos_weight for the BCE term with
         target-ratio negative balancing plus unweighted BCE. None or a non-positive
-        value disables ratio balancing. Auxiliary losses, when enabled, may still
-        operate on the full supervised logits.
+        value disables ratio balancing.
     """
     def __new__(cls, *args, **kwargs):
         obj = super().__new__(cls)
@@ -1608,6 +1485,7 @@ class GNNTrainConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     batch_size: int = 16
+    early_stop_patience: int = 0
 
     # Model sizes
     hidden: int = 128
@@ -1629,9 +1507,6 @@ class GNNTrainConfig:
 
     # Sampling: None or <= 0 disables ratio sampling; > 0 sets target neg:pos ratio
     neg_pos_ratio: Optional[float] = None
-
-    # Tree-specific auxiliary losses (used only in spanning-tree-style tasks)
-    use_tree_aux_loss: bool = False
 
     # Saving
     save_dir: Optional[str] = "saved_checkpoints"  # None to skip saving
@@ -1670,37 +1545,6 @@ def _balance_binary_negpos(y_sel: torch.Tensor, ratio: float) -> torch.Tensor:
         neg_idx = torch.cat([neg_idx, repl])
 
     return torch.cat([pos_idx, neg_idx])
-
-
-def _tree_count_penalty(
-    logits: torch.Tensor,
-    supervision_mask: torch.Tensor,
-    mask: torch.Tensor,
-    A: torch.Tensor
-) -> torch.Tensor:
-    """
-    Encourage the total predicted edge count to match the tree edge count (N - 1).
-    Uses L1 loss normalised by N to maintain O(1) scale with the primary BCE loss.
-    """
-    Z = logits
-    m = supervision_mask
-
-    probs = torch.sigmoid(Z)
-    pred_edge_count = (probs * m).sum(dim=(1, 2))
-
-    node_mask = mask.any(dim=-1) | mask.any(dim=-2)
-    node_mask = node_mask | (A > 0.5).any(dim=-1) | (A > 0.5).any(dim=-2)
-
-    n_valid = node_mask.sum(dim=1).to(pred_edge_count.dtype)
-
-    # pred_edge_count is bounded by the number of supervised candidate cells
-    n_candidates = m.sum(dim=(1, 2)).to(pred_edge_count.dtype)
-    target_edge_count = torch.minimum((n_valid - 1).clamp_min(0), n_candidates)
-
-    # L1 penalty normalised by the graph size
-    loss = torch.abs(pred_edge_count - target_edge_count) / n_valid.clamp_min(1.0)
-
-    return loss.mean()
 
 
 # -------------------------------- Model factory --------------------------------
@@ -1978,15 +1822,6 @@ def train_one_gnn(
     model.gps_lap_pe_sign_flip = bool(getattr(cfg, "gps_lap_pe_sign_flip", True))
     model.gps_rwse_steps = int(getattr(cfg, "gps_rwse_steps", 16))
     model.feature_schema = feature_schema
-
-    if num_classes > 1 and bool(getattr(cfg, "use_tree_aux_loss", False)):
-        print(
-            "[WARN] use_tree_aux_loss=True is unsupported for multiclass tasks; "
-            "disabling tree auxiliary loss for this run.",
-            flush=True
-        )
-        cfg.use_tree_aux_loss = False
-
     zero_supervised = bool(getattr(cfg, "gnn_zero_supervised", False))
 
     # Warmup
@@ -2023,9 +1858,13 @@ def train_one_gnn(
     # Training Loop
     best_val, best_thr, best_state = -1.0, (None if num_classes > 1 else 0.5), None
     best_val_metrics = None
+    no_improve = 0
+    patience = int(getattr(cfg, "early_stop_patience", 0))  # 0 => disabled
     last_known_thr = 0.5
+    epochs_ran = 0
 
     for epoch in range(1, int(cfg.epochs) + 1):
+        epochs_ran = epoch
         model.train()
         epoch_loss, epoch_count = 0.0, 0
 
@@ -2034,8 +1873,6 @@ def train_one_gnn(
             mask = mask.to(device)
             A_enc = _redact_supervised_edges(A, mask, zero_supervised)
             optimiser.zero_grad(set_to_none=True)
-            logits = None
-            prebalanced_binary = False
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
                 supervision_mask = effective_mask(mask, A, is_directed)
@@ -2051,46 +1888,25 @@ def train_one_gnn(
                     y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]].long().to(device)
                 else:
                     y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(device=device, dtype=torch.float32)
+                    if neg_pos_ratio is not None and neg_pos_ratio > 0:
+                        keep = _balance_binary_negpos(y_sel, neg_pos_ratio)
+                        idx = idx[keep]
+                        y_sel = y_sel[keep]
 
-                    if not bool(getattr(cfg, "use_tree_aux_loss", False)):
-                        if neg_pos_ratio is not None and neg_pos_ratio > 0:
-                            keep = _balance_binary_negpos(y_sel, neg_pos_ratio)
-                            idx = idx[keep]
-                            y_sel = y_sel[keep]
-                            prebalanced_binary = True
-
-                if bool(getattr(cfg, "use_tree_aux_loss", False)):
-                    logits = model(A_enc, feats, mask)
-                    if num_classes > 1:
-                        z_sel = logits[idx[:, 0], idx[:, 1], idx[:, 2], :]
-                    else:
-                        z_sel = logits[idx[:, 0], idx[:, 1], idx[:, 2]]
-                else:
-                    z_sel = model.score_pairs_selected(A_enc, feats, mask, idx)
+                z_sel = model.score_pairs_selected(A_enc, feats, mask, idx)
 
                 if num_classes > 1:
                     loss = criterion(z_sel, y_sel)
                     bs = int(y_sel.numel())
                 else:
                     if neg_pos_ratio is not None and neg_pos_ratio > 0:
-                        if prebalanced_binary:
-                            loss = nn.BCEWithLogitsLoss()(z_sel, y_sel)
-                            bs = int(y_sel.numel())
-                        else:
-                            keep = _balance_binary_negpos(y_sel, neg_pos_ratio)
-                            z_bal, y_bal = z_sel[keep], y_sel[keep]
-                            loss = nn.BCEWithLogitsLoss()(z_bal, y_bal)
-                            bs = int(y_bal.numel())
+                        loss = nn.BCEWithLogitsLoss()(z_sel, y_sel)
+                        bs = int(y_sel.numel())
                     else:
                         # Default: _pos_weight
                         pw = _pos_weight(y_sel)
                         loss = nn.BCEWithLogitsLoss(pos_weight=pw)(z_sel, y_sel)
                         bs = int(y_sel.numel())
-
-            # This penalises deviation from expected tree density (N-1 edges)
-            if bool(getattr(cfg, "use_tree_aux_loss", False)) and logits is not None:
-                aux = _tree_count_penalty(logits, supervision_mask, mask, A=A)
-                loss = loss + aux
 
             if not torch.isfinite(loss):
                 continue
@@ -2124,6 +1940,18 @@ def train_one_gnn(
             best_thr = thr if thr is not None else (None if num_classes > 1 else last_known_thr)
             best_val_metrics = dict(val_metrics)
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        elif not np.isfinite(sel_val):
+            # Empty / no-eval validation split: keep NaN explicit and do not count it as "no improvement"
+            pass
+        else:
+            no_improve += 1
+            if patience > 0 and no_improve >= patience:
+                print(
+                    f"[{encoder.upper()}] Early stop @ epoch {epoch} "
+                    f"(best Val F1={best_val:.{disp_dec}f})"
+                )
+                break
 
     if best_state is not None:
         model.load_state_dict(best_state, strict=True)
@@ -2149,12 +1977,14 @@ def train_one_gnn(
         "directed": is_directed,
         "task": _task_to_meta_dict(task),
         "feature_schema": feature_schema,
-        "pairwise_on_demand": getattr(model, "pairwise_on_demand", False),
+        "pairwise_on_demand": False,
         "cfg": dict(
             lr=float(cfg.lr),
             weight_decay=float(cfg.weight_decay),
             epochs=int(cfg.epochs),
-            batch_size=1 if getattr(model, "pairwise_on_demand", False) else int(cfg.batch_size)
+            epochs_ran=int(epochs_ran),
+            early_stop_patience=int(getattr(cfg, "early_stop_patience", 0)),
+            batch_size=int(cfg.batch_size)
         ),
         "elapsed_seconds": round(time.monotonic() - _t_model_start, 3)
     }
@@ -2212,16 +2042,6 @@ def train_one_gnn_edges(
     model.dropedge_p = float(getattr(cfg, "dropedge_p", 0.10))
     model.feature_schema = feature_schema
     model.pairwise_on_demand = True
-
-    # Feature guards
-    if bool(getattr(cfg, "use_tree_aux_loss", False)):
-        print(
-            "[WARN] use_tree_aux_loss=True is unsupported when pairwise_on_demand=True; "
-            "disabling tree auxiliary loss for this run.",
-            flush=True
-        )
-        cfg.use_tree_aux_loss = False
-
     model.lap_pe_k = int(getattr(cfg, "lap_pe_k", 0))
     model.gps_lap_pe_k = int(getattr(cfg, "gps_lap_pe_k", 16))
     model.gps_lap_pe_sign_flip = bool(getattr(cfg, "gps_lap_pe_sign_flip", True))
@@ -2267,9 +2087,13 @@ def train_one_gnn_edges(
     # Training Loop
     best_val, best_thr, best_state = -1.0, (None if num_classes > 1 else 0.5), None
     best_val_metrics = None
+    no_improve = 0
+    patience = int(getattr(cfg, "early_stop_patience", 0))  # 0 => disabled
     last_known_thr = 0.5
+    epochs_ran = 0
 
     for epoch in range(1, int(cfg.epochs) + 1):
+        epochs_ran = epoch
         model.train()
         epoch_loss, epoch_count = 0.0, 0
 
@@ -2366,6 +2190,18 @@ def train_one_gnn_edges(
             best_thr = thr if thr is not None else (None if num_classes > 1 else last_known_thr)
             best_val_metrics = dict(val_metrics)
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        elif not np.isfinite(sel_val):
+            # Empty / no-eval validation split: keep NaN explicit and do not count it as "no improvement"
+            pass
+        else:
+            no_improve += 1
+            if patience > 0 and no_improve >= patience:
+                print(
+                    f"[{encoder.upper()}] Early stop @ epoch {epoch} "
+                    f"(best Val F1={best_val:.{disp_dec}f})"
+                )
+                break
 
     if best_state is not None:
         model.load_state_dict(best_state, strict=True)
@@ -2391,12 +2227,14 @@ def train_one_gnn_edges(
         "directed": is_directed,
         "task": _task_to_meta_dict(task),
         "feature_schema": feature_schema,
-        "pairwise_on_demand": getattr(model, "pairwise_on_demand", False),
+        "pairwise_on_demand": True,
         "cfg": dict(
             lr=float(cfg.lr),
             weight_decay=float(cfg.weight_decay),
             epochs=int(cfg.epochs),
-            batch_size=1 if getattr(model, "pairwise_on_demand", False) else int(cfg.batch_size)
+            epochs_ran=int(epochs_ran),
+            early_stop_patience=int(getattr(cfg, "early_stop_patience", 0)),
+            batch_size=1
         ),
         "elapsed_seconds": round(time.monotonic() - _t_model_start, 3)
     }

@@ -69,7 +69,7 @@ gnn_cfg = GNNTrainConfig(
         batch_size=cfg.batch_size
     )
 
-# Run the GNN pipeline on all four models
+# Run the GNN pipeline on all five models
 run_gnn_suite(
     task=task,
     encoders=("gcn", "sage", "gin", "edge_tx", "gps"),

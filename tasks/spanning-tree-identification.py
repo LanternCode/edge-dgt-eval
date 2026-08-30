@@ -94,11 +94,10 @@ gnn_cfg = GNNTrainConfig(
     epochs=ec_cfg.epochs,
     dropout=0.15,
     lap_pe_k=8,
-    use_tree_aux_loss=True,
     neg_pos_ratio=5.0
 )
 
-# Run the GNN pipeline on all four models
+# Run the GNN pipeline on all five models
 gnn_encoders = ["gcn", "sage", "gin", "edge_tx", "gps"]
 run_gnn_suite(
     task=task,

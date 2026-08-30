@@ -86,10 +86,9 @@ Pairwise features:
     Dense models derive pairwise channels during channel stacking from the adjacency channel after any 
     configured redaction. `degree` is a 1D node feature. `endpoint_degree` expands to the pairwise
     endpoint channels `deg_row` and `deg_col`; `deg_diff` is their absolute difference.
-    If `allow_adj_channel=False` and no dense features are requested, `run_pipeline_for_task(...)`
-    uses the default structural feature set for the dense model, while temporarily requesting
-    only `degree` and `clustering_coeff` during loader resolution. It then restores the caller's original
-    `task.hooks.feature_set`; the remaining structural channels are derived during BCHW assembly.
+    If a dense model resolves to zero effective input channels, training raises
+    `[NO FEATURES DETECTED]`; setting `task.hooks.feature_set=True` requests the default
+    orientation-aware canonical feature set.
     In dense models, 1D node features are broadcast to row/col channels internally.
     In GNN models, 1D inputs are node features and square canonical or typed custom `(N, N)` inputs are edge features.
 
@@ -804,41 +803,37 @@ class FeatureRegistry:
         return x_std
 
     @staticmethod
-    def zscore_edges_per_graph(E: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def zscore_edges_per_graph(E: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Per-graph, per-channel z-score for edge tensors.
         Args:
             E: (B, N, N, C).
-            mask: optional (B, N, N) boolean mask; True=valid. Broadcast over channels.
+            mask: (B, N, N) boolean mask; True=valid. Broadcast over channels.
         Returns:
             Tensor with same shape as E, z-scored per graph per channel.
         """
         B, H, W, C = E.shape
         flat = E.reshape(B, H * W, C)
 
-        if mask is not None:
-            # Reshape explicitly to match H*W to avoid accidental mismatches.
-            m = mask.reshape(B, H * W, 1).to(device=E.device, dtype=E.dtype)
+        # Reshape explicitly to match H*W to avoid accidental mismatches.
+        m = mask.reshape(B, H * W, 1).to(device=E.device, dtype=E.dtype)
 
-            # Avoid empty division
-            count = torch.clamp(m.sum(dim=1, keepdim=True), min=1.0)
-            mean = (flat * m).sum(dim=1, keepdim=True) / count
-            var = ((flat - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
-        else:
-            mean = flat.mean(dim=1, keepdim=True)
-            var = flat.var(dim=1, unbiased=False, keepdim=True)
+        # Avoid empty division
+        count = torch.clamp(m.sum(dim=1, keepdim=True), min=1.0)
+        mean = (flat * m).sum(dim=1, keepdim=True) / count
+        var = ((flat - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
 
         std = torch.clamp(var.sqrt(), min=1e-8)
         return ((flat - mean) / std).reshape(B, H, W, C)
 
     @staticmethod
-    def zscore_nodes_per_graph(X: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def zscore_nodes_per_graph(X: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Per-graph, per-feature z-score for node tensors.
 
         Args:
             X: (B, N, F).
-            mask: optional (B, N) boolean mask. True=valid.
+            mask: (B, N) boolean mask. True=valid.
 
         Returns:
             Tensor with same shape as X, z-scored per graph per feature.
@@ -852,19 +847,15 @@ class FeatureRegistry:
         if n_feat == 0:
             return X
 
-        if mask is not None:
-            m0 = mask.to(X.device, non_blocking=True)
-            if m0.dtype != torch.bool:
-                m0 = m0 > 0.5
+        m0 = mask.to(X.device, non_blocking=True)
+        if m0.dtype != torch.bool:
+            m0 = m0 > 0.5
 
-            m = m0.view(B, N, 1).expand_as(X)
+        m = m0.view(B, N, 1).expand_as(X)
 
-            count = torch.clamp(m.sum(dim=1, keepdim=True).to(X.dtype), min=1.0)
-            mean = (X * m).sum(dim=1, keepdim=True) / count
-            var = ((X - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
-        else:
-            mean = X.mean(dim=1, keepdim=True)
-            var = X.var(dim=1, unbiased=False, keepdim=True)
+        count = torch.clamp(m.sum(dim=1, keepdim=True).to(X.dtype), min=1.0)
+        mean = (X * m).sum(dim=1, keepdim=True) / count
+        var = ((X - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
 
         std = torch.clamp(var.sqrt(), min=1e-8)
         out = ((X - mean) / std)
@@ -1174,12 +1165,8 @@ class ProvidedSplitsTask(TaskSpec):
 
             # Normalise feature_set so the synthetic path matches the single-graph/provided-splits path
             hooks_for_generation = copy.copy(self.hooks)
-            generation_feature_set = getattr(
-                self, "_dense_generation_feature_set_override",
-                getattr(self.hooks, "feature_set", False)
-            )
             hooks_for_generation.feature_set = _normalise_feature_set(
-                generation_feature_set, directed=self.directed
+                getattr(self.hooks, "feature_set", False), directed=self.directed
             )
             ds = bench.generate_dataset(
                 specs, hooks=hooks_for_generation,
@@ -2286,23 +2273,19 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     _t_model_start = time.monotonic()
     train_loader, val_loader, test_loader = loaders
     num_classes = int(getattr(task, "num_classes", 1))
-    epochs = int(getattr(cfg, "epochs", 80))
-    lr = float(getattr(cfg, "lr", 1e-3))
-    weight_decay = float(getattr(cfg, "weight_decay", 0.0))
-    max_grad_norm = float(getattr(cfg, "grad_clip", 0.0))
+    epochs = int(cfg.epochs)
+    lr = float(cfg.lr)
+    weight_decay = float(cfg.weight_decay)
+    max_grad_norm = float(cfg.grad_clip)
     edges_only = bool(getattr(task, "eval_on_existing_edges_only", False))
-
-    disp_dec = int(getattr(cfg, "display_decimals", 4))
-    disp_trunc = bool(getattr(cfg, "display_truncate", False))
+    disp_dec = int(cfg.display_decimals)
+    disp_trunc = bool(cfg.display_truncate)
 
     def _fmt(v):
         if disp_trunc and not math.isnan(v):
             p = 10 ** disp_dec
             v = int(v * p) / p
         return f"{v:.{disp_dec}f}"
-
-    def _get(name, default):
-        return getattr(cfg, name, default)
 
     # ------------------------------------------------------------
     # 1) Resolve feature_keys for this task and fit registry fresh
@@ -2311,7 +2294,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     feature_keys = list(getattr(runtime, "feature_keys", []))
 
     # Decide mask-channel per model (or honor cfg override)
-    if getattr(cfg, "use_mask_channel", None) is None:
+    if cfg.use_mask_channel is None:
         registry.use_mask_channel = (model_key in ("cnn", "transformer"))
         print(f"[{model_key.upper()}] mask channel default → {registry.use_mask_channel}")
     else:
@@ -2319,7 +2302,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         print(f"[{model_key.upper()}] mask channel override from cfg → {registry.use_mask_channel}")
 
     allow_adj = bool(getattr(getattr(task, "hooks", object()), "allow_adj_channel", False))
-    include_adj = allow_adj or (model_key == "transformer" and bool(getattr(cfg, "tx_force_adj_channel", True)))
+    include_adj = allow_adj or (model_key == "transformer" and bool(cfg.tx_force_adj_channel))
     registry.fit(train_loader, feature_keys, include_adj=include_adj)
     manifest_names = list(getattr(registry, "manifest", feature_keys))
     print("registry.manifest:", manifest_names)
@@ -2363,7 +2346,11 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     names = list(manifest_names)
     eff_in_ch = len(manifest_names)
     if eff_in_ch == 0:
-        raise ValueError("[NO FEATURES DETECTED] Effective in_channels is 0. Enable allow_adj_channel or tx_force_adj_channel.")
+        raise ValueError(
+            "[NO FEATURES DETECTED] Effective in_channels is 0. "
+            "Set task.hooks.feature_set=True to use the default structural features, "
+            "or explicitly enable an input channel for this model."
+        )
 
     if model_key in ("transformer", "cnn"):
         print(f"[{model_key.upper()}] using channels:", names)
@@ -2375,17 +2362,17 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     if model_key == "mlp":
         model = MatrixFeatureMLP(
             in_channels=eff_in_ch,
-            hidden_dim=_get("mlp_hidden", 256),
-            dropout=_get("mlp_dropout", 0.10),
+            hidden_dim=cfg.mlp_hidden,
+            dropout=cfg.mlp_dropout,
             num_classes=num_classes,
         ).to(DEVICE)
 
     elif model_key == "deep_mlp":
         model = MatrixFeatureDeepMLP(
             in_channels=eff_in_ch,
-            hidden_dim=_get("deep_mlp_hidden", 256),
-            depth=_get("deep_mlp_layers", 4),
-            dropout=_get("deep_mlp_dropout", 0.10),
+            hidden_dim=cfg.deep_mlp_hidden,
+            depth=cfg.deep_mlp_layers,
+            dropout=cfg.deep_mlp_dropout,
             num_classes=num_classes,
         ).to(DEVICE)
 
@@ -2398,7 +2385,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
             hidden=int(cfg.cnn_hidden),
             head_kernel=head_k,
             num_classes=num_classes,
-            dropout=float(getattr(cfg, "cnn_dropout", 0.0)),
+            dropout=float(cfg.cnn_dropout),
         ).to(DEVICE)
 
     elif model_key == "transformer":
@@ -2420,15 +2407,15 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                     max(int(split[i][0].shape[0]) for split in predivided for i in range(len(split)))
                 )
 
-        budget = _get("tx_token_budget", 1024)
-        use_dec = _get("tx_use_decoder", True)
-        d_model = _get("tx_dmodel", 384)
-        n_layers = _get("tx_layers", 6)
-        n_heads = _get("tx_heads", 6)
-        dropout = _get("tx_dropout", 0.10)
-        patch_overlap = bool(_get("tx_patch_overlap", False))
-        token_pol = _get("tx_token_policy", "keep_all")
-        min_keep = _get("tx_min_keep_ratio", 0.0)
+        budget = cfg.tx_token_budget
+        use_dec = cfg.tx_use_decoder
+        d_model = cfg.tx_dmodel
+        n_layers = cfg.tx_layers
+        n_heads = cfg.tx_heads
+        dropout = cfg.tx_dropout
+        patch_overlap = bool(cfg.tx_patch_overlap)
+        token_pol = cfg.tx_token_policy
+        min_keep = cfg.tx_min_keep_ratio
         CANDIDATES = (2, 4, 8, 16, 24, 32, 48, 64)
 
         def tokens_for(N: int, P: int, S: int) -> int:
@@ -2479,7 +2466,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
 
     scheduler = None
     if model_key == "transformer":
-        sched_name = str(getattr(cfg, "tx_scheduler", "none")).lower()
+        sched_name = str(cfg.tx_scheduler).lower()
         if sched_name == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         elif sched_name == "step":
@@ -2489,8 +2476,8 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     # 5) Train
     # ------------------------------------------------------------
     best_state = None
-    # selection metric (default = F1; optional "auroc", "bacc")
-    select_by = str(getattr(cfg, "select_by", "f1")).lower()
+    # Selection metric (default = F1; optional "auroc", "bacc")
+    select_by = str(cfg.select_by).lower()
     if select_by == "auroc":
         _select_key = "AUROC"
     elif select_by == "bacc":
@@ -2500,7 +2487,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
 
     best_val_sel = float("-inf")
     no_improve = 0
-    patience = int(getattr(cfg, "early_stop_patience", 0))  # 0 -> no early stop
+    patience = int(cfg.early_stop_patience)
     last_known_thr = 0.5
     for epoch in range(1, epochs + 1):
         model.train()
@@ -2695,14 +2682,12 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
 
 
 # ---------------------------------------------------------------------
-# Hooks + feature utilities (single source of truth, no globals needed)
+# Hooks + feature utilities (single source of truth)
 # ---------------------------------------------------------------------
 def _hooks_get(hooks, key, default=None):
-    """Safe access for TaskHooks (object) and dict hooks."""
+    """Safe access for TaskHooks."""
     if hooks is None:
         return default
-    if isinstance(hooks, dict):
-        return hooks.get(key, default)
     return getattr(hooks, key, default)
 
 
@@ -3008,29 +2993,26 @@ def run_random_forest_for_task(
             y_c = L[idx[:, 0], idx[:, 1], idx[:, 2]].numpy()
             yield X_c, y_c
 
-    # Collect a split into (E,C) and labels (with optional reservoir sampling)
-    def _collect_split(loader: DataLoader, enforce_cap: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    # Collect the training split into a capped (E,C) reservoir and labels
+    def _collect_split(loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
         rng = np.random.default_rng(getattr(task, "seed", None))
         X_res, y_res = None, None
         seen_pos, seen_neg, seen_multi, seen_bin = 0, 0, 0, 0
-        
-        cap = max_edges if enforce_cap and max_edges else float('inf')
-        is_capped_binary = (num_classes == 1 and rf_neg_pos_ratio > 0 and cap != float('inf'))
-        is_global_capped_binary = (num_classes == 1 and rf_neg_pos_ratio <= 0 and cap != float('inf'))
+
+        cap = int(max_edges)
+        is_capped_binary = num_classes == 1 and rf_neg_pos_ratio > 0
+        is_global_capped_binary = num_classes == 1 and rf_neg_pos_ratio <= 0
         max_pos = int(cap / (1.0 + rf_neg_pos_ratio)) if is_capped_binary else cap
         max_neg = cap - max_pos if is_capped_binary else cap
 
         with torch.no_grad():
             for X_c, y_c in _iter_split_rows(loader):
                 if X_res is None:
-                    alloc_size = int(cap) if enforce_cap and max_edges else 0
-                    X_res = np.empty((alloc_size, X_c.shape[1]), dtype=np.float32) if alloc_size else []
-                    y_res = np.empty((alloc_size,), dtype=np.int64 if num_classes > 1 else np.float32) if alloc_size else []
-
-                if not enforce_cap or not max_edges:
-                    X_res.append(X_c)
-                    y_res.append((y_c > 0.5).astype(np.float32) if num_classes == 1 else y_c.astype(np.int64))
-                    continue
+                    X_res = np.empty((cap, X_c.shape[1]), dtype=np.float32)
+                    y_res = np.empty(
+                        (cap,),
+                        dtype=np.int64 if num_classes > 1 else np.float32
+                    )
 
                 if num_classes > 1:
                     # Clamp: a full reservoir must start replacement at row 0
@@ -3111,14 +3093,11 @@ def run_random_forest_for_task(
 
         if X_res is None:
             return np.empty((0, 0), np.float32), np.empty((0,), np.float32)
-        
-        if not enforce_cap or not max_edges:
-            return np.concatenate(X_res, axis=0), np.concatenate(y_res, axis=0)
 
         if num_classes > 1:
             valid = min(seen_multi, int(cap))
             return X_res[:valid], y_res[:valid]
-        
+
         if is_global_capped_binary:
             valid = min(seen_bin, int(cap))
             return X_res[:valid], y_res[:valid]
@@ -3145,7 +3124,7 @@ def run_random_forest_for_task(
         return X_final[perm], y_final[perm]
 
     # Train
-    Xtr, ytr = _collect_split(train_loader, enforce_cap=True)
+    Xtr, ytr = _collect_split(train_loader)
 
     def _empty_metrics() -> Dict[str, float]:
         if num_classes == 1:
@@ -3279,18 +3258,6 @@ def run_random_forest_for_task(
 
         # --- Binary Path ---
         pr = np.asarray(probs, dtype=np.float64)
-        if pr.size == 0:
-            return None, {
-                "loss/edge": None,
-                "precision": float("nan"),
-                "recall": float("nan"),
-                "f1": float("nan"),
-                "accuracy": float("nan"),
-                "bacc": float("nan"),
-                "auroc": float("nan"),
-                "auprc": float("nan"),
-                "TP": 0, "TN": 0, "FP": 0, "FN": 0
-            }
 
         # pick threshold
         if fixed_thr is None:
@@ -3570,8 +3537,7 @@ def _reset_pipeline_runtime_state(task=None) -> None:
 
     if task is not None:
         for attr in (
-            "_active_run_loaders", "_active_run_loader_sig", "_active_run_dataset",
-            "_dense_generation_feature_set_override", "_latest_results"
+            "_active_run_loaders", "_active_run_loader_sig", "_active_run_dataset","_latest_results"
         ):
             if hasattr(task, attr):
                 delattr(task, attr)
@@ -3656,35 +3622,8 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
         custom_feature_types=custom_feature_types
     )
 
-    # Supported dense policy: when adjacency input is disabled and no dense features were requested,
-    # use the default structural feature set without retaining it on the task
-    _restore_feature_set = False
-    _original_feature_set = None
-    if not feature_keys and not allow_adj:
-        feature_keys = ["degree", "deg_row", "deg_col", "clustering_coeff", "cn", "jaccard", "adamic_adar"]
-        loader_feature_keys = ["degree", "clustering_coeff"]
-        if hooks is not None:
-            _original_feature_set = hooks.feature_set
-            task._dense_generation_feature_set_override = _original_feature_set
-            hooks.feature_set = list(loader_feature_keys)
-            _restore_feature_set = True
-        print(
-            "[WARN] Dense no-feature mode is unavailable when allow_adj_channel=False. "
-            "Using the default dense structural feature set: "
-            f"{feature_keys}"
-        )
-
     # Resolve loaders
-    try:
-        train_loader, val_loader, test_loader = _resolve_loaders(task, cfg)
-    finally:
-        if _restore_feature_set:
-            hooks.feature_set = _original_feature_set
-            if hasattr(task, "_dense_generation_feature_set_override"):
-                delattr(task, "_dense_generation_feature_set_override")
-            for attr in ("_active_run_loaders", "_active_run_loader_sig"):
-                if hasattr(task, attr):
-                    delattr(task, attr)
+    train_loader, val_loader, test_loader = _resolve_loaders(task, cfg)
 
     # Expose dense runtime state to subroutines without mutating cfg
     print("feature_keys:", feature_keys)

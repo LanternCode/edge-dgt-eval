@@ -1160,7 +1160,8 @@ if __name__ == "__main__":
             neg_pos_ratio=1.0,
             gnn_zero_supervised=True,
             batch_size=1,
-            grad_clip=float(args.gnn_grad_clip)
+            grad_clip=float(args.gnn_grad_clip),
+            early_stop_patience=5
         )
         bundle = run_gnn_edges_suite(task=task, encoders=[args.model], cfg=gnn_cfg)
         _print_gold_style_metrics(bundle, args.model)

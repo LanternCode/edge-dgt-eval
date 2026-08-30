@@ -59,7 +59,13 @@ class HiggsRetweetEdgesTask(ProvidedSplitsTask):
     """
     Full-graph sparse task using local induced subgraphs for edge mini-batch training.
     """
-    def __init__(self, neg_pos_ratio: float = 5.0, tile_size: int = 384):
+    def __init__(
+            self,
+            neg_pos_ratio: float = 5.0,
+            tile_size: int = 384,
+            targets_per_tile: int = 16,
+            seed: Optional[int] = None
+    ):
         """Initialise the HIGGS task, target splits, observable graph, and tile benchmark."""
         hooks = TaskHooks(
             label_fn=None,
@@ -73,11 +79,17 @@ class HiggsRetweetEdgesTask(ProvidedSplitsTask):
             name="HIGGS_Retweet_Tiles",
             directed=True,
             hooks=hooks,
-            num_workers=4
+            num_workers=4,
+            seed=seed
         )
 
         self.neg_pos_ratio = float(neg_pos_ratio)
         self.tile_size = int(tile_size)
+        self.targets_per_tile = int(targets_per_tile)
+        if self.targets_per_tile < 1:
+            raise ValueError("targets_per_tile must be at least 1.")
+        if 2 * self.targets_per_tile > self.tile_size:
+            raise ValueError("tile_size must be at least 2 * targets_per_tile to guarantee all target endpoints fit.")
 
         txt = _ensure_higgs_local()
         G = _load_directed_graph(txt)
@@ -154,7 +166,12 @@ class HiggsRetweetEdgesTask(ProvidedSplitsTask):
             f"  splits (pos): {len(P_tr):,}/{len(P_va):,}/{len(P_te):,} | (neg): {len(N_tr):,}/{len(N_va):,}/{len(N_te):,}"
         )
 
-        self._bench_instance = HiggsRetweetTileBench(self, tile_size=self.tile_size)
+        self._bench_instance = HiggsRetweetTileBench(
+            self,
+            tile_size=self.tile_size,
+            targets_per_tile=self.targets_per_tile,
+            seed=self.seed
+        )
 
     def node_feature_dict(self, A_repr) -> Dict[str, np.ndarray]:
         """Global node features from the observable training graph."""
@@ -166,9 +183,9 @@ class HiggsRetweetEdgesTask(ProvidedSplitsTask):
 
 class ECTileDataset(Dataset):
     """
-    Builds a local induced subgraph around a (u,v) pair from the observable directed graph.
+    Builds local induced subgraphs around groups of candidate pairs from the observable directed graph.
 
-    Supervision is restricted to the target pair via the mask.
+    Supervision is restricted to the packed target pairs via the mask.
     """
     def __init__(
             self,
@@ -178,17 +195,24 @@ class ECTileDataset(Dataset):
             col_ptr: np.ndarray,
             rows_sorted: np.ndarray,
             edges: Dict[str, np.ndarray],
+            targets_per_tile: int,
+            seed: int,
             P: int = 384,
             node_feats: Optional[Dict[str, np.ndarray]] = None,
-            node_feat_keys: Optional[Tuple[str, ...]] = None,
+            node_feat_keys: Optional[Tuple[str, ...]] = None
     ):
-        """Initialise candidate pairs, sparse graph indices, tile size, and node features."""
+        """Initialise candidate pairs, sparse graph indices, tile packing, and node features."""
         self.N = int(N)
         self.row_ptr = row_ptr.astype(np.int64, copy=False)
         self.cols_sorted = cols_sorted.astype(np.int64, copy=False)
         self.col_ptr = col_ptr.astype(np.int64, copy=False)
         self.rows_sorted = rows_sorted.astype(np.int64, copy=False)
         self.P = int(P)
+        self.targets_per_tile = int(targets_per_tile)
+        if self.targets_per_tile < 1:
+            raise ValueError("targets_per_tile must be at least 1.")
+        if 2 * self.targets_per_tile > self.P:
+            raise ValueError("P must be at least 2 * targets_per_tile to guarantee all target endpoints fit.")
 
         pos = edges["pos"].astype(np.int64, copy=False)
         neg = edges["neg"].astype(np.int64, copy=False)
@@ -198,12 +222,19 @@ class ECTileDataset(Dataset):
             np.zeros(neg.shape[0], dtype=np.float32)
         ])
 
+        if self.targets_per_tile > 1 and self.pairs.shape[0] > 1:
+            rng = np.random.default_rng(int(seed))
+            order = rng.permutation(self.pairs.shape[0])
+            self.pairs = self.pairs[order]
+            self.labels = self.labels[order]
+
+        self.n_tiles = (self.pairs.shape[0] + self.targets_per_tile - 1) // self.targets_per_tile
         self.node_feats = node_feats or {}
         self.node_feat_keys = node_feat_keys if node_feat_keys is not None else tuple(self.node_feats.keys())
 
     def __len__(self) -> int:
-        """Return the number of supervised candidate pairs."""
-        return int(self.pairs.shape[0])
+        """Return the number of multi-target tiles."""
+        return int(self.n_tiles)
 
     def _has_edge(self, u: int, v: int) -> bool:
         """Return whether the observable training graph contains the directed edge u -> v."""
@@ -213,11 +244,20 @@ class ECTileDataset(Dataset):
         j = int(np.searchsorted(cs, v, side="left"))
         return j < cs.shape[0] and int(cs[j]) == v
 
-    def _sample_nodes(self, u: int, v: int, target_present: bool) -> np.ndarray:
-        """Build a neighbourhood-first local node set without using the target edge."""
-        nodes = [u, v]
-        seen = {u, v}
-        frontier = [u, v]
+    def _sample_nodes(self, target_pairs: np.ndarray, hidden_positive_keys: set) -> np.ndarray:
+        """Build a neighbourhood-first local node set without traversing supervised positive edges."""
+        nodes = []
+        seen = set()
+        for u, v in target_pairs:
+            for node in (int(u), int(v)):
+                if node not in seen:
+                    seen.add(node)
+                    nodes.append(node)
+
+        if len(nodes) > self.P:
+            raise RuntimeError("Target endpoints exceed the tile node budget.")
+
+        frontier = list(nodes)
 
         while frontier and len(nodes) < self.P:
             remaining = self.P - len(nodes)
@@ -262,11 +302,9 @@ class ECTileDataset(Dataset):
                     if n is None:
                         break
 
-                    if target_present:
-                        if from_outgoing and x == u and n == v:
-                            continue
-                        if not from_outgoing and x == v and n == u:
-                            continue
+                    edge_key = int(x) * self.N + int(n) if from_outgoing else int(n) * self.N + int(x)
+                    if edge_key in hidden_positive_keys:
+                        continue
 
                     if n in seen:
                         continue
@@ -281,41 +319,60 @@ class ECTileDataset(Dataset):
         return np.asarray(nodes, dtype=np.int64)
 
     def __getitem__(self, i):
-        """Build and return one leakage-safe induced subgraph sample for a candidate pair."""
-        u, v = int(self.pairs[i, 0]), int(self.pairs[i, 1])
-        y = float(self.labels[i])
-        target_present = self._has_edge(u, v)
-        nodes = self._sample_nodes(u, v, target_present)
+        """Build and return one leakage-safe induced subgraph supervising a group of candidate pairs."""
+        start = int(i) * self.targets_per_tile
+        end = min(start + self.targets_per_tile, int(self.pairs.shape[0]))
+        target_pairs = self.pairs[start:end]
+        target_labels = self.labels[start:end]
+
+        hidden_positive_keys = set()
+        hidden_out = {}
+        hidden_in = {}
+        for u_raw, v_raw in target_pairs:
+            u = int(u_raw)
+            v = int(v_raw)
+            if not self._has_edge(u, v):
+                continue
+            hidden_positive_keys.add(u * self.N + v)
+            hidden_out[u] = hidden_out.get(u, 0) + 1
+            hidden_in[v] = hidden_in.get(v, 0) + 1
+
+        nodes = self._sample_nodes(target_pairs, hidden_positive_keys)
         n = int(nodes.shape[0])
         local = {int(node): j for j, node in enumerate(nodes)}
 
-        # Induced adjacency with the target edge removed
+        # Induced adjacency with the supervised positive target edges removed
         A = np.zeros((n, n), dtype=np.float32)
         for j, r in enumerate(nodes):
             s = int(self.row_ptr[r])
             e = int(self.row_ptr[r + 1])
             for c in self.cols_sorted[s:e]:
                 c = int(c)
-                if target_present and int(r) == u and c == v:
+                if int(r) * self.N + c in hidden_positive_keys:
                     continue
                 k = local.get(c)
                 if k is not None:
                     A[j, k] = 1.0
 
-        # Target label and supervision mask
+        # Target labels and supervision mask
         L = np.zeros((n, n), dtype=np.float32)
         M = np.zeros((n, n), dtype=bool)
-        L[0, 1] = y
-        M[0, 1] = True
+        for (u_raw, v_raw), y in zip(target_pairs, target_labels):
+            u = int(u_raw)
+            v = int(v_raw)
+            L[local[u], local[v]] = float(y)
+            M[local[u], local[v]] = True
 
-        # Global node features with the target contribution removed
+        # Global node features with the hidden target contributions removed
         feats = {}
         for k in self.node_feat_keys:
             x = np.asarray(self.node_feats[k][nodes], dtype=np.float32).copy()
-            if target_present and k == "out_degree":
-                x[0] = max(0.0, x[0] - 1.0)
-            if target_present and k == "in_degree":
-                x[1] = max(0.0, x[1] - 1.0)
+            if k == "out_degree":
+                for u, count in hidden_out.items():
+                    x[local[u]] = max(0.0, x[local[u]] - float(count))
+            if k == "in_degree":
+                for v, count in hidden_in.items():
+                    x[local[v]] = max(0.0, x[local[v]] - float(count))
             feats[k] = x
 
         return A, feats, L, M
@@ -324,16 +381,30 @@ class ECTileDataset(Dataset):
 class HiggsRetweetTileBench:
     """Expose the pre-divided HIGGS tile datasets through the framework benchmark interface."""
 
-    def __init__(self, task: HiggsRetweetEdgesTask, tile_size: int = 384):
+    def __init__(
+            self,
+            task: HiggsRetweetEdgesTask,
+            targets_per_tile: int,
+            seed: int,
+            tile_size: int = 384
+    ):
         """Create train, validation, and test tile datasets with task-declared custom node features."""
         node_feats = task.node_feature_dict(None)
         self.node_feat_keys = tuple(node_feats.keys())
         self.splits = {
             k: ECTileDataset(task._N, task._csr_row_ptr, task._csr_cols,
                              task._csc_col_ptr, task._csc_rows, edges,
-                             P=tile_size, node_feats=node_feats, node_feat_keys=self.node_feat_keys)
-            for k, edges in [("train", task._edges_tr), ("val", task._edges_va), ("test", task._edges_te)]
+                             targets_per_tile=targets_per_tile, seed=int(seed) + split_offset, P=tile_size,
+                             node_feats=node_feats, node_feat_keys=self.node_feat_keys)
+            for split_offset, (k, edges) in enumerate(
+                [("train", task._edges_tr), ("val", task._edges_va), ("test", task._edges_te)]
+            )
         }
+        print(
+            f"[HIGGS-TILES] targets/tile={int(targets_per_tile)} | "
+            f"tiles (train/val/test): {len(self.splits['train']):,}/"
+            f"{len(self.splits['val']):,}/{len(self.splits['test']):,}"
+        )
 
 
 if __name__ == "__main__":
@@ -345,9 +416,24 @@ if __name__ == "__main__":
         choices=["mlp", "deep_mlp", "cnn", "transformer", "rf", "gcn", "gin", "edge_tx", "sage", "gps"],
         help="Which model architecture to run."
     )
+    parser.add_argument(
+        "--targets_per_tile",
+        type=int,
+        default=16,
+        help="Maximum supervised candidate pairs packed into each local tile."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Use a specific pipeline seed instead of generating a new one."
+    )
 
     args = parser.parse_args()
-    task = HiggsRetweetEdgesTask(neg_pos_ratio=5.0)
+    task = HiggsRetweetEdgesTask(
+        neg_pos_ratio=5.0,
+        targets_per_tile=args.targets_per_tile,
+        seed=args.seed
+    )
 
     if args.model in ["gcn", "gin", "edge_tx", "sage", "gps"]:
         print(f"--- Running GNN Pipeline for model: {args.model} ---")
@@ -359,7 +445,8 @@ if __name__ == "__main__":
             layers=4,
             dropedge_p=0.2,
             gnn_zero_supervised=True,
-            neg_pos_ratio=1.0
+            neg_pos_ratio=1.0,
+            early_stop_patience=5
         )
 
         run_gnn_edges_suite(
@@ -390,4 +477,3 @@ if __name__ == "__main__":
             ec_cfg.select_by = "bacc"
 
         bundle = run_pipeline_for_task(task=task, models=[args.model], cfg=ec_cfg)
-        

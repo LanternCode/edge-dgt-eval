@@ -83,7 +83,7 @@ gnn_cfg = GNNTrainConfig(
     neg_pos_ratio=1.0
 )
 
-# Run the GNN pipeline on all four models
+# Run the GNN pipeline on all five models
 run_gnn_suite(
     task=task_fes,
     encoders=("gcn", "sage", "gin", "edge_tx", "gps"),

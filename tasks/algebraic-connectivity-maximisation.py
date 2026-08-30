@@ -739,7 +739,7 @@ gnn_cfg = GNNTrainConfig(
     hidden=64
 )
 
-# Run the GNN pipeline on all four models
+# Run the GNN pipeline on all five models
 #gnn_encoders = ["gcn", "sage", "gin", "edge_tx"]
 gnn_encoders = ["gps"]
 gnn_out = run_gnn_suite(task, gnn_encoders, gnn_cfg)

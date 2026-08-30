@@ -395,6 +395,7 @@ class GNNTrainConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     batch_size: int = 16
+    early_stop_patience: int = 0
     hidden: int = 128
     layers: int = 3
     heads: int = 4
@@ -408,7 +409,6 @@ class GNNTrainConfig:
     learnable_layer_norm: bool = True
     scheduler: str = "cosine"         # "none" | "cosine"
     neg_pos_ratio: Optional[float] = None  # None or <= 0 disables ratio sampling
-    use_tree_aux_loss: bool = False
     save_dir: Optional[str] = "saved_checkpoints"
 ```
 
@@ -416,12 +416,12 @@ Notes:
 
 - GNN threshold tuning and checkpoint selection are always F1-based. Dense-only knobs such as `threshold_metric` and `select_by` do not apply.
 - `grad_clip=1.0` keeps gradient clipping enabled by default in the GNN pipeline; set `grad_clip=0.0` to disable it.
+- `early_stop_patience=0` disables GNN early stopping. A positive value stops after that many consecutive epochs with a finite validation F1 that does not improve the best validation F1. An empty or otherwise non-finite validation result does not increment the no-improvement counter.
 - `learnable_layer_norm=False` keeps the GNN encoder LayerNorm affine parameters but freezes them at their initial identity values.
 - `lap_pe_k` is the general LapPE request in both GNN runners, and GPS additionally enforces at least `gps_lap_pe_k` LapPE columns. GPS also uses `gps_lap_pe_sign_flip` and `gps_rwse_steps`.
 - `gps_rwse_steps` controls GPS-owned random-walk structural encodings. These are not part of `hooks.feature_set` and are not requested by `feature_set=True`.
 - `gnn_zero_supervised` controls adjacency redaction uniformly across GNN encoders; GPS derives its model-owned structural processing from that same model-visible adjacency.
 - `neg_pos_ratio` controls negative-to-positive sampling ratio for binary GNN training. `None` (default) or a non-positive value disables ratio-based sampling and uses `pos_weight` instead. Positive values set the target negative-to-positive ratio.
-- `use_tree_aux_loss=True` adds an auxiliary penalty pulling the expected number of predicted edges toward `n - 1`, capped by the number of supervised candidate pairs. `n` counts nodes that carry a supervised pair or an observed edge, which equals the graph size under the default all-ones mask and excludes isolated nodes under a sparse mask. It does not detect cycles or enforce connectivity. Only meaningful for spanning-tree tasks. Automatically disabled in Scalable Mode.
 - Summary display formatting is set on the runner call itself, e.g. `run_gnn_suite(..., display_decimals=6, display_truncate=True)`.
 
 ---
@@ -449,7 +449,7 @@ feature_keys
 Notes:
 
 - In the dense pipeline, adjacency-derived pairwise channels are computed during BCHW assembly from the supervised-redacted observed adjacency.
-- The dense runner prevents empty model inputs by adding the default dense structural feature set when needed: `degree`, `deg_row`, `deg_col`, `clustering_coeff`, `cn`, `jaccard`, `adamic_adar`.
+- The dense runner does not install structural features implicitly. If a model resolves to zero effective input channels, training raises `[NO FEATURES DETECTED]`. Set `task.hooks.feature_set=True` to request the default structural features, or explicitly enable an input channel for that model.
 - In the full-matrix GNN path, edge matrices may include appended heavy structural pairwise features even if they were not explicitly requested as standalone edge tensors.
 - `pairwise_batch_from_adj(...)` returns keys in its own fixed helper insertion order, not the caller's requested key order.
 - In Scalable Mode, node features discovered by untargeted schema inference continue to flow through the encoder. Untargeted discovery scans at most 64 batches total across the resolved loaders, so features that first appear after that scan window are not added to the schema. The decoder does not materialise a dense `(N, N, Fe)` edge-feature tensor. Instead, it computes its fixed structural pair-feature vector only for the supervised pairs selected for scoring. User-supplied decoder-side edge features outside that fixed structural set do not reach the Scalable Mode decoder.
@@ -461,7 +461,7 @@ Notes:
 | `hooks.allow_adj_channel=True` | All dense models | Include `adj` for all models |
 | `cfg.tx_force_adj_channel=True` | Transformer only | Force `adj` for TX even if hooks say no |
 
-When `hooks.allow_adj_channel=False`, dense no-feature mode is unavailable. In that case, `run_pipeline_for_task(...)` uses the default structural feature set for the dense model, but temporarily requests only `degree` and `clustering_coeff` during loader resolution before restoring the caller's original `task.hooks.feature_set`. The remaining structural channels are derived from adjacency during BCHW assembly.
+When `hooks.allow_adj_channel=False`, the task-level `adj` input channel is disabled for dense models; Transformer may still include it through `cfg.tx_force_adj_channel=True`. The runner does not synthesize a structural-feature fallback. If the resolved model manifest contains zero effective input channels, training raises `[NO FEATURES DETECTED]`. Set `task.hooks.feature_set=True` to request the default structural features, or explicitly enable an input channel for that model.
 
 GNN encoders never consume `adj` as a feature channel — they receive it as the propagation matrix.
 
@@ -524,7 +524,9 @@ hooks = TaskHooks(
 
 The custom type is mandatory; custom node/edge semantics are not inferred from a square tensor. Canonical strings, macros, `True`, and `False` retain their existing meaning. In the dense pipeline, supported custom node features are 1-D node vectors expanded to row/column channels, while supported custom edge features are 2-D pairwise matrices; tensor shapes that contradict the declared feature type are outside the supported dense-input contract.
 
-For supported pre-divided datasets, canonical-feature availability is a **split-level schema decision, not a per-sample repair pass**. The first sample of each split is the schema probe. If a requested canonical key is absent from that probe and the benchmark exposes `extract_features(...)`, the pipeline wraps the split and derives that feature from every item's adjacency on access. If the benchmark does not expose `extract_features(...)`, requested canonical features that require loader-side derivation must already be supplied by the dataset. If the key is present in the probe, the split is treated as already providing that feature and later samples are not scanned or repaired individually. A canonical key supplied by a pre-divided dataset must therefore be supplied consistently across that split; omission or `None` in later samples is inconsistent user data, not a request for pipeline re-derivation. Custom features remain user-supplied and may be present only where the user provides them.
+For supported pre-divided datasets, canonical-feature availability is a **split-level schema decision, not a per-sample repair pass**. The first sample of each split is the schema probe. If a requested canonical key is absent from that probe and the benchmark exposes `extract_features(...)`, the pipeline wraps the split, derives that feature from each item's adjacency on first access, and retains the derived value in that dataset instance's per-sample cache. If the benchmark does not expose `extract_features(...)`, requested canonical features that require loader-side derivation must already be supplied by the dataset. If the key is present in the probe, the split is treated as already providing that feature and later samples are not scanned or repaired individually. A canonical key supplied by a pre-divided dataset must therefore be supplied consistently across that split; omission or `None` in later samples is inconsistent user data, not a request for pipeline re-derivation. Custom features remain user-supplied and may be present only where the user provides them.
+
+
 
 Where schema inference is used outside the dense custom-feature path, non-square 2D inputs may be classified as node features when no explicit custom type is available, and `(F, N)` node inputs are transposed to `(N, F)` when the second dimension matches the graph dimension. This does not extend dense-model support to multi-column custom node features.
 
@@ -645,7 +647,6 @@ run_gnn_suite(...)
                  → _prepare_adj_for_encoder(...)
                  → model.enc(...)                         [encode → Z_batch]
             → model.dec.score_pairs(...)                  [score selected pairs]
-       → model(...) only when use_tree_aux_loss=True      [full-grid logits]
 ```
 
 ### Loader → Model (GNN, Scalable Mode)
@@ -710,7 +711,7 @@ Saved to `saved_checkpoints/<task.name>/<timestamp>/<model_key>.pth` via `save_p
 
 Common dense-pipeline metadata fields include: `manifest`, `use_mask_channel`, `directed`, `supervised_redaction_policy`, `edges_only`, `seed`, `feature_keys`, `keep_idx`, `eff_in_ch`.
 
-Common GNN-pipeline metadata fields include: `directed`, `feature_schema`, `pairwise_on_demand`.
+Common GNN-pipeline metadata fields include: `directed`, `feature_schema`, `pairwise_on_demand`. The GNN checkpoint `cfg` subset includes `lr`, `weight_decay`, `epochs`, `epochs_ran`, `early_stop_patience`, and the effective `batch_size`.
 
 The exact `meta` payload is pipeline-specific; only `state_dict`, `model_key`, `task`, and the nested `cfg` subset should be treated as universally stable.
 
@@ -774,7 +775,7 @@ Technically:
 - The decoder computes its structural inputs only for those selected pairs. Its fixed structural feature vector contains endpoint degree statistics together with common-neighbour, Jaccard, and Adamic–Adar statistics derived from the adjacency visible to the model.
 - Node features, including typed custom node features, flow through the encoder. User-supplied edge features outside the fixed Scalable Mode structural set do not reach the decoder.
 
-Scalable Mode forces `batch_size=1`, so it processes one graph at a time. This does not restrict the dataset to a single graph. `use_tree_aux_loss=True` is disabled in Scalable Mode. GPS uses `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` as encoder-side structural encodings in both runners.
+Scalable Mode forces `batch_size=1`, so it processes one graph at a time. This does not restrict the dataset to a single graph. GPS uses `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` as encoder-side structural encodings in both runners.
 
 Full-matrix GPS also uses the assembled edge-feature channels for its local GINE-style message passing, normalised over the observed message-passing edges. Those local attributes are stored only for observed edges; the dense `(N, N, Fe)` tensor remains the decoder representation. Scalable Mode skips edge-matrix assembly before `encode_only()`, so its GPS local branch is constructed with `edge_dim=0`.
 
@@ -803,6 +804,10 @@ The pipeline supports task wrapping. Some internal utilities inspect `base_task`
 - If the probe already contains a requested canonical key, that split is trusted to provide the declared feature consistently. Later omissions are not automatically repaired.
 - Presence detection is key-based. A key present with value `None` still declares that key as present to the split-schema probe; `None` is not interpreted as a request for re-derivation.
 - On the `ProvidedSplitsTask` single-graph mask-split path, automatically derived canonical features require the benchmark to expose an `extract_features(...)` implementation.
+
+`shortest_path` is a deliberate runtime-derived canonical exception. `GraphBenchmark.extract_features(...)` does not emit a `shortest_path` tensor. When the feature is requested, the dense and full-matrix GNN paths compute it during feature assembly from the adjacency view that is currently visible to that model. A `shortest_path` tensor supplied in a pre-divided feature dictionary is therefore not consumed by those paths. Scalable Mode does not materialise the dense `(N, N)` `shortest_path` feature.
+
+The sample-0 ownership rules above apply to the other canonical features; they do not transfer ownership of `shortest_path` to a pre-divided dataset.
 
 These rules avoid an implicit per-sample data-repair pass over user-provided datasets. They are part of the supported data contract and should not be reported as failures of canonical-feature ownership.
 
@@ -847,9 +852,20 @@ Code that will crash or produce silently wrong results **on a supported code pat
 
 Before reporting: read the target code twice. Check for guards (`torch.where`, `.clamp_min`, conditional branches) that may already handle the case you are about to flag.
 
-### 2. Redundant code
+### 2. Redundant code and optimisation
 
-Code that performs identical work twice or can be removed or simplified without changing behaviour. This includes unnecessary type casts, duplicate computations, and re-derivations of values already available in scope. Suboptimal code where a logically equivalent, more efficient implementation exists also qualifies as redundancy. For hot-path performance claims that would change encoder adjacency routing, feature assembly, or training-loop behaviour, report them as findings only when supported by profiling or concrete measurements on a supported code path; otherwise treat them as non-blocking hypotheses, not recommended changes. Caching the GPS structural encodings has already been measured and declined; see "GPS structural encodings are recomputed per batch, not cached" for the numbers and the threshold that would reopen it.
+**Redundancy** means the implementation uses more lines of code than are necessary to express the same supported behaviour. A redundancy fix must reduce LOC while preserving that behaviour. Replacing existing code with an equal or larger amount of code is not a redundancy fix; it creates additional redundancy even if the replacement is stylistically cleaner.
+
+**Optimisation** is separate from redundancy. An optimisation must preserve behaviour bit-for-bit while reducing compute. This includes preserving deterministic outputs and any RNG-dependent behaviour exercised by the supported path.
+
+A claimed optimisation must have evidence of its saving. Either:
+
+- the saving follows directly from the implementation and can be quantified logically (for example, the replacement performs one half of an otherwise identical computation); or
+- the saving is demonstrated empirically on a supported entry point with enough repeated paired measurements to separate the effect from run-to-run noise. For wall-clock claims, use a substantial repeated sample (normally around 100 paired runs) and report the observed saving rather than extrapolating from an isolated microbenchmark.
+
+A logically equivalent implementation with no demonstrated compute saving is not an optimisation. A performance hypothesis without either form of evidence is not a finding and should not be recommended as a change.
+
+Caching the GPS structural encodings has already been measured and declined; see "GPS structural encodings are recomputed per batch, not cached" for the existing measurements and the threshold that would reopen it.
 
 ### 3. Inconsistent behaviour
 
@@ -914,7 +930,6 @@ The following are **not currently supported**. If you need one, open an issue an
 **Training and evaluation**
 
 - **Stronger GNN supervision redaction.** `gnn_zero_supervised` redacts the shared adjacency path but does not automatically blank all supervised edge-feature tensors.
-- **Early stopping for the GNN pipeline.** `TNNTrainConfig` exposes `early_stop_patience`; `GNNTrainConfig` does not currently provide an equivalent.
 - **Configurable leading metric for the GNN pipeline.** The GNN pipeline is currently fixed to validation F1 for threshold tuning and checkpoint selection.
 - **Configurable self-loop supervision policy.** Undirected evaluation excludes diagonal pairs; directed evaluation includes them only where `A[i, i] > 0`.
 
@@ -927,7 +942,7 @@ The following are **not currently supported**. If you need one, open an issue an
 
 **Losses and extensibility**
 
-- **User-defined auxiliary loss components.** Task-specific loss logic currently lives in the shared pipeline.
+- **User-defined loss components.** A future extension could let tasks register additional loss terms without adding task-specific logic to the shared pipeline.
 - **Custom decoder-side edge features in Scalable Mode.** The Scalable Mode decoder uses a fixed structural pair-feature representation. Arbitrary user-supplied edge-feature tensors outside that structural set do not reach the decoder.
 - **Batched graph processing in Scalable Mode.** Scalable Mode currently processes one graph at a time and forces `batch_size=1`.
 - **Dense support for multi-column custom node features.** 1D node features are currently expanded to paired row/col channels; multi-column `(N, F)` custom node features are not yet supported.
@@ -995,7 +1010,6 @@ When modifying the codebase, verify these before treating a change as complete:
    - Scalable Mode continues to enforce `batch_size=1`
    - `run_gnn_edges_suite(...)` continues to follow the documented Scalable Mode behaviour
    - GPS `gps_lap_pe_k`, `gps_lap_pe_sign_flip`, and `gps_rwse_steps` remain active in `run_gnn_edges_suite(...)`
-   - `use_tree_aux_loss` remains disabled in Scalable Mode
 
 5. **Run finalisation and state reset remain correct across sequential tasks**
    - Standalone dense runs finalise cleanly without manual reset.
