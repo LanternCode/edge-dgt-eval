@@ -207,9 +207,6 @@ def begin_or_attach_run(
                 active.display_decimals = int(display_decimals)
                 active.display_truncate = bool(display_truncate)
 
-                # If some caller printed early by mistake, ensure end-of-run
-                # finalisation is still allowed to print once.
-                active.bundle.pop("_summary_printed", None)
                 _stamp_bundle(active.bundle, active.stages, is_open=True)
                 return active.bundle
 
@@ -217,12 +214,8 @@ def begin_or_attach_run(
             _finalise_open_run_locked()
 
         bundle = bundle_factory()
-        if not isinstance(bundle, dict):
-            raise TypeError("bundle_factory() must return a dict-like bundle.")
-
         bundle.setdefault("results", {})
         bundle.setdefault("metadata", {})
-        bundle.pop("_summary_printed", None)
 
         _ACTIVE_RUN = _ActiveRun(
             task_key=task_key,

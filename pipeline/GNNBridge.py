@@ -30,9 +30,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 from .EdgeClassification import (
-    _cuda_gc, _cuda_peak_stats, _cuda_reset_peak_stats, _format_duration, _normalise_feature_spec,
-    effective_mask, FeatureRegistry, _task_to_meta_dict, finalise_summary, _resolve_loaders, _pos_weight,
-    get_optimal_threshold, save_pipeline_checkpoint, _reset_pipeline_runtime_state, _pick_probe_loader
+    _cuda_gc, _cuda_peak_stats, _cuda_reset_peak_stats, _format_duration, _normalise_feature_spec, _supervised_indices,
+    FeatureRegistry, _task_to_meta_dict, finalise_summary, _resolve_loaders, _pos_weight, _pick_probe_loader,
+    get_optimal_threshold, save_pipeline_checkpoint, _reset_pipeline_runtime_state
 )
 from ._utils.features import pairwise_for_pairs, pairwise_batch_from_adj, shortest_path_from_adj
 from ._utils.run_lifecycle import begin_or_attach_run
@@ -118,10 +118,6 @@ def _random_walk_structural_encoding(
     steps = int(steps)
     N = int(A.size(0))
     dev = A.device
-
-    if steps <= 0:
-        return torch.zeros((N, 0), device=dev, dtype=torch.float32)
-
     rwse = torch.zeros((N, steps), device=dev, dtype=torch.float32)
     idx = torch.nonzero(node_mask.to(device=dev, dtype=torch.bool), as_tuple=False).view(-1)
     if int(idx.numel()) == 0:
@@ -451,11 +447,7 @@ def _redact_supervised_edges(
     if not zero_supervised:
         return A_in
     
-    m = mask_in
-    if m.dtype != torch.bool: 
-        m = m > 0.5
-
-    return A_in.masked_fill(m, 0.0)
+    return A_in.masked_fill(mask_in, 0.0)
 
 
 # ------------------------------- GCN Encoder ----------------------------------
@@ -1076,11 +1068,6 @@ def _prepare_features_batch(
     node_mask_batch = torch.zeros((B, N), dtype=torch.bool, device=dev)
     seq_idx = torch.arange(N, device=dev)
     mask_bool = mask.to(device=dev, dtype=torch.bool)
-    if not is_directed:
-        # effective_mask() treats (i, j) and (j, i) as one supervised pair, so masks differing
-        # only in orientation must yield identical edge features and z-score statistics.
-        # The decoder also reads E[j, i] for its reverse term.
-        mask_bool = mask_bool | mask_bool.transpose(1, 2)
 
     for b in range(B):
         fdict = feats[b]
@@ -1433,15 +1420,10 @@ class GraphEdgeClassifier(nn.Module):
         if node_mask.dim() == 2:
             node_mask = node_mask[0]
 
-        X_batch = list(X_batch)
-        if len(X_batch) == 0:
-            raise ValueError("encode_only expects non-empty X_batch.")
-
         # Extract the single graph's feature matrix directly
+        X_batch = list(X_batch)
         dev = A.device
         X = X_batch[0]
-        if X.dim() == 1:
-            X = X.view(-1, 1)
 
         # Lazy init encoder
         Fn = int(X.size(1))
@@ -1477,7 +1459,8 @@ class GNNTrainConfig:
     """
     def __new__(cls, *args, **kwargs):
         obj = super().__new__(cls)
-        obj._batch_size_explicit = len(args) >= 5 or "batch_size" in kwargs
+        batch_size_index = tuple(cls.__dataclass_fields__).index("batch_size")
+        obj._batch_size_explicit = len(args) > batch_size_index or "batch_size" in kwargs
         return obj
 
     epochs: int = 40
@@ -1510,16 +1493,6 @@ class GNNTrainConfig:
 
     # Saving
     save_dir: Optional[str] = "saved_checkpoints"  # None to skip saving
-
-
-def _supervised_indices(
-    mask: torch.Tensor, A: torch.Tensor, is_directed: bool, edges_only: bool
-) -> torch.Tensor:
-    """Build the effective supervision mask and return nonzero (B, i, j) indices."""
-    m = effective_mask(mask, A, is_directed)
-    if edges_only:
-        m = m & (A > 0.5)
-    return torch.nonzero(m, as_tuple=False)
 
 
 def _balance_binary_negpos(y_sel: torch.Tensor, ratio: float) -> torch.Tensor:
@@ -1867,6 +1840,7 @@ def train_one_gnn(
         epochs_ran = epoch
         model.train()
         epoch_loss, epoch_count = 0.0, 0
+        saw_nonfinite_loss = False
 
         for A, feats, L, mask in train_loader:
             A = A.to(device)
@@ -1875,11 +1849,7 @@ def train_one_gnn(
             optimiser.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
-                supervision_mask = effective_mask(mask, A, is_directed)
-                if edges_only:
-                    supervision_mask = supervision_mask & (A > 0.5)
-
-                idx = torch.nonzero(supervision_mask, as_tuple=False)
+                idx = _supervised_indices(mask, A, is_directed, edges_only)
                 if idx.numel() == 0:
                     continue
 
@@ -1909,6 +1879,7 @@ def train_one_gnn(
                         bs = int(y_sel.numel())
 
             if not torch.isfinite(loss):
+                saw_nonfinite_loss = True
                 continue
             scaler.scale(loss).backward()
 
@@ -1921,6 +1892,11 @@ def train_one_gnn(
 
             epoch_loss += loss.item() * bs
             epoch_count += bs
+
+        if epoch_count == 0 and saw_nonfinite_loss:
+            raise FloatingPointError(
+                f"[{encoder.upper()} TRAINING] Epoch {epoch} produced only non-finite training losses."
+            )
 
         if scheduler is not None:
             scheduler.step()
@@ -2096,6 +2072,7 @@ def train_one_gnn_edges(
         epochs_ran = epoch
         model.train()
         epoch_loss, epoch_count = 0.0, 0
+        saw_nonfinite_loss = False
 
         for A, feats, L, mask in train_loader:
             A = A.to(device)
@@ -2159,6 +2136,7 @@ def train_one_gnn_edges(
                     bs = int(y_target.numel())
 
             if not torch.isfinite(loss):
+                saw_nonfinite_loss = True
                 continue
             scaler.scale(loss).backward()
 
@@ -2171,6 +2149,11 @@ def train_one_gnn_edges(
 
             epoch_loss += loss.item() * bs
             epoch_count += bs
+
+        if epoch_count == 0 and saw_nonfinite_loss:
+            raise FloatingPointError(
+                f"[{encoder.upper()} TRAINING] Epoch {epoch} produced only non-finite training losses."
+            )
 
         if scheduler is not None:
             scheduler.step()
@@ -2477,14 +2460,11 @@ def run_gnn_edges_suite(
 def _drop_edges(A: torch.Tensor, p: float, directed: bool) -> torch.Tensor:
     """
     Apply training-time DropEdge to the adjacency used for encoder message passing.
-    - p controls regularisation strength - p <= 0 disables DropEdge;
+    - p controls regularisation strength; the caller invokes this helper only for p > 0;
     - Supports dense (2D or (1,N,N)) tensors used by the pipeline;
     - For undirected graphs, symmetry is preserved in the returned adjacency;
     - Always keeps self-loops.
     """
-    if p <= 0.0:
-        return A
-
     # Dense path (2D or (1,N,N))
     orig_dim = A.dim()
     A_batch = A.unsqueeze(0) if orig_dim == 2 else A

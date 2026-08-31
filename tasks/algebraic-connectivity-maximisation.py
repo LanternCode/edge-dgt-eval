@@ -721,27 +721,27 @@ greedy_l2, _ = _monte_carlo_best(bundle["A_test"], bundle["C_test"], KNOBS.k_add
 # Define the config used by the TNN pipeline
 print("[2/5] Running Matrix Models Pipeline...")
 matrix_cfg = TNNTrainConfig(
-    epochs=30,
+    epochs=50,
     lr=1e-3,
-    use_mask_channel=True
+    use_mask_channel=True,
+    early_stop_patience=10
 )
 
 # Run the TNN pipeline on all five models
-#matrix_models = ["mlp", "deep_mlp", "cnn", "transformer", "rf"]
-matrix_models = []
+matrix_models = ["mlp", "deep_mlp", "cnn", "transformer", "rf"]
 pipeline_out = run_pipeline_for_task(task, matrix_models, matrix_cfg)
 
 # Define the config used by the GNN pipeline
 print("\n[3/5] Running GNN Suite...")
 gnn_cfg = GNNTrainConfig(
-    epochs=30,
+    epochs=50,
     lr=5e-3,
-    hidden=64
+    hidden=64,
+    early_stop_patience=10
 )
 
 # Run the GNN pipeline on all five models
-#gnn_encoders = ["gcn", "sage", "gin", "edge_tx"]
-gnn_encoders = ["gps"]
+gnn_encoders = ["gcn", "sage", "gin", "edge_tx", "gps"]
 gnn_out = run_gnn_suite(task, gnn_encoders, gnn_cfg)
 
 print("\n[4/5] Computing Final Metrics...")

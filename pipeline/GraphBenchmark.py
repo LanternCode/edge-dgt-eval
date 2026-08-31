@@ -6,11 +6,11 @@ import torch
 import random
 import networkx as nx
 import numpy as np
-from ._utils.features import DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES, pairwise_batch_from_adj
+from ._utils.features import pairwise_batch_from_adj
 from collections import deque
 from time import perf_counter
 from collections.abc import Sized
-from typing import List, Tuple, Union, Dict, Optional, cast
+from typing import List, Sequence, Tuple, Dict, Optional, cast
 from torch.utils.data import DataLoader, Dataset, Subset
 from decimal import Decimal
 
@@ -589,17 +589,13 @@ class GraphBenchmark:
     def extract_features(
             self,
             adj: np.ndarray,
-            feature_set: Union[bool, List[str]] = False,
+            feature_set: Optional[Sequence[str]] = None,
             directed: bool = False
     ) -> Dict[str, np.ndarray]:
         if not feature_set:
             return {}
 
-        if feature_set is True:
-            feature_list = list(DIRECTED_AUTO_FEATURES if directed else UNDIRECTED_AUTO_FEATURES)
-        else:
-            feature_list = list(feature_set)
-
+        feature_list = list(feature_set)
         deg = adj.sum(axis=1).astype(np.float32, copy=False) if (
             'degree' in feature_list or 'clustering_coeff' in feature_list
         ) else None

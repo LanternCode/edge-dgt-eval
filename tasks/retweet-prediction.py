@@ -439,7 +439,7 @@ if __name__ == "__main__":
         print(f"--- Running GNN Pipeline for model: {args.model} ---")
 
         gnn_cfg = GNNTrainConfig(
-            epochs=50,
+            epochs=30,
             weight_decay=1e-2,
             hidden=256,
             layers=4,

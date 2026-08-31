@@ -257,7 +257,7 @@ Rules:
              └─────────────┬─────────────┘
                            │
                ┌───────────▼───────────────┐
-               │      Shared contracts     │
+               │ Shared pipeline contracts │
                │      effective_mask()     │
                │      FeatureRegistry      │
                │      finalise_summary()   │
@@ -266,7 +266,7 @@ Rules:
                └───────────────────────────┘
 ```
 
-The dense and GNN pipelines are **architecturally separate** and intentionally differ in preprocessing, normalisation, and several configurable behaviours. They share evaluation masking logic (`effective_mask`), feature math (`_utils.features`), metric computation, and the summary printer.
+The dense and GNN pipelines are **architecturally separate** and intentionally differ in preprocessing, normalisation, and several configurable behaviours. They share evaluation masking logic (`effective_mask`), feature math (`_utils.features`), metric computation, and the summary printer. These are pipeline-internal shared contracts, not additional entry points.
 
 ---
 
@@ -908,8 +908,8 @@ The following do not qualify under any category and should not be reported:
 ## Limitations and Future Work
 
 ### Unsupported usage
-
-Only the documented runner entry points and task shapes are supported. Direct instantiation of internal classes, calling underscore-prefixed helpers, invoking individual dataloader methods, or relying on direct task-level `train_dataloader` / `val_dataloader` / `test_dataloader` entry points is unsupported and may crash, rebuild expensive state, or produce incorrect results. Internal components are optimised for pipeline-owned, already-sanitised inputs and do not contain defensive guards for unexpected shapes, sparse/dense mismatches, or missing masks.
+ 
+Only the documented runner entry points and task shapes are supported. Direct instantiation of internal classes, calling underscore-prefixed helpers, importing or calling helpers from `_utils.features` or `_utils.run_lifecycle` in task files, invoking individual dataloader methods, or relying on direct task-level `train_dataloader` / `val_dataloader` / `test_dataloader` entry points is unsupported and may crash, rebuild expensive state, or produce incorrect results. Internal components are optimised for pipeline-owned, already-sanitised inputs and do not contain defensive guards for unexpected shapes, sparse/dense mismatches, or missing masks.
 
 ### Internal components
 

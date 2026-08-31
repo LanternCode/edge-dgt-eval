@@ -84,11 +84,16 @@ def pairwise_batch_from_adj(A_batch: Tensor, keys: Sequence[str], *, is_directed
     """
     orig_dim = A_batch.dim()
     A = A_batch.unsqueeze(0) if orig_dim == 2 else A_batch
-        
+
     A01 = torch.gt(A, 0).to(dtype=torch.float32)
     B, N, _ = A01.shape
-    row_deg = A01.sum(dim=-1)
-    col_deg = A01.sum(dim=-2) if is_directed else row_deg
+    need_row_deg = (
+        any(k in keys for k in ("deg_row", "deg_diff", "jaccard", "adamic_adar"))
+        or (not is_directed and "deg_col" in keys)
+    )
+    need_col_deg = is_directed and any(k in keys for k in ("deg_col", "deg_diff", "jaccard"))
+    row_deg = A01.sum(dim=-1) if need_row_deg else None
+    col_deg = A01.sum(dim=-2) if need_col_deg else row_deg
     
     results: Dict[str, Tensor] = {}
     
@@ -138,11 +143,6 @@ def pairwise_for_pairs(
     dense float32 adjacency and precomputed row/column degrees.
     Pair rows are processed in chunks so temporary memory is O(chunk_size * N).
     """
-    allowed = {"cn", "jaccard", "adamic_adar"}
-    for key in keys:
-        if key not in allowed:
-            raise KeyError(f"Unsupported key for pairwise_for_pairs: {key}")
-
     M = int(src.numel())
     step = max(1, int(chunk_size))
     results: Dict[str, Tensor] = {

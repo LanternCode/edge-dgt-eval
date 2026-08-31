@@ -143,6 +143,23 @@ def seed_everything(seed: int):
 # ============================================================
 # 1) Collate, masks, stacking, channel statistics
 # ============================================================
+def _extract_positional_matrices(comps, N: int) -> List[torch.Tensor]:
+    matrices = []
+    for c in comps[1:]:
+        if isinstance(c, dict):
+            continue
+        arr = torch.from_numpy(np.asarray(c)) if not isinstance(c, torch.Tensor) else c
+        if arr.ndim != 2 or tuple(arr.shape) != (N, N):
+            raise ValueError(
+                f"[SAMPLE SHAPE] Sample contains a matrix component of shape {tuple(arr.shape)}; label "
+                f"and evaluation mask matrices must match the adjacency at ({N}, {N}). "
+                f"Roles are assigned in order, so a mis-shaped matrix would shift the remaining "
+                f"components into the wrong slots."
+            )
+        matrices.append(arr)
+    return matrices
+
+
 def collate_fn_pad(batch, *, num_classes: int = 1):
     """
     Collates a batch of graph samples into padded dense tensors.
@@ -213,19 +230,7 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
                     feats_t[k] = v
 
         # Extract remaining N x N matrices for labels (L) and masks (M)
-        matrices = []
-        for c in comps[1:]:
-            if isinstance(c, dict):
-                continue
-            arr = torch.from_numpy(np.asarray(c)) if not isinstance(c, torch.Tensor) else c
-            if arr.ndim != 2 or tuple(arr.shape) != (N, N):
-                raise ValueError(
-                    f"[SAMPLE SHAPE] Sample contains a matrix component of shape {tuple(arr.shape)}; label "
-                    f"and evaluation mask matrices must match the adjacency at ({N}, {N}). "
-                    f"Roles are assigned in order, so a mis-shaped matrix would shift the remaining "
-                    f"components into the wrong slots."
-                )
-            matrices.append(arr)
+        matrices = _extract_positional_matrices(comps, N)
 
         # Roles are positional: the first non-dict matrix becomes L and the second becomes M
         L = matrices[0] if len(matrices) > 0 else None
@@ -291,32 +296,17 @@ def effective_mask(
         actually present in `A`.
 
     Shapes:
-      mask: (B, N, N) or (N, N)
-      A:    (B, N, N) or (N, N)
+      mask: (B, N, N)
+      A:    (B, N, N)
       ->    (B, N, N) bool
     """
-    # Ensure boolean
-    if mask.dtype != torch.bool:
-        mask = mask > 0.5
-
     m = mask
-
-    if m.dim() == 2:
-        m = m.unsqueeze(0)
-
     if not directed:
         if not torch.equal(m, m.transpose(-1, -2)):
             raise ValueError("[INVALID MASK] Undirected task masks must be symmetric.")
         return torch.triu(m, diagonal=1)
 
-    if A.dtype != torch.bool:
-        A_bool = A > 0.5
-    else:
-        A_bool = A
-
-    if A_bool.dim() == 2:
-        A_bool = A_bool.unsqueeze(0)
-
+    A_bool = A > 0.5
     _, N, _ = m.shape
     eye = torch.eye(N, dtype=torch.bool, device=m.device).unsqueeze(0)
 
@@ -326,6 +316,16 @@ def effective_mask(
     # Directed only: include diagonal candidates where a self-loop is actually present in A
     diag_present = m & A_bool & eye
     return offdiag | diag_present
+
+
+def _supervised_indices(
+    mask: torch.Tensor, A: torch.Tensor, directed: bool, edges_only: bool
+) -> torch.Tensor:
+    """Build the effective supervision mask and return nonzero (B, i, j) indices."""
+    m = effective_mask(mask, A, directed)
+    if edges_only:
+        m = m & (A > 0.5)
+    return torch.nonzero(m, as_tuple=False)
 
 
 def _build_meta(
@@ -478,7 +478,7 @@ class FeatureRegistry:
             self,
             A: torch.Tensor,
             feats: List[Dict[str, torch.Tensor]],
-            mask: Optional[torch.Tensor],
+            mask: torch.Tensor,
             feature_keys: Sequence[str],
             *, include_adj: bool = True
     ) -> torch.Tensor:
@@ -507,15 +507,10 @@ class FeatureRegistry:
         adj = A.to(dtype)
 
         # Build the redaction mask directly from the task-provided mask
-        if mask is not None:
-            mb = mask.to(A.device, non_blocking=True)
-            if mb.dtype != torch.bool:
-                mb = mb > 0.5
-        else:
-            mb = None
+        mb = mask.to(A.device, non_blocking=True)
 
         # Redact adjacency exactly at the task-mask coordinates
-        if mb is not None and getattr(self, "supervised_redaction_policy", "adj_only") != "none":
+        if getattr(self, "supervised_redaction_policy", "adj_only") != "none":
             adj = adj.clone()
             adj[mb] = 0
 
@@ -524,13 +519,7 @@ class FeatureRegistry:
 
         # ----- [1] optional mask-as-input channel (separate from loss/eval mask) -----
         if self.use_mask_channel:
-            if mask is None:
-                m = torch.ones((B, N, N), dtype=torch.bool, device=A.device)
-            else:
-                m = mask.to(A.device, non_blocking=True)
-                if m.dtype != torch.bool:
-                    m = m > 0.5
-            X.append(m.float().unsqueeze(1))  # (B,1,N,N)
+            X.append(mb.float().unsqueeze(1))  # (B,1,N,N)
 
         # Redacted adjacency per-graph for feature derivations
         A_base = adj
@@ -732,7 +721,7 @@ class FeatureRegistry:
         MLP and Deep MLP reuse the same manifest and per-channel (mean,std), therefore the cache.
         """
         cache_key = (
-            id(getattr(train_loader, "dataset", train_loader)),
+            train_loader,
             tuple(feature_keys),
             self.use_mask_channel,
             include_adj,
@@ -787,10 +776,8 @@ class FeatureRegistry:
         """
         x: (B, C_eff, H, W)
         Uses dataset means/stds; guards against tiny std and extreme values.
+        Requires fit() to have run.
         """
-        if self.mean is None or self.std is None:
-            return x
-
         mu = self.mean.view(1, -1, 1, 1).to(x.device, non_blocking=True)
         sig = self.std.view(1, -1, 1, 1).to(x.device, non_blocking=True)
 
@@ -838,9 +825,6 @@ class FeatureRegistry:
         Returns:
             Tensor with same shape as X, z-scored per graph per feature.
         """
-        if X.dim() != 3:
-            raise ValueError("Expected node tensor with shape (B, N, F)")
-
         B, N, n_feat = X.shape
 
         # Short-circuit the z-scoring if the feature dimension is zero
@@ -848,9 +832,6 @@ class FeatureRegistry:
             return X
 
         m0 = mask.to(X.device, non_blocking=True)
-        if m0.dtype != torch.bool:
-            m0 = m0 > 0.5
-
         m = m0.view(B, N, 1).expand_as(X)
 
         count = torch.clamp(m.sum(dim=1, keepdim=True).to(X.dtype), min=1.0)
@@ -1068,19 +1049,7 @@ class ProvidedSplitsTask(TaskSpec):
                     N = int(A_t.shape[0])
 
                     # Extract remaining NxN matrices purely by shape, mirroring collate_fn_pad
-                    matrices = []
-                    for c in comps[1:]:
-                        if isinstance(c, dict):
-                            continue
-                        arr = c if isinstance(c, torch.Tensor) else torch.as_tensor(np.asarray(c))
-                        if arr.ndim != 2 or tuple(arr.shape) != (N, N):
-                            raise ValueError(
-                                f"[SAMPLE SHAPE] Sample contains a matrix component of shape {tuple(arr.shape)}; label "
-                                f"and evaluation mask matrices must match the adjacency at ({N}, {N}). "
-                                f"Roles are assigned in order, so a mis-shaped matrix would shift the remaining "
-                                f"components into the wrong slots."
-                            )
-                        matrices.append(arr)
+                    matrices = _extract_positional_matrices(comps, N)
 
                     # If the user already provided >= 2 matrices (L and Mask), respect their tuple and skip policy
                     if len(matrices) >= 2:
@@ -1635,9 +1604,6 @@ class MatrixMLPBase(nn.Module):
         dev = param.device
         dtype = param.dtype
 
-        if x2d.size(0) == 0:
-            return torch.empty((0, self.out_dim), device=dev, dtype=dtype)
-        
         xb = x2d.to(device=dev, dtype=dtype, non_blocking=True)
         return self.net(xb)
 
@@ -2180,26 +2146,23 @@ def get_optimal_threshold(y_true: np.ndarray, y_prob: np.ndarray, metric: str = 
     """
     if y_prob.size == 0 or len(np.unique(y_true)) < 2: 
         return fallback_thr
-    
+
     metric = (metric or "f1").lower()
-    
+
     if metric == "bacc":
         fpr, tpr, ts = roc_curve(y_true, y_prob)
         if len(ts) < 2:
             return fallback_thr
-        
+
         # Search the real thresholds rather than picking ts[1] when the sentinel wins
         baccs = 0.5 * (tpr + (1.0 - fpr))
         best_i = 1 + int(np.argmax(baccs[1:]))
         return float(ts[best_i])
-    
+
     ps, rs, ts = precision_recall_curve(y_true, y_prob)
     f1s = 2.0 * ps * rs / np.maximum(ps + rs, 1e-12)
     best_i = np.argmax(f1s)
-    
-    if ts.size == 0: 
-        return fallback_thr
-    
+
     return float(ts[min(best_i, len(ts) - 1)])
 
 
@@ -2225,11 +2188,9 @@ def forward_logits_common(
     if not torch.is_tensor(A):
         raise TypeError("A must be a Tensor of shape (B,N,N)")
     A = A.to(device, non_blocking=True)
-    m_in = None
-    if mask is not None:
-        if not torch.is_tensor(mask):
-            raise TypeError("mask must be a Tensor or None")
-        m_in = mask.to(device, non_blocking=True)
+    if not torch.is_tensor(mask):
+        raise TypeError("mask must be a Tensor of shape (B,N,N)")
+    m_in = mask.to(device, non_blocking=True)
 
     # ------------------------------
     # 2) Assemble channels
@@ -2495,17 +2456,10 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         for A, feats, L, mask in train_loader:
             optimizer.zero_grad(set_to_none=True)
 
-            # Build an effective train mask on the CPU, then select supervised indices
-            m_cpu = effective_mask(mask, A, registry.directed)
-
-            # Train only on observed edges if task asks for it
-            if edges_only:
-                m_cpu = m_cpu & (A > 0.5)
-
-            if not m_cpu.any():
+            # Select supervised training indices on the CPU
+            idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
+            if idx_cpu.numel() == 0:
                 continue
-
-            idx_cpu = torch.nonzero(m_cpu, as_tuple=False)  # (E, 3): [b, i, j]
 
             with torch.amp.autocast(
                     "cuda",
@@ -2546,12 +2500,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                 if z_gathered is not None:
                     z_sel = z_gathered.squeeze(-1).to(torch.float32)
                 else:
-                    # Normalise logits to (B, H, W)
-                    if logits.dim() == 4 and logits.size(1) == 1:
-                        z = logits[:, 0, :, :]
-                    else:
-                        z = logits
-                    z_sel = z[idx[:, 0], idx[:, 1], idx[:, 2]].to(torch.float32)
+                    z_sel = logits[idx[:, 0], idx[:, 1], idx[:, 2]].to(torch.float32)
 
                 y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5) \
                     .to(dev, non_blocking=True).to(torch.float32)
@@ -2574,11 +2523,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                 if z_gathered is not None:
                     z_sel = z_gathered.to(torch.float32)
                 else:
-                    # Normalise logits to (B, H, W, K)
-                    if logits.dim() == 4 and logits.size(1) == num_classes:
-                        z = logits.permute(0, 2, 3, 1).contiguous()
-                    else:
-                        z = logits
+                    z = logits.permute(0, 2, 3, 1).contiguous()
                     z_sel = z[idx[:, 0], idx[:, 1], idx[:, 2], :].to(torch.float32)
 
                 y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] \
@@ -2699,7 +2644,7 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
       - Binary:  Acc, P, R, F1, AUROC, AUPRC, loss/edge, thr (optional)
       - Multi:   Acc, P_macro, R_macro, F1_macro, AUC_macro, AUPRC_macro, loss/edge
     Shapes:
-      logits: (B,N,N) or (B,1,N,N) for binary; (B,K,N,N) or (B,N,N,K) for multi.
+      logits: (B,N,N) for binary; (B,K,N,N) for multi.
     """
     model.eval()
     DEVICE = next(model.parameters()).device
@@ -2713,13 +2658,10 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
     for A, feats, L, mask in loader:
         # MLP fast path: gather supervised pairs directly, skip full-grid forward
         if model_key in ("mlp", "deep_mlp"):
-            m_cpu = effective_mask(mask, A, registry.directed)
-            if edges_only is True:
-                m_cpu = m_cpu & (A > 0.5)
-            if not m_cpu.any():
+            idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
+            if idx_cpu.numel() == 0:
                 continue
 
-            idx_cpu = torch.nonzero(m_cpu, as_tuple=False)  # (E, 3): [b, i, j]
             b_idx, i_idx, j_idx = idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]
 
             # Build and standardize BCHW on device — same ops as forward_logits_common
@@ -2761,11 +2703,9 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
         # ------------------------------------------------------------
         # Full-grid path for spatial models (cnn, transformer)
         # ------------------------------------------------------------
-        # Skip batches with no supervised pairs before BCHW assembly / model forward.
-        m_cpu = effective_mask(mask, A, registry.directed)
-        if edges_only is True:
-            m_cpu = m_cpu & (A > 0.5)
-        if not m_cpu.any():
+        # Skip batches with no supervised pairs before BCHW assembly / model forward
+        idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
+        if idx_cpu.numel() == 0:
             continue
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -2776,17 +2716,10 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
                 model_key=model_key, model=model, device=DEVICE
             )
 
-        idx_cpu = torch.nonzero(m_cpu, as_tuple=False)  # (E,3): [b,i,j]
         dev = logits.device
         idx = idx_cpu.to(dev, non_blocking=True)
         if num_classes == 1:
-            # Normalise logits to (B,H,W)
-            if logits.dim() == 4 and logits.size(1) == 1:
-                z = logits[:, 0, :, :]
-            else:
-                z = logits
-
-            z_sel = z[idx[:, 0], idx[:, 1], idx[:, 2]]  # (E,)
+            z_sel = logits[idx[:, 0], idx[:, 1], idx[:, 2]]  # (E,)
 
             # Evaluate > 0.5 entirely on the CPU where L and idx_cpu already reside
             y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(torch.float32)
@@ -2794,12 +2727,7 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
             all_logits_sel.append(z_sel.detach().to(torch.float32).cpu())
             all_y_sel.append(y_sel)
         else:
-            # Normalise to (B,H,W,K)
-            if logits.dim() == 4 and logits.size(1) == num_classes:
-                z = logits.permute(0, 2, 3, 1).contiguous()
-            else:
-                z = logits
-
+            z = logits.permute(0, 2, 3, 1).contiguous()
             z_sel = z[idx[:, 0], idx[:, 1], idx[:, 2], :]  # (E,K)
             y_sel_cpu = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]].to(torch.int64)
             y_sel = y_sel_cpu.to(dev, non_blocking=True)
@@ -2977,10 +2905,8 @@ def run_random_forest_for_task(
 
     def _iter_split_rows(loader: DataLoader):
         for A, feats, L, mask in loader:
-            m = effective_mask(mask, A, registry.directed)
-            if edges_only:
-                m = m & (A > 0.5)
-            if not m.any():
+            idx = _supervised_indices(mask, A, registry.directed, edges_only)
+            if idx.numel() == 0:
                 continue
 
             x_bchw = registry.stack_channels_BCHW(
@@ -2988,7 +2914,6 @@ def run_random_forest_for_task(
             )
             x_bchw = registry.standardise_bchw(x_bchw)
 
-            idx = torch.nonzero(m, as_tuple=False)
             X_c = x_bchw[idx[:, 0], :, idx[:, 1], idx[:, 2]].numpy()
             y_c = L[idx[:, 0], idx[:, 1], idx[:, 2]].numpy()
             yield X_c, y_c
@@ -3373,8 +3298,6 @@ def print_final_summary_table(
     def _get(d: dict | None, keys):
         if not d:
             return None
-        if isinstance(keys, str):
-            return d.get(keys, None)
         for k in keys:
             if k in d:
                 return d[k]
@@ -3509,14 +3432,11 @@ def finalise_summary(results: Dict[str, Any], task, header: Optional[str] = None
     """
     Print a single consolidated summary for a (possibly merged) results mapping.
     Accepts either the raw results dict or the full pipeline bundle with a "results" key.
-    Safe to call multiple times on the same object; prints once.
+    Called once per run by the lifecycle finaliser.
     """
-    bundle = results
     res_map = results
     if isinstance(results, dict) and "results" in results and isinstance(results["results"], dict):
         res_map = results["results"]
-    if isinstance(bundle, dict) and bundle.get("_summary_printed"):
-        return
 
     # Use the explicit parameters instead of reading from cfg
     print_final_summary_table(
@@ -3527,9 +3447,6 @@ def finalise_summary(results: Dict[str, Any], task, header: Optional[str] = None
         header=header,
         order=_preferred_model_order()
     )
-
-    if isinstance(bundle, dict):
-        bundle["_summary_printed"] = True
 
 
 def _reset_pipeline_runtime_state(task=None) -> None:
