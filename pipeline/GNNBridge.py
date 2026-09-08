@@ -665,11 +665,16 @@ class _EdgeMaskedTransformer(nn.Module):
         self.inp = nn.Linear(in_dim, hidden)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden, nhead=heads, dim_feedforward=hidden * 4,
-            dropout=dropout, batch_first=True, activation="gelu"
+            dropout=dropout, batch_first=True, activation="gelu",
+            norm_first=True
         )
         enc_layer.norm1 = nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
         enc_layer.norm2 = nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=depth)
+        self.enc = nn.TransformerEncoder(
+            enc_layer,
+            num_layers=depth,
+            norm=nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
+        )
         self.out = nn.Linear(hidden, out_dim)
         self.register_buffer("_eye_cache", torch.empty(0, 0, dtype=torch.bool), persistent=False)
 
