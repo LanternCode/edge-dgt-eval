@@ -8,10 +8,10 @@ from pipeline.GNNBridge import GNNTrainConfig, run_gnn_suite
 
 
 # ---------------------------------------------------------------------
-# Labeler: the estimated minimal chordal graph is generated using
+# Labeler: the estimated minimum chordal graph is generated using
 # networkx's complete_to_chordal_graph greedy algorithm.
 # ---------------------------------------------------------------------
-def label_minimal_chordal_completion(A: np.ndarray) -> np.ndarray:
+def label_minimum_chordal_completion(A: np.ndarray) -> np.ndarray:
     """
     Computes the chordal completion of the graph represented by adjacency A.
     Label L[i,j] = 1 if edge (i,j) must be added to make G chordal, else 0.
@@ -123,11 +123,11 @@ bench = ChordalCompletionBenchmark(
 )
 
 hooks = TaskHooks(
-    label_fn=label_minimal_chordal_completion,
+    label_fn=label_minimum_chordal_completion,
     feature_set=[
         "powers", "degree", "endpoint_degree",
         "deg_diff", "triangles", "clustering_coeff",
-        "cn", "jaccard", "adamic_adar",
+        "jaccard", "adamic_adar",
         "shortest_path"
     ],
     allow_adj_channel=True
@@ -135,7 +135,7 @@ hooks = TaskHooks(
 
 # Create the task object using the 80/10/10 split across 1000 non-chordal graphs with 6-140 nodes each
 task = ProvidedSplitsTask(
-    name="estimated_minimal_chordal_completion",
+    name="estimated_minimum_chordal_completion",
     directed=False,
     hooks=hooks,
     ratios=(0.8, 0.1, 0.1),

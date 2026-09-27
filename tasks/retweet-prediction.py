@@ -70,7 +70,7 @@ class HiggsRetweetEdgesTask(ProvidedSplitsTask):
         hooks = TaskHooks(
             label_fn=None,
             feature_set=[
-                "deg_row", "deg_col", "cn", "adamic_adar",
+                "deg_row", "deg_col", "deg_diff", "cn", "jaccard", "adamic_adar",
                 "transpose", ("out_degree", "node"), ("in_degree", "node")
             ]
         )

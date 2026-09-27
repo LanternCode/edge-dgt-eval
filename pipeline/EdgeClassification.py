@@ -214,7 +214,7 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
                 continue
 
             # Safely pass other internal metadata through as raw Python types
-            if isinstance(k, str) and k.startswith("_"):
+            if isinstance(k, str) and k.startswith("_") and not isinstance(v, (np.ndarray, torch.Tensor)):
                 feats_t[k] = v
                 continue
 
@@ -442,11 +442,6 @@ class FeatureRegistry:
 
     DERIVABLE_FROM_ADJ: ClassVar[FrozenSet[str]] = frozenset({
         "cn", "jaccard", "adamic_adar", "deg_row", "deg_col", "deg_diff"
-    })
-
-    # Subset of DERIVABLE_FROM_ADJ commonly appended when append_pairwise=True
-    HEAVY_PAIRWISE_KEYS: ClassVar[FrozenSet[str]] = frozenset({
-        "cn", "jaccard", "adamic_adar"
     })
 
     _stats_cache: ClassVar[Dict] = {}
@@ -1246,7 +1241,8 @@ def _normalise_feature_spec(x, directed: bool) -> Tuple[List[str], Dict[str, str
                 raise ValueError(
                     f"[CUSTOM FEATURE] Conflicting types for '{k}': {previous!r} and {v_type!r}."
                 )
-            custom_types[k] = v_type
+            if not k.startswith("power_"):
+                custom_types[k] = v_type
             expanded.append(k)
             continue
 
@@ -1271,7 +1267,9 @@ def _normalise_feature_spec(x, directed: bool) -> Tuple[List[str], Dict[str, str
         if k not in FeatureRegistry.CANONICAL and k not in custom_types:
             print(f"[WARN] Unknown/non-canonical feature '{k}' dropped. "
                   f"Allowed canonical features: {sorted(FeatureRegistry.CANONICAL)}. "
-                  f"Declare custom features as ('{k}', 'node') or ('{k}', 'edge').")
+                  + ("The 'power_' prefix is reserved for power_2 through power_5."
+                     if k.startswith("power_") else
+                     f"Declare custom features as ('{k}', 'node') or ('{k}', 'edge')."))
             continue
         if k not in seen:
             seen.add(k)

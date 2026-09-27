@@ -19,7 +19,7 @@ hooks_sym = TaskHooks(
     label_fn=label_symmetric_closure,
     feature_set=[
         "powers", "deg_row", "deg_col",
-        "triangles", "clustering_coeff", "cn",
+        "triangles", "clustering_coeff",
         "jaccard", "adamic_adar", "transpose"
     ],
     allow_adj_channel=True

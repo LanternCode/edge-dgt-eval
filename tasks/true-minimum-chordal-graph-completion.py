@@ -9,7 +9,7 @@ from pipeline.GNNBridge import run_gnn_suite, GNNTrainConfig
 from typing import List, Tuple, Optional
 
 
-class MinimalFillBenchmark(GraphBenchmark):
+class MinimumFillBenchmark(GraphBenchmark):
     """
     Custom Benchmark loader for the Minimum Fill-In (Chordal Completion) task.
 
@@ -106,7 +106,7 @@ class MinimalFillBenchmark(GraphBenchmark):
         return data
 
 
-bench = MinimalFillBenchmark(
+bench = MinimumFillBenchmark(
     dataset_path="data/minfill_true_1000/min_fill_dataset.jsonl",
     features_path="data/minfill_true_1000/min_fill_dataset.jsonl.features.current.pt"
 )
@@ -120,7 +120,7 @@ hooks = TaskHooks(
     allow_adj_channel=True
 )
 
-# Create the task object and provide the path to the true minimal fillins and features
+# Create the task object and provide the path to the true minimum fillins and features
 task = ProvidedSplitsTask(
     name="true_min_fill_chordal_completion",
     directed=False,

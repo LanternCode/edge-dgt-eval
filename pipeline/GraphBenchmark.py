@@ -555,7 +555,7 @@ class GraphBenchmark:
         counts = [1 if r > 0 else 0 for r in requested]
         while sum(counts) < n:
             i = max(
-                range(3),
+                (j for j, r in enumerate(requested) if r > 0),
                 key=lambda j: requested[j] * n - counts[j]
             )
             counts[i] += 1

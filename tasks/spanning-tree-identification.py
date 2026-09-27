@@ -44,11 +44,11 @@ hooks = TaskHooks(
     feature_set=[
         "powers", "degree", "deg_diff",
         "triangles", "clustering_coeff",
-        "cn", "jaccard", "adamic_adar"
+        "jaccard", "adamic_adar"
     ]
 )
 
-# Exclude shape_cycle due ti conflicting objectives
+# Exclude shape_cycle due to conflicting objectives
 bench = GraphBenchmark(
     graph_types=[
         "erdos_renyi", "barabasi_albert", "watts_strogatz",

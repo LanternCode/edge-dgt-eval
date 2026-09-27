@@ -30,8 +30,7 @@ hooks = TaskHooks(
     label_fn=lambda A: label_shortcut_elimination(A, K_max=2),
     feature_set=[
     "power_3", "power_4", "power_5",
-    "degree", "deg_row", "deg_col", "deg_diff",
-    "triangles", "clustering_coeff"
+    "degree", "deg_row", "deg_col", "deg_diff"
     ],
     orientation="dag",
     ensure_connected=True,

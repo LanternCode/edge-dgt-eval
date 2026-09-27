@@ -196,12 +196,13 @@ class FacebookLouvainTileBench(GraphBenchmark):
 class FacebookLouvainTask(ProvidedSplitsTask):
     def __init__(self, seed=None, tile_size: int = 512, seeds_per_tile: int = 4):
         hooks = TaskHooks(
+            # cn replaces power_2 (identical here) because only cn reaches the Scalable Mode decoder
             label_fn=None,
             feature_set=[
-                "degree", "deg_diff",
+                "degree", "deg_row", "deg_col", "deg_diff",
                 "triangles", "clustering_coeff",
-                "jaccard", "adamic_adar",
-                "powers", "shortest_path"
+                "cn", "jaccard", "adamic_adar",
+                "power_3", "power_4", "power_5", "shortest_path"
             ],
             allow_adj_channel=True
         )

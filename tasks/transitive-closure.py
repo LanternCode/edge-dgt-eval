@@ -30,8 +30,7 @@ hooks = TaskHooks(
     label_fn=label_transitive_closure_unbounded,
     feature_set=[
         "powers", "deg_row", "deg_col",
-        "triangles", "clustering_coeff",
-        "transpose"
+        "transpose", "jaccard", "adamic_adar"
     ],
     orientation="dag",
     allow_adj_channel=True

@@ -5,7 +5,8 @@ Bridge to map raw graph tuples (A, node_feats, edge_feats, meta) into
 model-ready tensors with consistent shape conventions, per-graph
 standardisation via FeatureRegistry helpers, and shared utils.features helpers for
 pairwise edge features. This module intentionally delegates:
-  - Pairwise features -> utils.features.pairwise_batch_from_adj / utils.features.pairwise_for_pairs
+  - Pairwise features -> Taken from the sample feature dicts as requested; Scalable Mode computes
+                         its requested decoder subset via utils.features.pairwise_for_pairs
   - Self-loops        -> Adjacency A is used as given for feature assembly and propagation.
                          The Edge-Masked Transformer adds temporary self-loops only to its
                          internal attention allow-mask. Supervision/evaluation policy is
@@ -34,7 +35,7 @@ from .EdgeClassification import (
     FeatureRegistry, _task_to_meta_dict, finalise_summary, _resolve_loaders, _pos_weight, _pick_probe_loader,
     get_optimal_threshold, save_pipeline_checkpoint, _reset_pipeline_runtime_state
 )
-from ._utils.features import pairwise_for_pairs, pairwise_batch_from_adj, shortest_path_from_adj
+from ._utils.features import pairwise_for_pairs, shortest_path_from_adj
 from ._utils.run_lifecycle import begin_or_attach_run
 from sklearn.metrics import (
     precision_score, recall_score, f1_score, roc_auc_score,
@@ -169,7 +170,6 @@ def _assemble_features_for_graph(
         lap_pe_sign_flip: bool = False,
         rwse_steps: int = 0,
         build_edge_mats: bool = True,
-        append_pairwise: bool = True,
         is_directed: bool = False,
         extra_edge_mask: Optional[torch.Tensor] = None
 ) -> Tuple[
@@ -229,9 +229,6 @@ def _assemble_features_for_graph(
         build_edge_mats:
             If False, the returned E will have shape (N, N, 0) and edge feature assembly
             is skipped
-        append_pairwise:
-            If True, append derived pairwise features (FeatureRegistry.HEAVY_PAIRWISE_KEYS)
-            as supported by `pairwise_batch_from_adj`
         extra_edge_mask:
             Optional mask selecting observed/local message-passing edges. When supplied,
             the second return value is `(E, E_local)` rather than `E`.
@@ -350,18 +347,6 @@ def _assemble_features_for_graph(
 
             v = feats.get(k, None)
             edge_mats.append(_as_edge_mat(v))
-
-        if append_pairwise:
-            # Filter out heavy pairwise keys that are already provided in the schema
-            needed_keys = [
-                k for k in FeatureRegistry.HEAVY_PAIRWISE_KEYS
-                if k not in edge_keys
-            ]
-            if needed_keys:
-                for _v in pairwise_batch_from_adj(
-                    A, needed_keys, is_directed=is_directed
-                ).values():
-                    edge_mats.append(_v.to(device=dev, dtype=torch.float32))
 
         E = torch.stack(edge_mats, dim=-1) if edge_mats else torch.zeros((N, N, 0), device=dev, dtype=torch.float32)
 
@@ -997,7 +982,6 @@ def _prepare_features_batch(
     lap_pe_sign_flip: bool = False,
     rwse_steps: int = 0,
     build_edge_mats: bool = True,
-    append_pairwise: bool = True,
     is_directed: bool = False,
     build_local_edge_mats: bool = False
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
@@ -1046,9 +1030,6 @@ def _prepare_features_batch(
             If True, construct edge/pairwise feature matrices Eb for each graph.
             If False, Eb may be returned as an empty/placeholder tensor depending on
             `_assemble_features_for_graph`
-        append_pairwise:
-            If True, append any derived pairwise features (e.g., from adjacency) as
-            supported by `_assemble_features_for_graph`
         is_directed:
             Whether the graphs are directed. Affects pairwise feature assembly
 
@@ -1094,7 +1075,6 @@ def _prepare_features_batch(
             lap_pe_sign_flip=bool(lap_pe_sign_flip),
             rwse_steps=int(rwse_steps),
             build_edge_mats=bool(build_edge_mats),
-            append_pairwise=bool(append_pairwise),
             is_directed=bool(is_directed),
             extra_edge_mask=local_mask_b
         )
@@ -1289,7 +1269,6 @@ class GraphEdgeClassifier(nn.Module):
             lap_pe_sign_flip=self._lap_pe_sign_flip_enabled(),
             rwse_steps=self._effective_rwse_steps(),
             build_edge_mats=True,
-            append_pairwise=True,
             is_directed=bool(self.directed),
             build_local_edge_mats=is_gps
         )
@@ -1370,9 +1349,14 @@ class GraphEdgeClassifier(nn.Module):
         Computes logits only for specific pairs (src, dst).
         Used for memory efficiency on large graphs.
 
+        Decoder edge features are `self.decoder_pair_keys`: the task-requested members of
+        FeatureRegistry.DERIVABLE_FROM_ADJ, stacked in task.hooks.feature_set order.
+
         Returns:
             Logits: (M,) if binary, or (M, K) if multiclass.
         """
+        keys = tuple(getattr(self, "decoder_pair_keys", ()))
+
         # `sum` is not on the autocast allowlist, so counts stay fp32 unless explicitly cast
         is_directed = bool(getattr(self, "directed", False))
         A01 = (A > 0.5).to(torch.float32)
@@ -1380,36 +1364,32 @@ class GraphEdgeClassifier(nn.Module):
         col_deg = A01.sum(dim=0) if is_directed else row_deg
         d_u = row_deg[src]
         d_v = col_deg[dst]
-        deg_diff = (d_u - d_v).abs().view(-1, 1)
 
         # Compute structural features - bf16 is exact only to 256 and these feed jaccard and adamic_adar
-        pairwise_keys = list(FeatureRegistry.HEAVY_PAIRWISE_KEYS)
-        pairwise_feats = pairwise_for_pairs(
+        pairwise_keys = [k for k in ("cn", "jaccard", "adamic_adar") if k in keys]
+        pair_feats = pairwise_for_pairs(
             A01, src, dst, pairwise_keys,
             row_deg=row_deg, col_deg=col_deg,
             is_directed=is_directed
-        )
-        cn = pairwise_feats["cn"]
-        jacc = pairwise_feats["jaccard"]
-        aa = pairwise_feats["adamic_adar"]
+        ) if pairwise_keys else {}
+        pair_feats["deg_diff"] = (d_u - d_v).abs()
 
         # Fetch node embeddings
         z_u = Z[src]
         z_v = Z[dst]
 
+        def _gather(deg_u: torch.Tensor, deg_v: torch.Tensor) -> torch.Tensor:
+            """Stack the requested features in key order, with the per-node slots taken from deg_u/deg_v."""
+            if not keys:
+                return Z.new_zeros((int(src.numel()), 0))
+            slots = {"deg_row": deg_u, "deg_col": deg_v, **pair_feats}
+            return torch.stack([slots[k] for k in keys], dim=1).to(Z.dtype)
+
         # Gather structural features as the edge feature vector
-        edge_feats = torch.cat([
-            d_u.view(-1, 1), d_v.view(-1, 1), deg_diff,
-            cn.view(-1, 1), jacc.view(-1, 1), aa.view(-1, 1)
-        ], dim=1).to(Z.dtype)
+        edge_feats = _gather(d_u, d_v)
 
         # Build reverse edge features with swapped per-node slots (d_u <-> d_v)
-        edge_feats_rev = None
-        if not self.directed:
-            edge_feats_rev = torch.cat([
-                d_v.view(-1, 1), d_u.view(-1, 1), deg_diff,
-                cn.view(-1, 1), jacc.view(-1, 1), aa.view(-1, 1)
-            ], dim=1).to(Z.dtype)
+        edge_feats_rev = None if self.directed else _gather(d_v, d_u)
 
         return self.dec.score_pairs(z_u, z_v, edge_feats, edge_feats_rev)
 
@@ -1442,8 +1422,9 @@ class GraphEdgeClassifier(nn.Module):
         
         # Explicitly initialise the decoder during warmup when pairwise_on_demand=True so the optimiser tracks it
         if self.dec is None and getattr(self, "pairwise_on_demand", False):
-            # In on-demand mode, decoder edge features are fixed: [d_u, d_v, deg_diff, cn, jaccard, adamic_adar]
-            self.dec = self._build_decoder(node_dim=Z.size(1), edge_dim=6).to(dev)
+            # In on-demand mode, decoder edge features are the task-requested decoder_pair_keys
+            edge_dim = len(tuple(getattr(self, "decoder_pair_keys", ())))
+            self.dec = self._build_decoder(node_dim=Z.size(1), edge_dim=edge_dim).to(dev)
 
         return Z
 
@@ -1593,7 +1574,7 @@ def _gnn_eval_split(
                     lap_pe_k=model._effective_lap_pe_k(),
                     lap_pe_sign_flip=model._lap_pe_sign_flip_enabled(),
                     rwse_steps=model._effective_rwse_steps(),
-                    build_edge_mats=False, append_pairwise=False,
+                    build_edge_mats=False,
                     is_directed=bool(is_directed)
                 )
                 Z = model.encode_only(A_enc, X_batch, node_mask)
@@ -1989,13 +1970,14 @@ def train_one_gnn_edges(
         cfg: Union[GNNTrainConfig, SimpleNamespace, dict],
         *,
         loaders: Tuple[DataLoader, DataLoader, DataLoader],
-        feature_schema: Dict[str, Any]
+        feature_schema: Dict[str, Any],
+        decoder_pair_keys: Sequence[str]
 ) -> Dict[str, Dict[str, float]]:
     """
     On-demand GNN training, one graph at a time. Supports Binary (BCE) and Multiclass (CrossEntropy).
 
-    Loaders and the feature schema are runner-owned, set by run_gnn_edges_suite before
-    loader resolution and always passed in.
+    Loaders, the feature schema and the decoder pair keys are runner-owned, set by
+    run_gnn_edges_suite before loader resolution and always passed in.
     """
     _t_model_start = time.monotonic()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2023,6 +2005,7 @@ def train_one_gnn_edges(
     model.dropedge_p = float(getattr(cfg, "dropedge_p", 0.10))
     model.feature_schema = feature_schema
     model.pairwise_on_demand = True
+    model.decoder_pair_keys = tuple(decoder_pair_keys)
     model.lap_pe_k = int(getattr(cfg, "lap_pe_k", 0))
     model.gps_lap_pe_k = int(getattr(cfg, "gps_lap_pe_k", 16))
     model.gps_lap_pe_sign_flip = bool(getattr(cfg, "gps_lap_pe_sign_flip", True))
@@ -2040,7 +2023,7 @@ def train_one_gnn_edges(
             lap_pe_k=model._effective_lap_pe_k(),
             lap_pe_sign_flip=model._lap_pe_sign_flip_enabled(),
             rwse_steps=model._effective_rwse_steps(),
-            build_edge_mats=False, append_pairwise=False,
+            build_edge_mats=False,
             is_directed=bool(is_directed)
         )
         Z = model.encode_only(A0_enc, X_batch, node_mask)
@@ -2092,7 +2075,7 @@ def train_one_gnn_edges(
                     lap_pe_k=model._effective_lap_pe_k(),
                     lap_pe_sign_flip=model._lap_pe_sign_flip_enabled(),
                     rwse_steps=model._effective_rwse_steps(),
-                    build_edge_mats=False, append_pairwise=False,
+                    build_edge_mats=False,
                     is_directed=bool(is_directed)
                 )
                 Z = model.encode_only(A_enc, X_batch, node_mask)
@@ -2216,6 +2199,7 @@ def train_one_gnn_edges(
         "task": _task_to_meta_dict(task),
         "feature_schema": feature_schema,
         "pairwise_on_demand": True,
+        "decoder_pair_keys": list(decoder_pair_keys),
         "cfg": dict(
             lr=float(cfg.lr),
             weight_decay=float(cfg.weight_decay),
@@ -2371,8 +2355,9 @@ def run_gnn_edges_suite(
           resolved loaders. Typed custom declarations in task.hooks.feature_set provide
           node/edge metadata without narrowing discovery. Features first appearing after
           that scan window are not added to the schema. Discovered node features flow
-          through to the encoder. The decoder's structural pair features are computed
-          on the fly from the adjacency.
+          through to the encoder. The decoder's structural pair features are the subset of
+          deg_row, deg_col, deg_diff, cn, jaccard and adamic_adar requested in
+          task.hooks.feature_set, computed on the fly from the adjacency.
     """
     canon = _canonicalise_encoders(encoders)
     batch_size_explicit = (
@@ -2403,12 +2388,14 @@ def run_gnn_edges_suite(
 
     hooks = getattr(task, "hooks", None)
     if hooks is None:
-        custom_types = {}
+        requested_features, custom_types = [], {}
     else:
-        _, custom_types = _normalise_feature_spec(
+        requested_features, custom_types = _normalise_feature_spec(
             getattr(hooks, "feature_set", []),
             directed=task.directed
         )
+    decoder_pair_keys = tuple(k for k in requested_features if k in FeatureRegistry.DERIVABLE_FROM_ADJ)
+    print(f"[SCALABLE MODE] Decoder pair features: {list(decoder_pair_keys) or 'none'}", flush=True)
 
     if batch_size_explicit and int(cfg.batch_size) != 1:
         print(
@@ -2433,7 +2420,8 @@ def run_gnn_edges_suite(
         out = train_one_gnn_edges(
             enc, task, cfg,
             loaders=shared_loaders,
-            feature_schema=shared_feature_schema
+            feature_schema=shared_feature_schema,
+            decoder_pair_keys=decoder_pair_keys
         )
         entry = {
             "val": out.get("val", {}),
@@ -2602,7 +2590,10 @@ def _infer_feature_schema(
                 if seeking is not None:
                     keys_to_check = [k for k in requested_order if k in seeking and k in fdict]
                 else:
-                    keys_to_check = list(fdict.keys())
+                    keys_to_check = [
+                        k for k in fdict
+                        if not k.startswith("power_") or k in FeatureRegistry.CANONICAL
+                    ]
 
                 for k in keys_to_check:
                     v = fdict[k]

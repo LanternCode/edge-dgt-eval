@@ -344,7 +344,7 @@ feature_mode = "default"  # Switch to "ablation" for limited feature range
 
 # Declare custom atom features alongside canonical structural features
 atom_keys = atom_feature_keys_for_mode(feature_mode)
-canonical_structural = ["degree", "twohop", "triangles"]
+canonical_structural = ["degree", "twohop", "triangles", "cn", "jaccard", "adamic_adar"]
 hooks = TaskHooks(feature_set=[(k, "node") for k in atom_keys] + canonical_structural)
 
 # Create the task object using an 80/10/10 split across 1000 task-specific graphs with 6-140 nodes each

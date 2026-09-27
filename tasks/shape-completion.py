@@ -21,12 +21,11 @@ def label_shape_completion(G: nx.Graph) -> np.ndarray:
     return L_full
 
 
-# Request all features minus transpose (the graph is symmetric)
+# Request all task-relevant features
 hooks = TaskHooks(
     label_fn=label_shape_completion,
     feature_set=[
-        "degree", "deg_row", "deg_col", "deg_diff",
-        "triangles", "clustering_coeff", "powers",
+        "degree", "deg_row", "deg_col", "deg_diff", "powers",
         "jaccard", "adamic_adar", "shortest_path"
     ],
     allow_adj_channel=True
