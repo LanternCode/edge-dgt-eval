@@ -39,8 +39,8 @@ Core abstractions
   AUROC/AUPRC, BAcc (with tuned threshold on Val utilising state momentum for 
   degenerate splits), and multiclass reports Acc/P_macro/R_macro/F1_macro/AUC_macro/AUPRC_macro/BAcc_macro.
 
-- Saving: each trained model is saved to .pth with state_dict + meta (channel stats,
-  manifest, flags, best threshold, and task info).
+- Saving: when enabled, each trained model is saved to .pth with state_dict +
+  meta (manifest, flags, best threshold, and task info).
 
 Usage
 -----
@@ -630,7 +630,7 @@ class FeatureRegistry:
                     M = torch.zeros(N, N, dtype=dtype, device=A.device)
 
                     # Handle missing 1D features that require two channels (row/col)
-                    if getattr(self, "manifest", None) and f"{k}_row" in self.manifest:
+                    if self.custom_feature_types.get(k) != "edge":
                         per_graph_parts.append(torch.stack([M, M], dim=0).unsqueeze(0))
                         continue
 
@@ -3229,7 +3229,7 @@ def run_random_forest_for_task(
         val_m = _empty_metrics()
     else:
         thr, val_m = _metrics_from_probs(pv, yv, fixed_thr=None, threshold_metric=threshold_metric)
-        val_m["_prob"] = pv.astype(np.float32).tolist()
+        val_m["_prob"] = pv.tolist()
         val_m["_y"] = yv.astype(int).tolist()
 
     pt, yt = _predict_split(test_loader)
@@ -3237,7 +3237,7 @@ def run_random_forest_for_task(
         test_m = _empty_metrics()
     else:
         _, test_m = _metrics_from_probs(pt, yt, fixed_thr=thr, threshold_metric=threshold_metric)
-        test_m["_prob"] = pt.astype(np.float32).tolist()
+        test_m["_prob"] = pt.tolist()
         test_m["_y"] = yt.astype(int).tolist()
 
     if num_classes == 1:

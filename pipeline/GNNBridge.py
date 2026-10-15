@@ -2548,7 +2548,7 @@ def _infer_feature_schema(
                 edge_keys.append(k)
             return
 
-        if t.dim() == 0 or (t.dim() == 2 and t.shape == (1, 1)) or t.dim() == 1:
+        if t.dim() == 0 or (t.dim() == 2 and t.shape == (1, 1) and k not in FeatureRegistry.CANONICAL) or t.dim() == 1:
             if k not in seen_nodes:
                 seen_nodes.add(k)
                 node_keys.append(k)

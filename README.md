@@ -874,7 +874,7 @@ Two supported code paths that should produce identical results for identical inp
 
 ### 4. Dead code
 
-Code that is unreachable from any supported entry point, or code that only functions under unsupported usage patterns. This includes conditional branches that can never evaluate to true on supported paths. Before reporting: check whether the code is forward-looking scaffolding documented in "Key Design Decisions."
+Dead code includes code unreachable from all supported entry points, code that functions only under unsupported usage patterns, and conditional branches whose conditions cannot be satisfied on supported paths. User-facing configuration enterable through a task file is never dead.
 
 ### 5. Internal cleanup and other unclassified issues
 
@@ -886,9 +886,7 @@ The following do not qualify under any category and should not be reported:
 
 - **Style preferences**: staticmethod vs instance method, import grouping, variable naming conventions.
 - **Used imports**: every import in this codebase is used. An import used in only one function is not "narrowly scoped" or "dead."
-- **Defensive calls**: `gc.collect()`, `torch.cuda.ipc_collect()`, `torch.cuda.synchronize()` exist as safety nets and are not dead code.
-- **Numerical safety nets in forward paths**: `torch.nan_to_num`, `torch.clamp`, and input bounding in encoder or decoder forward methods guard against silent NaN or Inf propagation.
-- **Code organisation choices**: whether two runners with shared setup should be merged into one parameterised function are structural preferences.
+- **Code organisation choices**: whether two GNN runners with shared setup should be merged into one parameterised function are structural preferences.
 
 ### Common false-positive patterns (do not report)
 

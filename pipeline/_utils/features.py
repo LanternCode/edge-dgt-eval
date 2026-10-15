@@ -166,7 +166,8 @@ def pairwise_for_pairs(
         Au = A01[src_c]
         Av = A01_t[dst_c]
         shared = Au * Av
-        cn = shared.sum(dim=1)
+        if "cn" in results or "jaccard" in results:
+            cn = shared.sum(dim=1)
 
         if "cn" in results:
             results["cn"][start:end] = cn
