@@ -1229,10 +1229,8 @@ class GraphEdgeClassifier(nn.Module):
 
         if self.encoder_type in ("sage", "gin", "gps"):
             if as_list:
-                return [A_for_enc[b] if A_for_enc[b].is_sparse else A_for_enc[b].to_sparse_coo()
-                        for b in range(A_for_enc.size(0))]
-            if not A_for_enc.is_sparse:
-                return A_for_enc.to_sparse_coo()
+                return [A_for_enc[b].to_sparse_coo() for b in range(A_for_enc.size(0))]
+            return A_for_enc.to_sparse_coo()
 
         return A_for_enc
 
@@ -1390,18 +1388,12 @@ class GraphEdgeClassifier(nn.Module):
 
     def encode_only(self, A: torch.Tensor, X_batch, node_mask: torch.Tensor) -> torch.Tensor:
         """
-        Returns node embeddings Z for a single graph or batch size 1.
+        Returns node embeddings Z for a batch of size 1.
         Useful for running the encoder once before scoring many pairs on demand.
         """
-        # Normalise inputs to single graph format (N, N)
-        if A.dim() == 3:
-            A = A[0]
-
-        if node_mask.dim() == 2:
-            node_mask = node_mask[0]
-
         # Extract the single graph's feature matrix directly
         X_batch = list(X_batch)
+        A = A[0]
         dev = A.device
         X = X_batch[0]
 
@@ -1413,6 +1405,7 @@ class GraphEdgeClassifier(nn.Module):
         # Apply training-time adjacency preparation for the encoder
         A_for_enc = self._prepare_adj_for_encoder(A)
 
+        node_mask = node_mask[0]
         Z = self.enc.forward_one(A_for_enc, X, node_mask)
         
         # Explicitly initialise the decoder during warmup when pairwise_on_demand=True so the optimiser tracks it
@@ -1564,6 +1557,9 @@ def _gnn_eval_split(
         with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
             # Path A: On-demand
             if getattr(model, "pairwise_on_demand", False):
+                idx = _supervised_indices(mask, A, is_directed, edges_only)
+                if idx.numel() == 0:
+                    continue
                 X_batch, _, node_mask = _prepare_features_batch(
                     A_enc, feats, mask, schema=getattr(model, "feature_schema", None),
                     lap_pe_k=model._effective_lap_pe_k(),
@@ -1573,10 +1569,6 @@ def _gnn_eval_split(
                     is_directed=bool(is_directed)
                 )
                 Z = model.encode_only(A_enc, X_batch, node_mask)
-
-                idx = _supervised_indices(mask, A, is_directed, edges_only)
-                if idx.numel() == 0:
-                    continue
 
                 i_idx, j_idx = idx[:, 1], idx[:, 2]
                 idx_cpu = idx.cpu()
@@ -1689,7 +1681,7 @@ def _gnn_eval_split(
                 "auprc": float("nan"),
             }, None
 
-        z_tensor = torch.nan_to_num(torch.cat(all_logits), nan=0.0, posinf=30.0, neginf=-30.0)
+        z_tensor = torch.cat(all_logits)
         y_tensor = torch.cat(all_labels)
 
         pw = _pos_weight(y_tensor)
@@ -2571,7 +2563,7 @@ def _infer_feature_schema(
                 break
             B = A.size(0)
             for b in range(B):
-                fdict = feats[b] if isinstance(feats, (list, tuple)) else feats
+                fdict = feats[b]
                 N_unpadded = int(fdict["_N"])
 
                 # Only inspect the keys we are still looking for

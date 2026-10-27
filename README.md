@@ -562,6 +562,7 @@ Label validity contract on supported paths:
 - `collate_fn_pad(...)` pads `L` with `0` and pads `mask` with `False`.
 - Label and evaluation-mask matrices must be `(N, N)`, matching the adjacency. Roles are assigned positionally, so a mis-shaped matrix is rejected during collation.
 - For multiclass tasks, label matrices must contain finite integer class IDs in `[0, num_classes - 1]`. Invalid values are rejected during collation.
+- All three dataset splits are validated during loader resolution, before model training begins, to reject NaN values in label matrices, including masked-out positions.
 
 ### (B) Transformer token-keep mask
 
@@ -949,6 +950,7 @@ The following are **not currently supported**. If you need one, open an issue an
 **Validation strictness and limits**
 
 - **Pipeline-level strict mode.** Some malformed inputs currently warn and continue where feasible.
+- **Optional label validation preflight.** Allow trusted datasets to skip the exhaustive NaN label scan across train/validation/test during loader resolution. The current mandatory scan can increase startup time and resource consumption for large or lazily generated datasets. Skipping it would remove the guarantee of detecting invalid labels before training.
 - **Per-feature strictness controls for dynamic padding.**
 - **Configurable RF edge cap.** The RF path uses a fixed maximum of 20,000,000 edges. Its capped training collector preallocates the reservoir at that maximum so replacement sampling remains one-pass and in-place. Small training splits reserve the corresponding array address space.
 

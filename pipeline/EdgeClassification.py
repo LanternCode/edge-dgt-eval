@@ -540,7 +540,7 @@ class FeatureRegistry:
                 _mat_cache_batch[k] = torch.stack([
                     shortest_path_from_adj(
                         A_base[b], is_directed=self.directed,
-                        valid_n=int(feats[b].get("_N", N)) if isinstance(feats[b], dict) else N
+                        valid_n=int(feats[b].get("_N", N))
                     )
                     for b in range(B)
                 ], dim=0).to(dtype)
@@ -576,7 +576,7 @@ class FeatureRegistry:
 
             per_graph_parts: List[torch.Tensor] = []
             for b in range(B):
-                fdict: Dict[str, torch.Tensor] = feats[b] if isinstance(feats[b], dict) else {}
+                fdict: Dict[str, torch.Tensor] = feats[b]
                 M: Optional[torch.Tensor] = None
 
                 # Precomputed features passed in `feats[b][k]`
@@ -1541,6 +1541,17 @@ def _resolve_loaders(task, cfg, batch_size=None):
             return cached_loaders
 
         loaders = task._build_loaders(batch_size=bs)
+
+        for split_name, loader in zip(("train", "val", "test"), loaders):
+            for i in range(len(loader.dataset)):
+                sample = loader.dataset[i]
+                matrices = _extract_positional_matrices(sample, sample[0].shape[0])
+                if matrices and bool(torch.isnan(matrices[0]).any()):
+                    raise ValueError(
+                        f"[INVALID LABEL] NaN detected in {split_name} sample {i} "
+                        f"of task '{task.name}'. Exiting the framework."
+                    )
+
         task._active_run_loaders = loaders
         task._active_run_loader_sig = loader_sig
         return loaders
