@@ -28,7 +28,7 @@ Core abstractions
 - TaskSpec: base task metadata/hooks adapter. Supported runner inputs use
   ProvidedSplitsTask or a subclass; loader construction is pipeline-owned.
 
-- FeatureRegistry: stacks the features into BHWC/BCHW, computes per-channel
+- FeatureRegistry: stacks the features into BCHW, computes per-channel
   train-only mean/std, standardises, and records the exact channel manifest.
 
 - Model Zoo: Standard MLP, Deep MLP, CNN, Transformer — all consume pre-stacked
@@ -48,7 +48,7 @@ Usage
   This includes generated datasets, pre-split datasets, and single-graph mask splits.
 - Direct task-provided `train_dataloader` / `val_dataloader` / `test_dataloader`
   entry points are unsupported.
-- Requires `GraphBenchmark` importable on sys.path.
+- Imports `GraphBenchmark` from the `pipeline` package; run task files as modules from the repository root.
 - Works on CPU or CUDA. In Colab with GPU enabled, it will use cuda automatically.
 
 Notes
@@ -417,7 +417,7 @@ class FeatureRegistry:
       - channel order / expansion (adj, optional mask, expanded features),
       - computing dataset statistics on train (mean/std),
       - standardising BCHW tensors,
-      - stacking BCHW/BHWC consistently across heads.
+      - stacking BCHW consistently across heads.
 
     Notes on structural features:
       - In the dense/image-style path, `deg_row`, `deg_col`, and `deg_diff` are canonical 
@@ -468,7 +468,7 @@ class FeatureRegistry:
         # "none"     → no redaction; all channels remain visible at (i,j)
         self.supervised_redaction_policy = str(supervised_redaction_policy)
 
-    # ----- Stacking (BCHW/BHWC) -----
+    # ----- Stacking (BCHW) -----
     def stack_channels_BCHW(
             self,
             A: torch.Tensor,
@@ -506,8 +506,7 @@ class FeatureRegistry:
 
         # Redact adjacency exactly at the task-mask coordinates
         if getattr(self, "supervised_redaction_policy", "adj_only") != "none":
-            adj = adj.clone()
-            adj[mb] = 0
+            adj = adj.masked_fill(mb, 0)
 
         if include_adj:
             X.append(adj.unsqueeze(1))  # (B,1,N,N)
@@ -647,7 +646,7 @@ class FeatureRegistry:
             out = base
 
         # "all" covers every model-input channel, including the optional 'mask' channel
-        if mb is not None and getattr(self, "supervised_redaction_policy", "adj_only") == "all":
+        if getattr(self, "supervised_redaction_policy", "adj_only") == "all":
             out = out.masked_fill(mb.unsqueeze(1), 0)
         return out
 
@@ -903,6 +902,15 @@ class ProvidedSplitsTask(TaskSpec):
         num_classes: Optional override for multi-class tasks (default 1).
         eval_on_existing_edges_only: If True, loss/metrics are evaluated only on observed edges (mask ∩ A).
         show_progress: Whether to show GraphBenchmark sampling progress.
+        mask_policy: Evaluation mask for generated and pre-divided data, built only when a sample
+            does not supply its own. None (default) or "all" supervise every pair, "edges" the
+            observed edges, "non_edges" the observed non-edges.
+        bench: Optional benchmark. Its `splits` select the pre-divided or single-graph path; without
+            `splits`, graphs are generated with it. Defaults to a new GraphBenchmark.
+        pin_memory: DataLoader pin_memory. None enables it when CUDA is available; it is
+            never enabled without CUDA.
+        num_workers: DataLoader worker processes (default 0).
+        seed: Seeds random, NumPy and torch at construction. None generates a seed and prints it.
     """
     def __init__(
         self,
@@ -1551,8 +1559,6 @@ def _resolve_loaders(task, cfg, batch_size=None):
 
 def _task_to_meta_dict(task):
     def _get_safe_hooks(h_obj):
-        if h_obj is None:
-            return None
         res = {h: getattr(h_obj, h) for h in ("feature_set", "orientation", "ensure_connected", "allow_adj_channel") if hasattr(h_obj, h)}
         return res if res else None
 
@@ -2530,9 +2536,6 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
                 loss = criterion(z_sel, y_sel)
                 denom = int(y_sel.numel())
 
-            if denom == 0:
-                continue
-
             scaler.scale(loss).backward()
             if max_grad_norm > 0:
                 scaler.unscale_(optimizer)
@@ -2540,8 +2543,8 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
             scaler.step(optimizer)
             scaler.update()
 
-            loss_sum += float(loss.detach().to("cpu")) * max(1, denom)
-            denom_sum += max(1, denom)
+            loss_sum += float(loss.detach().to("cpu")) * denom
+            denom_sum += denom
 
         avg = (loss_sum / denom_sum) if denom_sum else float("nan")
 
@@ -2627,20 +2630,15 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
 # ---------------------------------------------------------------------
 # Hooks + feature utilities (single source of truth)
 # ---------------------------------------------------------------------
-def _hooks_get(hooks, key, default=None):
-    """Safe access for TaskHooks."""
-    if hooks is None:
-        return default
-    return getattr(hooks, key, default)
-
-
 @torch.no_grad()
 def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_keys,
                 num_classes, fixed_threshold=None, fallback_thr=0.5, *, criterion=None):
     """
     Eval one split. Returns a dict with keys:
-      - Binary:  Acc, P, R, F1, AUROC, AUPRC, loss/edge, thr (optional)
-      - Multi:   Acc, P_macro, R_macro, F1_macro, AUC_macro, AUPRC_macro, loss/edge
+      - Binary:  accuracy, precision, recall, f1, bacc, auroc, auprc, loss/edge, thr, _prob, _y
+      - Multi:   accuracy, P_macro, R_macro, F1_macro, f1, BAcc_macro, AUC_macro, AUPRC_macro,
+                 loss/edge, _prob, _y
+      A split with no supervised pairs returns the same metric keys as NaN, without thr, _prob or _y.
     Shapes:
       logits: (B,N,N) for binary; (B,K,N,N) for multi.
     """
@@ -2900,6 +2898,12 @@ def run_random_forest_for_task(
 
     # Fit/refresh registry stats for RF with the pipeline-resolved list
     registry.fit(train_loader, rf_keys, include_adj=bool(allow_adj_channel))
+    if not registry.manifest:
+        raise ValueError(
+            "[NO FEATURES DETECTED] Effective in_channels is 0. "
+            "Set task.hooks.feature_set=True to use the default structural features, "
+            "or explicitly enable an input channel for this model."
+        )
 
     def _iter_split_rows(loader: DataLoader):
         for A, feats, L, mask in loader:
@@ -3526,7 +3530,7 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
     # Feature keys — no 'adj' here; it is managed by the registry manifest and gated later
     hooks = getattr(task, "hooks", None)
     requested, custom_feature_types = _normalise_feature_spec(
-        _hooks_get(hooks, "feature_set", []), directed=task.directed
+        getattr(hooks, "feature_set", []), directed=task.directed
     )
     feature_keys = list(requested)
 

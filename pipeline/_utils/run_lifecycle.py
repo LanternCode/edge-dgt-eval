@@ -199,8 +199,7 @@ def begin_or_attach_run(
             active = _ACTIVE_RUN
 
             if can_attach(list(active.stages), stage, active.task_key, task_key):
-                if stage not in active.stages:
-                    active.stages.append(stage)
+                active.stages.append(stage)
 
                 # Latest caller controls final summary display behavior.
                 active.quiet = bool(quiet)

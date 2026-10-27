@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: CC-BY-SA-4.0
 
 """
-Bridge to map raw graph tuples (A, node_feats, edge_feats, meta) into
+Bridge to map collated graph batches (A, feature dicts, L, mask) into
 model-ready tensors with consistent shape conventions, per-graph
 standardisation via FeatureRegistry helpers, and shared utils.features helpers for
 pairwise edge features. This module intentionally delegates:
@@ -447,7 +447,6 @@ class _GCNEncoder(torch.nn.Module):
         hidden: int,
         depth: int,
         dropout: float = 0.0,
-        use_residual: bool = True,
         directed: bool = False,
         learnable_layer_norm: bool = True
     ):
@@ -455,7 +454,6 @@ class _GCNEncoder(torch.nn.Module):
         self.hidden = int(hidden)
         self.depth = int(depth)
         self.dropout = float(dropout)
-        self.use_residual = bool(use_residual)
         self.directed = bool(directed)
 
         self.in_lin = torch.nn.Linear(in_dim, hidden)
@@ -510,8 +508,7 @@ class _GCNEncoder(torch.nn.Module):
         for lin, norm in zip(self.convs, self.norms):
             H_agg = torch.matmul(P, H.float()).to(H.dtype)
             H_new = lin(H_agg)
-            if self.use_residual:
-                H_new = H_new + H
+            H_new = H_new + H
             H_new = norm(H_new)
             H_new = F.relu(H_new)
             H_new = self.drop(H_new)
@@ -959,15 +956,14 @@ class _EdgeFeatureDecoder(nn.Module):
             nn.Linear(hidden, out_dim)
         )
 
-    def score_pairs(self, z_u, z_v, edge_feats, edge_feats_rev=None):
+    def score_pairs(self, z_u, z_v, edge_feats, edge_feats_rev):
         """Score M specific pairs without materialising N×N."""
         diff_abs = (z_u - z_v).abs()
         prod = z_u * z_v
         phi = torch.cat([z_u, z_v, diff_abs, prod, edge_feats], dim=-1)
         s = self.scorer(phi)
         if not self.directed:
-            ef_rev = edge_feats_rev if edge_feats_rev is not None else edge_feats
-            phi_rev = torch.cat([z_v, z_u, diff_abs, prod, ef_rev], dim=-1)
+            phi_rev = torch.cat([z_v, z_u, diff_abs, prod, edge_feats_rev], dim=-1)
             s = 0.5 * (s + self.scorer(phi_rev))
 
         return s.squeeze(-1)
@@ -1061,7 +1057,7 @@ def _prepare_features_batch(
         Ab = A[b]
 
         # collate_fn_pad records the unpadded node count for every sample and pads A with zeros and mask with False
-        true_node_count = int(fdict["_N"]) if isinstance(fdict, dict) else 0
+        true_node_count = int(fdict["_N"])
         node_mask_b = (seq_idx < true_node_count)
 
         local_mask_b = None
@@ -1140,7 +1136,6 @@ class GraphEdgeClassifier(nn.Module):
                 hidden=int(self.hidden),
                 depth=int(self.depth),
                 dropout=float(self.dropout),
-                use_residual=True,
                 directed=bool(getattr(self, "directed", False)),
                 learnable_layer_norm=bool(getattr(self, "learnable_layer_norm", True))
             )
@@ -1590,7 +1585,7 @@ def _gnn_eval_split(
                 else:
                     y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(torch.float32)
 
-                A_single = A_enc[0] if A_enc.dim() == 3 else A_enc
+                A_single = A_enc[0]
                 z_sel = torch.nan_to_num(
                     model.score_pairs_on_demand(Z, A_single, i_idx, j_idx),
                     nan=0.0, posinf=30.0, neginf=-30.0
@@ -1755,7 +1750,6 @@ def train_one_gnn(
     """
     _t_model_start = time.monotonic()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg = _coerce_train_cfg(cfg)
 
     is_directed = bool(getattr(task, "directed", False))
     edges_only = bool(getattr(task, "eval_on_existing_edges_only", False))
@@ -1899,7 +1893,7 @@ def train_one_gnn(
         sel_val = float(val_metrics.get("f1", float("nan")))
         if np.isfinite(sel_val) and sel_val > best_val:
             best_val = sel_val
-            best_thr = thr if thr is not None else (None if num_classes > 1 else last_known_thr)
+            best_thr = thr
             best_val_metrics = dict(val_metrics)
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             no_improve = 0
@@ -1981,12 +1975,10 @@ def train_one_gnn_edges(
     """
     _t_model_start = time.monotonic()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg = _coerce_train_cfg(cfg)
 
     is_directed = bool(getattr(task, "directed", False))
     edges_only = bool(getattr(task, "eval_on_existing_edges_only", False))
     num_classes = int(getattr(task, "num_classes", 1))
-    cfg.batch_size = 1
 
     train_loader, val_loader, test_loader = loaders
     probe_loader = _pick_probe_loader(train_loader, val_loader, test_loader)
@@ -2100,21 +2092,16 @@ def train_one_gnn_edges(
                 if i_idx.numel() == 0:
                     continue
 
-                A_single = A_enc[0] if A_enc.dim() == 3 else A_enc
+                A_single = A_enc[0]
                 scores = model.score_pairs_on_demand(Z, A_single, i_idx, j_idx)
 
                 # 4. Loss
                 if num_classes > 1:
                     y_target = y_sel.long()
-                    if y_target.numel() == 0:
-                        continue
                     loss = criterion(scores, y_target)
                     bs = int(y_target.numel())
                 else:
                     y_target = (y_sel > 0.5).float()
-                    if y_target.numel() == 0:
-                        continue
-
                     if ratio is not None and ratio > 0:
                         loss = nn.BCEWithLogitsLoss()(scores, y_target)
                     else:
@@ -2158,7 +2145,7 @@ def train_one_gnn_edges(
         sel_val = float(val_metrics.get("f1", float("nan")))
         if np.isfinite(sel_val) and sel_val > best_val:
             best_val = sel_val
-            best_thr = thr if thr is not None else (None if num_classes > 1 else last_known_thr)
+            best_thr = thr
             best_val_metrics = dict(val_metrics)
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             no_improve = 0
@@ -2490,7 +2477,8 @@ def _infer_feature_schema(
 ) -> Dict[str, Any]:
     """
     Inspect batches across one or more loaders and build a fixed schema:
-      - node_keys: ordered list of keys that should produce one (N,1) column each
+      - node_keys: ordered list of node-feature keys
+      - node_dims: number of node feature columns each node key contributes
       - edge_keys: ordered list of keys that should produce one (N,N) channel each
 
     When `requested_keys` is provided, the scanner maintains a shrinking set of
@@ -2548,7 +2536,7 @@ def _infer_feature_schema(
                 edge_keys.append(k)
             return
 
-        if t.dim() == 0 or (t.dim() == 2 and t.shape == (1, 1) and k not in FeatureRegistry.CANONICAL) or t.dim() == 1:
+        if t.dim() == 0 or (t.dim() == 2 and t.shape == (1, 1) and not (k in FeatureRegistry.CANONICAL or k in ("adj", "mask"))) or t.dim() == 1:
             if k not in seen_nodes:
                 seen_nodes.add(k)
                 node_keys.append(k)
@@ -2559,7 +2547,7 @@ def _infer_feature_schema(
             return
 
         r, c = int(t.shape[0]), int(t.shape[1])
-        if r == c and (k in FeatureRegistry.CANONICAL or k == "adj"):
+        if r == c and (k in FeatureRegistry.CANONICAL or k in ("adj", "mask")):
             if k not in seen_edges:
                 seen_edges.add(k)
                 edge_keys.append(k)
