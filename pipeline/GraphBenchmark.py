@@ -540,10 +540,7 @@ class GraphBenchmark:
         idx = np.arange(n)
         rng = np.random.default_rng(seed)
         rng.shuffle(idx)
-
         r0, r1, r2 = (Decimal(str(float(r))) for r in ratios)
-        if min(r0, r1, r2) < 0 or abs(r0 + r1 + r2 - 1) > Decimal("1e-6"):
-            raise ValueError(f"[PIPELINE SPLIT CONFIG] ratios must be non-negative and sum to 1.0; got {tuple(ratios)}.")
 
         requested = (r0, r1, r2)
         if n < sum(r > 0 for r in requested):

@@ -109,6 +109,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import networkx as nx
 import time
+from decimal import Decimal
 from ._utils.features import CANONICAL_FEATURES, DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES, pairwise_batch_from_adj, shortest_path_from_adj
 from ._utils.run_lifecycle import begin_or_attach_run, get_active_run_checkpoint_timestamp
 from .GraphBenchmark import GraphBenchmark
@@ -943,6 +944,7 @@ class ProvidedSplitsTask(TaskSpec):
         self.mask_policy = mask_policy  # Optional per-task mask builder. None keeps mask=ones in collate_fn_pad
         self.eval_on_existing_edges_only = bool(eval_on_existing_edges_only)
         self.num_classes = int(num_classes) if num_classes is not None else 1
+        self._seed_user_provided = seed is not None
 
         if seed is None:
             seed = random.randint(0, 2 ** 32 - 1)
@@ -1118,6 +1120,10 @@ class ProvidedSplitsTask(TaskSpec):
         # Generative benchmark path
         if self.num_graphs is None or int(self.num_graphs) < 1:
             raise ValueError("[INVALID CONFIGURATION] Generated datasets require num_graphs >= 1.")
+
+        r0, r1, r2 = (Decimal(str(float(r))) for r in self.ratios)
+        if min(r0, r1, r2) < 0 or abs(r0 + r1 + r2 - 1) > Decimal("1e-6"):
+            raise ValueError(f"[PIPELINE SPLIT CONFIG] ratios must be non-negative and sum to 1.0; got {tuple(self.ratios)}.")
 
         if int(self.num_graphs) < sum(float(r) > 0.0 for r in self.ratios):
             raise ValueError(
@@ -1673,6 +1679,7 @@ class MatrixFeatureCNN(nn.Module):
         super().__init__()
         assert head_kernel in (1, 3, 5)
         self.num_classes = num_classes
+        self.requires_valid_mask = True
 
         Drop = nn.Identity if dropout <= 0.0 else (lambda: nn.Dropout2d(dropout))
 
@@ -1682,12 +1689,18 @@ class MatrixFeatureCNN(nn.Module):
             Drop(),
             nn.Conv2d(hidden, hidden, 3, padding=1),
             nn.ReLU(inplace=True),
-            Drop(),
+            Drop()
         )
         self.head = nn.Conv2d(hidden, num_classes, kernel_size=head_kernel, padding=head_kernel // 2)
 
-    def forward(self, x_bchw_std: torch.Tensor) -> torch.Tensor:
-        h = self.stem(x_bchw_std)
+    def forward(self, x_bchw_std: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if valid_mask is None:
+            h = self.stem(x_bchw_std)
+        else:
+            h = self.stem[:3](x_bchw_std)
+            h = h.masked_fill(~valid_mask.unsqueeze(1), 0.0)
+            h = self.stem[3:](h)
+            h = h.masked_fill(~valid_mask.unsqueeze(1), 0.0)
         logits = self.head(h)                     # (B, K, N, N) or (B,1,N,N)
         if self.num_classes == 1:
             return logits.squeeze(1)              # (B, N, N)
@@ -1741,6 +1754,7 @@ class PatchTransformer(nn.Module):
         self.use_decoder = bool(use_decoder)
         self.token_policy = token_policy
         self.min_keep_ratio = float(min_keep_ratio)
+        self.requires_valid_mask = True
 
         token_dim = in_channels * self.patch * self.patch  # (C * P * P)
 
@@ -1903,7 +1917,8 @@ class PatchTransformer(nn.Module):
         return pe2d
 
     # -------------------- forward --------------------
-    def forward(self, x_bchw_std: torch.Tensor, _task_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x_bchw_std: torch.Tensor, _task_mask: Optional[torch.Tensor],
+                valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         x_bchw_std : (B, C, N, N) standardised BCHW
         _task_mask : (B, N, N) bool/float — used only to decide which tiles are kept as tokens
@@ -1918,15 +1933,25 @@ class PatchTransformer(nn.Module):
         elif self.token_policy == "auto":
             base = (_task_mask.to(device=device, dtype=torch.bool)
                     if _task_mask is not None else torch.zeros(B, N, N, dtype=torch.bool, device=device))
-            keep_ratio_per_graph = base.float().mean(dim=(1, 2))
+            if valid_mask is None:
+                keep_ratio_per_graph = base.float().mean(dim=(1, 2))
+            else:
+                keep_ratio_per_graph = (
+                    (base & valid_mask).sum(dim=(1, 2)).float() / valid_mask.sum(dim=(1, 2)).clamp_min(1)
+                )
             meets_threshold = (keep_ratio_per_graph > self.min_keep_ratio).view(B, 1, 1)
             m = torch.where(meets_threshold, base, torch.ones((B, N, N), dtype=torch.bool, device=device))
         else:  # "from_mask"
-            if _task_mask is not None and _task_mask.any():
+            if _task_mask is not None:
                 m = _task_mask.to(device=device, dtype=torch.bool)
+                has_supervision = m.flatten(1).any(dim=1)
+                m = torch.where(has_supervision[:, None, None], m, torch.ones_like(m))
             else:
-                # Historical safety fallback: if mask is absent or empty, keep all.
+                # Historical safety fallback: if mask is absent, keep all.
                 m = torch.ones((B, N, N), dtype=torch.bool, device=device)
+
+        if valid_mask is not None:
+            m = m & valid_mask
 
         # Pad features + mask to multiples of self.patch (kernel). (Stride may be <= self.patch; unfold handles it.)
         x_pad, m_pad, H_orig, W_orig = self._pad_features_and_mask(x_bchw_std, m)
@@ -1936,6 +1961,16 @@ class PatchTransformer(nn.Module):
         # Patchify
         tokens, tok_keep, SS = self._patchify(x_pad, m_pad)   # tokens: (B, L, C*P*P)
         Sr, Sc = SS
+        if valid_mask is not None:
+            real_n = valid_mask[:, 0, :].sum(dim=1)
+            padded_n = ((real_n + self.patch - 1) // self.patch) * self.patch
+            own_grid = (padded_n - self.patch) // self.stride + 1
+            rows = torch.arange(Sr, device=device).view(1, Sr, 1)
+            cols = torch.arange(Sc, device=device).view(1, 1, Sc)
+            tok_keep = tok_keep & (
+                (rows < own_grid[:, None, None])
+                & (cols < own_grid[:, None, None])
+            ).reshape(B, -1)
         L = tokens.size(1)
 
         if L > self.max_tokens:
@@ -2222,11 +2257,25 @@ def forward_logits_common(
         # ------------------------------
         x_bchw_std = registry.standardise_bchw(x_bchw)
 
+    valid_mask = None
+    if getattr(model, "requires_valid_mask", False):
+        sizes = [int(f["_N"]) for f in feats]
+        if min(sizes) < A.size(-1):
+            node_ids = torch.arange(A.size(-1), device=A.device)
+            valid_nodes = node_ids.unsqueeze(0) < torch.as_tensor(sizes, device=A.device).unsqueeze(1)
+            valid_mask = valid_nodes.unsqueeze(2) & valid_nodes.unsqueeze(1)
+            x_bchw_std = x_bchw_std.masked_fill(~valid_mask.unsqueeze(1), 0.0)
+
     # ------------------------------
     # 4) Forward through the selected head - TX can optionally take a task mask
     # ------------------------------
     if model_key == "transformer":
-        logits = model(x_bchw_std, _task_mask=m_in)
+        if valid_mask is None:
+            logits = model(x_bchw_std, _task_mask=m_in)
+        else:
+            logits = model(x_bchw_std, _task_mask=m_in, valid_mask=valid_mask)
+    elif valid_mask is not None:
+        logits = model(x_bchw_std, valid_mask=valid_mask)
     else:
         logits = model(x_bchw_std)
 
@@ -2286,7 +2335,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     # -----------------------------------------------------------------------------
     # 2) Effective input-channel semantics
     # -----------------------------------------------------------------------------
-    # There are THREE distinct “masks”/concepts:
+    # There are four distinct masks:
     #   (A) Supervision/Evaluation mask  → built by effective_mask(...). Always used.
     #       - Controls which (i,j) pairs contribute to loss/metrics.
     #       - Not an input feature. Independent of everything below.
@@ -2298,6 +2347,10 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     #   (C) *Mask input channel*         → a BCHW feature channel named "mask".
     #       - Controlled by cfg.use_mask_channel (None ⇒ infer per model).
     #       - If ON, we append the 0/1 mask matrix as a feature channel to the input tensor.
+    #
+    #   (D) Padding-validity mask         → derived from per-graph _N metadata.
+    #       - Used by models declaring requires_valid_mask=True in mixed-size batches.
+    #       - Distinguishes real graph positions from artificial batch padding.
     #
     # Adjacency input channel (“adj”):
     #   - Task gate:    hooks.allow_adj_channel  (applies to ALL models when True)
@@ -3590,6 +3643,14 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
             _model_elapsed = elapsed
 
         elif mk == "rf":
+            if getattr(task, "_seed_user_provided", False):
+                print(
+                    "[INFO] A fixed seed controls Random Forest construction, but "
+                    "parallel probability prediction (n_jobs=-1) can introduce last-bit "
+                    "floating point differences. Ranking metrics may also differ "
+                    "slightly when scores are nearly tied.",
+                    flush=True
+                )
             edges_only = bool(getattr(task, "eval_on_existing_edges_only", False))
             rf_neg_ratio = getattr(cfg, "rf_neg_pos_ratio", 4.0)
             rf_out = run_random_forest_for_task(
@@ -3615,10 +3676,12 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
             )
             continue
         else:
-            raise ValueError(
-                f"Unknown model key: {mk}. "
-                f"Allowed dense keys are: mlp, deep_mlp, cnn, transformer, rf."
+            print(
+                f"[MODEL SELECTION] Unknown model key {mk!r}; skipping. "
+                f"Allowed dense keys: mlp, deep_mlp, cnn, transformer, rf.",
+                flush=True
             )
+            continue
 
         _cuda_peak_stats(mk.lower())
         _cuda_gc(f"after-{mk.lower()}")

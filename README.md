@@ -545,7 +545,7 @@ Where schema inference is used outside the dense custom-feature path, non-square
 
 ## Masking System
 
-Three distinct mask concepts exist. Confusing them is a common source of errors.
+Four distinct mask concepts exist. Confusing them is a common source of errors.
 
 ### (A) Supervision / Evaluation mask
 
@@ -558,7 +558,7 @@ Built by `effective_mask(mask, A, directed)`. Controls which `(i, j)` pairs cont
 Label validity contract on supported paths:
 
 - This pipeline does **not** use ignore-index labels for padding or masking.
-- Padding is represented by `mask == False`, not by a sentinel target such as `-1`.
+- Collation pads the supervision mask with `False`, but `False` can also mean a valid, unsupervised graph pair. Padding validity is tracked separately using the original node counts (`_N`), not by a sentinel target such as `-1`.
 - `collate_fn_pad(...)` pads `L` with `0` and pads `mask` with `False`.
 - Label and evaluation-mask matrices must be `(N, N)`, matching the adjacency. Roles are assigned positionally, so a mis-shaped matrix is rejected during collation.
 - For multiclass tasks, label matrices must contain finite integer class IDs in `[0, num_classes - 1]`. Invalid values are rejected during collation.
@@ -582,6 +582,20 @@ A BCHW feature channel named `"mask"`, controlled by `cfg.use_mask_channel`:
 - `True` / `False` → explicit override for the neural models; RF never takes the `"mask"` channel and ignores this setting
 
 This is a model input, not a supervision signal.
+
+### (D) Padding-validity mask
+
+For spatial models declaring `requires_valid_mask=True`, the dense forward dispatcher derives a padding-validity mask from the original node counts (`_N`) supplied by `collate_fn_pad`.
+
+The mask is constructed only for batches containing graphs smaller than the batch maximum. It identifies real graph positions independently of supervision, input features, and supervised redaction.
+
+- **CNN:** Padded inputs are zeroed after standardisation, and padded intermediate activations are zeroed between convolution stages.
+- **Patch Transformer:** Padding validity restricts token selection and excludes tokens outside each graph's own patch grid, including when patches overlap. The existing `keep_all`, `from_mask`, and `auto` policies still control selection among valid graph tokens.
+- **Other models:** Models without this capability declaration retain their existing forward path. Future models opting in must accept `valid_mask` and apply it wherever their architecture mixes information across spatial positions.
+
+Uniform-size batches retain the original forward path. Mixed-size batching remains supported without dividing batches by graph size.
+
+The padding-validity mask is internal to the model execution path and does not change task files, supervision masks, feature manifests, channel-statistics fitting, or the MLP, Random Forest, and GNN paths.
 
 ---
 
@@ -730,6 +744,8 @@ task = ProvidedSplitsTask(..., seed=42)
 If no seed is provided, a random seed is generated and printed. The seed controls graph generation order, dataset splitting, dataloader shuffling, and model initialisation.
 
 Reproducibility follows the documented run sequence. Constructing a task seeds the relevant random-number generators; starting another top-level run with the same existing task does not rewind those generators to their initial state. Repeating the same execution sequence with the same seed reproduces the same sequence of runs.
+
+**Random Forest reproducibility:** Random Forest uses `n_jobs=-1` for parallel training and prediction. A fixed seed controls forest construction, but parallel probability prediction can accumulate floating point contributions in different orders, causing differences around machine precision. These differences can occasionally affect ranking-based metrics when predicted scores are tied or nearly tied. When Random Forest is selected with an explicitly supplied task seed, the pipeline prints an `[INFO]` message describing this limitation. Parallel execution remains enabled by default to preserve performance.
 
 ---
 
@@ -932,6 +948,7 @@ The following are **not currently supported**. If you need one, open an issue an
 - **Stronger GNN supervision redaction.** `gnn_zero_supervised` redacts the shared adjacency path but does not automatically blank all supervised edge-feature tensors.
 - **Configurable leading metric for the GNN pipeline.** The GNN pipeline is currently fixed to validation F1 for threshold tuning and checkpoint selection.
 - **Configurable self-loop supervision policy.** Undirected evaluation excludes diagonal pairs; directed evaluation includes them only where `A[i, i] > 0`.
+- **Strict Random Forest prediction reproducibility.** Provide an optional deterministic probability aggregation mechanism that eliminates thread scheduling-dependent floating point differences while retaining parallel execution where possible.
 
 **Data support and graph generation**
 
