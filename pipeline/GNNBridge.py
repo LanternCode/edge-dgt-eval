@@ -1376,8 +1376,6 @@ class GraphEdgeClassifier(nn.Module):
 
         def _gather(deg_u: torch.Tensor, deg_v: torch.Tensor) -> torch.Tensor:
             """Stack the requested features in key order, with the per-node slots taken from deg_u/deg_v."""
-            if not keys:
-                return Z.new_zeros((int(src.numel()), 0))
             slots = {"deg_row": deg_u, "deg_col": deg_v, **pair_feats}
             return torch.stack([slots[k] for k in keys], dim=1).to(Z.dtype)
 

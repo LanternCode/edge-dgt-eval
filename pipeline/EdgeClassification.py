@@ -353,7 +353,7 @@ def _build_meta(
         manifest=manifest,
         use_mask_channel=bool(getattr(registry, "use_mask_channel", False)),
         directed=bool(getattr(registry, "directed", True)),
-        supervised_redaction_policy=str(getattr(registry, "supervised_redaction_policy", "adj_only")),
+        supervised_redaction_policy=str(getattr(registry, "supervised_redaction_policy", "adj_and_derived")),
 
         # task semantics
         task=_task_to_meta_dict(task),
@@ -430,7 +430,7 @@ class FeatureRegistry:
     Policies:
         supervised_redaction_policy:
             "all"      → zero every channel at supervised (i,j)
-            "adj_only" → zero only the adjacency input channel during channel assembly [default].
+            "adj_and_derived" → zero only the adjacency input channel during channel assembly [default].
                          Adjacency-derived channels are then computed from that redacted
                          adjacency, while precomputed non-adjacency feature tensors remain visible.
             "none"     → no redaction; all channels remain visible at supervised (i,j)
@@ -451,7 +451,7 @@ class FeatureRegistry:
         self,
         use_mask_channel: Optional[bool] = None,
         directed: bool = False,
-        supervised_redaction_policy: str = "adj_only",
+        supervised_redaction_policy: str = "adj_and_derived",
         custom_feature_types: Optional[Dict[str, str]] = None,
     ):
         # keep tri-state so the training loop can decide per model before fit()
@@ -465,7 +465,7 @@ class FeatureRegistry:
 
         # Redaction policy at the supervised pixel (i,j) for BCHW inputs.
         # "all"      → zero every channel at (i,j)
-        # "adj_only" → zero only the 'adj' channel at (i,j) [default]
+        # "adj_and_derived" → zero only the 'adj' channel at (i,j) [default]
         # "none"     → no redaction; all channels remain visible at (i,j)
         self.supervised_redaction_policy = str(supervised_redaction_policy)
 
@@ -487,7 +487,7 @@ class FeatureRegistry:
           [2..] features from `feature_keys` (expanded; e.g., deg_row/deg_col, cn, ...)
 
         Redaction is controlled by `self.supervised_redaction_policy`:
-        - "adj_only": redact the 'adj' channel at supervised cells before adjacency-derived
+        - "adj_and_derived": redact the 'adj' channel at supervised cells before adjacency-derived
           channels are computed. As a result, channels derived from adjacency inside this
           function also reflect that redaction, while precomputed non-adjacency features do not.
         - "all": redact all 2D per-edge channels (both derived and precomputed).
@@ -506,7 +506,7 @@ class FeatureRegistry:
         mb = mask.to(A.device, non_blocking=True)
 
         # Redact adjacency exactly at the task-mask coordinates
-        if getattr(self, "supervised_redaction_policy", "adj_only") != "none":
+        if getattr(self, "supervised_redaction_policy", "adj_and_derived") != "none":
             adj = adj.masked_fill(mb, 0)
 
         if include_adj:
@@ -647,7 +647,7 @@ class FeatureRegistry:
             out = base
 
         # "all" covers every model-input channel, including the optional 'mask' channel
-        if getattr(self, "supervised_redaction_policy", "adj_only") == "all":
+        if getattr(self, "supervised_redaction_policy", "adj_and_derived") == "all":
             out = out.masked_fill(mb.unsqueeze(1), 0)
         return out
 
@@ -2046,9 +2046,9 @@ class TNNTrainConfig:
 
     # What to zero at the supervised (i,j) pixel when building BCHW inputs:
     #   "all"      → zero every channel at (i,j)
-    #   "adj_only" → zero only the 'adj' channel at (i,j); non-adj features remain visible
+    #   "adj_and_derived" → zero the 'adj' channel at (i,j) before deriving structural features from it
     #   "none"     → no redaction; all channels remain visible at (i,j)
-    supervised_redaction_policy: Literal["all", "adj_only", "none"] = "adj_only"
+    supervised_redaction_policy: Literal["all", "adj_and_derived", "none"] = "adj_and_derived"
 
     # MLPs
     mlp_hidden: int = 128
@@ -2227,7 +2227,7 @@ def forward_logits_common(
 
     Redaction is applied during `registry.stack_channels_BCHW`, before
     standardisation, according to `registry.supervised_redaction_policy`
-    ("all" | "adj_only" | "none").
+    ("all" | "adj_and_derived" | "none").
 
     Returns:
         logits: (B, N, N) for binary heads, or (B, K, N, N) for multiclass heads.
@@ -3601,7 +3601,7 @@ def run_pipeline_for_task(task, models, cfg, *, quiet: bool = False):
     registry = FeatureRegistry(
         use_mask_channel=getattr(cfg, "use_mask_channel", None),
         directed=getattr(task, "directed", True),
-        supervised_redaction_policy=str(getattr(cfg, "supervised_redaction_policy", "adj_only")),
+        supervised_redaction_policy=str(getattr(cfg, "supervised_redaction_policy", "adj_and_derived")),
         custom_feature_types=custom_feature_types
     )
 

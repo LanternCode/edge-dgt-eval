@@ -319,6 +319,8 @@ All GNN encoders produce per-node embeddings that feed into a shared edge decode
 | `edge_tx` | Edge-Masked Transformer | Dense attention restricted to the A+I neighbourhood | Standard `nn.TransformerEncoder` with a structural attention mask |
 | `gps` | GPS / GraphGPS-style encoder | Sparse local GINE-style message passing plus global full self-attention | Uses GPS-owned LapPE/RWSE structural encodings and a shared edge decoder |
 
+Aliases for `gcn`: `graphconv`, `graph_conv`.
+Aliases for `sage`: `graphsage`, `graph_sage`, `gs`.
 Aliases for `edge_tx`: `transformer`, `tx`, `edge-transformer`, `edge_transformer`, `edge-tx`.
 Aliases for `gps`: `graph_gps`, `graph-gps`.
 
@@ -374,7 +376,7 @@ class TNNTrainConfig:
     grad_clip: float = 0.0            # 0 disables
     early_stop_patience: int = 0      # 0 disables
     use_mask_channel: Optional[bool] = None   # None → infer per model
-    supervised_redaction_policy: str = "adj_only"
+    supervised_redaction_policy: str = "adj_and_derived"
     threshold_metric: str = "f1"      # "f1" | "bacc" (tuned on the validation split)
     select_by: str = "f1"             # "f1" | "bacc" | "auroc"
     tx_force_adj_channel: bool = True
@@ -471,7 +473,7 @@ Controls what gets zeroed at supervised `(i, j)` positions in BCHW inputs:
 
 | Policy | Behaviour |
 |--------|----------|
-| `"adj_only"` (default) | Zero the `adj` channel; derived channels reflect that redaction |
+| `"adj_and_derived"` (default) | Zero the `adj` channel; derived channels reflect that redaction |
 | `"all"` | Zero every applicable input channel at task-mask positions |
 | `"none"` | No redaction |
 
@@ -486,7 +488,7 @@ The GNN pipeline uses a separate flag, `cfg.gnn_zero_supervised`, which controls
 | `False` (default) | No redaction; the GNN encoder sees the full observed adjacency |
 | `True` | Zeros the adjacency at supervised `(i, j)` positions before encoding |
 
-`gnn_zero_supervised` controls the shared adjacency path for every GNN encoder. It is analogous to dense `supervised_redaction_policy="adj_only"` only with respect to the adjacency visible to the model; the complete feature representations are not functionally equivalent. GPS computes its LapPE/RWSE and local message-passing topology from the same redacted adjacency. Structural features computed inside GNN feature assembly from that adjacency also reflect the redaction. Edge-feature tensors already present in the sample feature dictionaries, including canonical features materialised during dataset construction, remain as supplied and are not globally blanked or recomputed by `gnn_zero_supervised`.
+`gnn_zero_supervised` controls the shared adjacency path for every GNN encoder. It is analogous to dense `supervised_redaction_policy="adj_and_derived"` only with respect to the adjacency visible to the model; the complete feature representations are not functionally equivalent. GPS computes its LapPE/RWSE and local message-passing topology from the same redacted adjacency. Structural features computed inside GNN feature assembly from that adjacency also reflect the redaction. Edge-feature tensors already present in the sample feature dictionaries, including canonical features materialised during dataset construction, remain as supplied and are not globally blanked or recomputed by `gnn_zero_supervised`.
 
 ### Existing-edge-only evaluation
 
@@ -712,7 +714,7 @@ For non-empty evaluated splits, metrics dicts also carry `_prob` (per-pair predi
 
 ```python
 {
-    "state_dict": { },    # model weights
+    "state_dict": { },    # model state
     "meta": {
         "model_key": "str",
         "best_val_threshold": "float | None",
@@ -723,7 +725,7 @@ For non-empty evaluated splits, metrics dicts also carry `_prob` (per-pair predi
 }
 ```
 
-Saved to `saved_checkpoints/<task.name>/<timestamp>/<model_key>.pth` via `save_pipeline_checkpoint(...)`. The timestamp is `YYYYMMDD_HHMMSS_ffffff`; microsecond precision keeps runs starting within the same second in separate directories. Every checkpoint written during one run shares a single timestamp.
+Saved to `saved_checkpoints/<task.name>/<timestamp>/<model_key>.pth` via `save_pipeline_checkpoint(...)`. The timestamp is `YYYYMMDD_HHMMSS_ffffff`; microsecond precision keeps runs starting within the same second in separate directories. Every checkpoint written during one run shares a single timestamp. Random Forest checkpoints store the fitted scikit-learn estimator under `state_dict["sklearn_model"]`. On PyTorch versions that default to restricted loading, these checkpoints require `torch.load(path, weights_only=False)`.
 
 Common dense-pipeline metadata fields include: `manifest`, `use_mask_channel`, `directed`, `supervised_redaction_policy`, `edges_only`, `seed`, `feature_keys`, `keep_idx`, `eff_in_ch`.
 
@@ -812,10 +814,6 @@ Passing `sage`, `gcn`, `gin`, `edge_tx`, or `gps` to `run_pipeline_for_task` pri
 ### Loader caching within a run
 
 For `ProvidedSplitsTask`, the supported entry points resolve loaders via `_resolve_loaders`, which caches the `(train_loader, val_loader, test_loader)` tuple for the active run. Later attached stages reuse the same DataLoader objects when the requested configuration is compatible. A new top-level run clears that cache.
-
-### Task wrapping and `base_task` traversal
-
-The pipeline supports task wrapping. Some internal utilities inspect `base_task` when the top-level task object does not explicitly define a required property. Metadata serialisation is taken from the top-level task object used by the runner.
 
 ### Canonical feature resolution is schema-level, not per-sample repair
 
@@ -935,7 +933,7 @@ Only the documented runner entry points and task shapes are supported. Direct in
 |-----------|--------------------|
 | `_GCNEncoder`, `_SAGEEncoder`, `_GINEncoder`, `_EdgeMaskedTransformer`, `_GPSEncoder` | Expect pre-normalised adjacency and feature tensors |
 | `_EdgeFeatureDecoder` | Expects node embeddings from a compatible encoder |
-| `GraphEdgeClassifier` | Runtime state (`feature_schema`, `dropedge_p`, `lap_pe_k`, `learnable_layer_norm`, pairwise-mode flags, `decoder_pair_keys`) is injected by the GNN runners after construction; direct instantiation is unsupported |
+| `GraphEdgeClassifier` | `learnable_layer_norm` is passed to the constructor. Additional runtime state (`feature_schema`, `dropedge_p`, `lap_pe_k`, pairwise-mode flags, `decoder_pair_keys`) is injected by the GNN runners after construction; direct instantiation is unsupported |
 | `_eval_split` (`EdgeClassification`) | Coupled to registry state from training setup |
 | `_gnn_eval_split` | Coupled to model attributes set during training |
 | `_build_single_graph_loaders_from_bench` | Assumes `_coerce_bench` has validated inputs |
