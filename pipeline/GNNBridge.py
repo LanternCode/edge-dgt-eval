@@ -1349,6 +1349,9 @@ class GraphEdgeClassifier(nn.Module):
             Logits: (M,) if binary, or (M, K) if multiclass.
         """
         keys = tuple(getattr(self, "decoder_pair_keys", ()))
+        if not keys:
+            empty = Z.new_zeros((int(src.numel()), 0))
+            return self.dec.score_pairs(Z[src], Z[dst], empty, None if self.directed else empty)
 
         # `sum` is not on the autocast allowlist, so counts stay fp32 unless explicitly cast
         is_directed = bool(getattr(self, "directed", False))
