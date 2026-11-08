@@ -780,6 +780,8 @@ The redaction logic is duplicated across pipelines because it integrates at diff
 
 The dense pipeline exposes `cfg.threshold_metric` and `cfg.select_by` for configurable threshold tuning and checkpoint selection. The GNN pipeline uses a fixed validation-F1 policy for both. This is intentional and should not be flagged as an inconsistency.
 
+After training, the dense neural trainer restores the best validation-selected weights when available and re-evaluates the validation split before testing. This provides validation metrics and the binary threshold associated with the restored model. The test split uses that threshold without retuning it; when validation is empty, the binary threshold falls back to 0.5. On deterministic generated datasets, this can repeat the selected epoch's validation computation. The final pass is intentionally retained to support all dataset configurations consistently, including user-provided datasets whose contents may change between accesses. Eliminating it would require additional metric caching, special case handling, and preservation of DataLoader RNG consumption for a limited computational saving.
+
 ### Encoder normalisation in the GNN suite
 
 All GNN encoders use LayerNorm. The single knob `cfg.learnable_layer_norm` controls whether those LayerNorm modules use learnable affine parameters (`True` = learnable, `False` = affine parameters retained but frozen at their initial identity values). This setting is shared across the GNN suite for comparability and does not apply to the dense pipeline. GPS also owns additional structural encoding knobs for LapPE and RWSE.

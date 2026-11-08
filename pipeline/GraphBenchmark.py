@@ -542,6 +542,7 @@ class GraphBenchmark:
         rng.shuffle(idx)
         r0, r1, r2 = (Decimal(str(float(r))) for r in ratios)
 
+        # Validate dataset length: custom generators may return fewer samples than num_graphs
         requested = (r0, r1, r2)
         if n < sum(r > 0 for r in requested):
             raise ValueError(
