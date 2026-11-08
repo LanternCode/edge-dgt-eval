@@ -1677,7 +1677,6 @@ class MatrixFeatureCNN(nn.Module):
         dropout: float = 0.0
     ):
         super().__init__()
-        assert head_kernel in (1, 3, 5)
         self.num_classes = num_classes
         self.requires_valid_mask = True
 
@@ -1931,8 +1930,7 @@ class PatchTransformer(nn.Module):
         if self.token_policy == "keep_all":
             m = torch.ones((B, N, N), dtype=torch.bool, device=device)
         elif self.token_policy == "auto":
-            base = (_task_mask.to(device=device, dtype=torch.bool)
-                    if _task_mask is not None else torch.zeros(B, N, N, dtype=torch.bool, device=device))
+            base = _task_mask.to(device=device, dtype=torch.bool)
             if valid_mask is None:
                 keep_ratio_per_graph = base.float().mean(dim=(1, 2))
             else:
@@ -1942,13 +1940,9 @@ class PatchTransformer(nn.Module):
             meets_threshold = (keep_ratio_per_graph > self.min_keep_ratio).view(B, 1, 1)
             m = torch.where(meets_threshold, base, torch.ones((B, N, N), dtype=torch.bool, device=device))
         else:  # "from_mask"
-            if _task_mask is not None:
-                m = _task_mask.to(device=device, dtype=torch.bool)
-                has_supervision = m.flatten(1).any(dim=1)
-                m = torch.where(has_supervision[:, None, None], m, torch.ones_like(m))
-            else:
-                # Historical safety fallback: if mask is absent, keep all.
-                m = torch.ones((B, N, N), dtype=torch.bool, device=device)
+            m = _task_mask.to(device=device, dtype=torch.bool)
+            has_supervision = m.flatten(1).any(dim=1)
+            m = torch.where(has_supervision[:, None, None], m, torch.ones_like(m))
 
         if valid_mask is not None:
             m = m & valid_mask
@@ -2878,7 +2872,7 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
         pred = prob.argmax(axis=1)
 
         # Metrics
-        acc = float(accuracy_score(y_all, pred)) if y_all.size else float("nan")
+        acc = float(accuracy_score(y_all, pred))
         P_macro = float(precision_score(y_all, pred, average="macro", zero_division=0))
         R_macro = float(recall_score(y_all, pred, average="macro", zero_division=0))
         F1_macro = float(f1_score(y_all, pred, average="macro", zero_division=0))

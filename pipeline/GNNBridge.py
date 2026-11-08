@@ -1183,9 +1183,6 @@ class GraphEdgeClassifier(nn.Module):
                 edge_dim=int(edge_dim)
             )
 
-        else:
-            raise ValueError(f"Unknown encoder_type={et!r}")
-
     def _build_decoder(self, node_dim: int, edge_dim: int) -> _EdgeFeatureDecoder:
         """Factory for the edge decoder using measured embedding dimensions."""
         return _EdgeFeatureDecoder(
@@ -1241,20 +1238,14 @@ class GraphEdgeClassifier(nn.Module):
             mask: torch.Tensor
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         """
-        Shared encode pipeline: schema check, feature assembly, lazy encoder/decoder init, encode.
+        Shared encode pipeline: feature assembly, lazy encoder/decoder init, encode.
 
         Returns:
             Z_batch: List of (N, d) node embeddings per graph.
             E_batch: List of (N, N, Fe) edge features per graph.
             node_mask: (B, N) bool validity mask.
         """
-        schema = getattr(self, "feature_schema", None)
-        if schema is None:
-            raise RuntimeError(
-                "[PIPELINE] GNN execution requires a resolved feature_schema from the pipeline. "
-                "Schema-less structural feature inference is unsupported."
-            )
-
+        schema = self.feature_schema
         is_gps = self.encoder_type == "gps"
         X_batch, E_batch, node_mask = _prepare_features_batch(
             A, feats, mask, schema=schema,
@@ -1944,7 +1935,6 @@ def train_one_gnn(
         "elapsed_seconds": meta["elapsed_seconds"],
         "val": best_val_metrics if best_val_metrics is not None else {
             "f1": float("nan")},
-        "val_best_metric": best_val if best_val_metrics is not None else float("nan"),
         "thr": best_thr,
         "test": test_metrics,
         "ckpt": ckpt_path
@@ -2197,7 +2187,6 @@ def train_one_gnn_edges(
         "elapsed_seconds": meta["elapsed_seconds"],
         "val": best_val_metrics if best_val_metrics is not None else {
             "f1": float("nan")},
-        "val_best_metric": best_val if best_val_metrics is not None else float("nan"),
         "thr": best_thr,
         "test": test_metrics,
         "ckpt": ckpt_path,
