@@ -655,7 +655,8 @@ class _EdgeMaskedTransformer(nn.Module):
         self.enc = nn.TransformerEncoder(
             enc_layer,
             num_layers=depth,
-            norm=nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm)
+            norm=nn.LayerNorm(hidden).requires_grad_(learnable_layer_norm),
+            enable_nested_tensor=False
         )
         self.out = nn.Linear(hidden, out_dim)
         self.register_buffer("_eye_cache", torch.empty(0, 0, dtype=torch.bool), persistent=False)

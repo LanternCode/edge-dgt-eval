@@ -739,13 +739,16 @@ The exact `meta` payload is pipeline-specific; only `state_dict`, `model_key`, `
 
 ```python
 task = ProvidedSplitsTask(..., seed=42)
-# Internally calls seed_everything(42), which locks:
-#   random, np.random, torch.manual_seed, CUDA seeds, cuDNN deterministic mode
+# Internally calls seed_everything(42), which configures:
+#   Python, NumPy and PyTorch seeds, cuDNN determinism,
+#   warning-only deterministic algorithms, and CUDA cuBLAS workspace
 ```
 
 If no seed is provided, a random seed is generated and printed. The seed controls graph generation order, dataset splitting, dataloader shuffling, and model initialisation.
 
 Reproducibility follows the documented run sequence. Constructing a task seeds the relevant random-number generators; starting another top-level run with the same existing task does not rewind those generators to their initial state. Repeating the same execution sequence with the same seed reproduces the same sequence of runs.
+
+**GPU reproducibility:** The pipeline enables `torch.use_deterministic_algorithms(True, warn_only=True)` to select deterministic implementations where available. Unsupported operations generate PyTorch warnings and execution continues; exact reproducibility is not guaranteed. Deterministic implementations may reduce performance. On CUDA, the pipeline sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` (32 MiB per workspace allocation) if the variable is unset, preserving user configuration. CPU-only runs do not configure cuBLAS. The workspace configuration is established during task initialization, before the framework's CUDA computations.
 
 **Random Forest reproducibility:** Random Forest uses `n_jobs=-1` for parallel training and prediction. A fixed seed controls forest construction, but parallel probability prediction can accumulate floating point contributions in different orders, causing differences around machine precision. These differences can occasionally affect ranking-based metrics when predicted scores are tied or nearly tied. When Random Forest is selected with an explicitly supplied task seed, the pipeline prints an `[INFO]` message describing this limitation. Parallel execution remains enabled by default to preserve performance.
 

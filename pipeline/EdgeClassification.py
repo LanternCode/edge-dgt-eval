@@ -97,6 +97,7 @@ Directed GNN convention:
     Directed propagation/attention follows row i, so node i aggregates or attends over
     its outgoing neighbors unless a model states otherwise.
 """
+import os
 import copy
 import inspect
 import gc
@@ -134,7 +135,9 @@ def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
     if torch.cuda.is_available():
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
@@ -1264,8 +1267,8 @@ def _normalise_feature_spec(x, directed: bool) -> Tuple[List[str], Dict[str, str
             raise TypeError(
                 f"[FEATURE SET] Entries must be feature-name strings or (name, type) custom declarations; got {item!r}."
             )
-        if item == "_N":
-            raise ValueError("[FEATURE SET] '_N' is reserved internal metadata and cannot be requested as a feature.")
+        if item in reserved_custom_names and item != "adj":
+            raise ValueError(f"[FEATURE SET] '{item}' is reserved by the pipeline and cannot be requested as a feature.")
         if item == "powers":
             expanded += ["power_2", "power_3", "power_4", "power_5"]
         elif item == "endpoint_degree":
