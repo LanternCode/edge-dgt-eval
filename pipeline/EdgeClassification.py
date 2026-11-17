@@ -800,10 +800,10 @@ class FeatureRegistry:
             Tensor with same shape as E, z-scored per graph per channel.
         """
         B, H, W, C = E.shape
-        flat = E.reshape(B, H * W, C)
+        flat = E.reshape(B, H * W, C).to(torch.float64)
 
         # Reshape explicitly to match H*W to avoid accidental mismatches.
-        m = mask.reshape(B, H * W, 1).to(device=E.device, dtype=E.dtype)
+        m = mask.reshape(B, H * W, 1).to(device=E.device, dtype=flat.dtype)
 
         # Avoid empty division
         count = torch.clamp(m.sum(dim=1, keepdim=True), min=1.0)
@@ -811,7 +811,7 @@ class FeatureRegistry:
         var = ((flat - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
 
         std = torch.clamp(var.sqrt(), min=1e-8)
-        return ((flat - mean) / std).reshape(B, H, W, C)
+        return ((flat - mean) / std).masked_fill(m == 0, 0.0).reshape(B, H, W, C).to(E.dtype)
 
     @staticmethod
     def zscore_nodes_per_graph(X: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -831,15 +831,16 @@ class FeatureRegistry:
         if n_feat == 0:
             return X
 
-        m0 = mask.to(X.device, non_blocking=True)
+        work = X.to(torch.float64)
+        m0 = mask.to(device=X.device, dtype=torch.bool, non_blocking=True)
         m = m0.view(B, N, 1).expand_as(X)
 
-        count = torch.clamp(m.sum(dim=1, keepdim=True).to(X.dtype), min=1.0)
-        mean = (X * m).sum(dim=1, keepdim=True) / count
-        var = ((X - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
+        count = torch.clamp(m.sum(dim=1, keepdim=True).to(work.dtype), min=1.0)
+        mean = (work * m).sum(dim=1, keepdim=True) / count
+        var = ((work - mean) ** 2 * m).sum(dim=1, keepdim=True) / count
 
         std = torch.clamp(var.sqrt(), min=1e-8)
-        out = ((X - mean) / std)
+        out = ((work - mean) / std).masked_fill(~m, 0.0).to(X.dtype)
 
         return out
 

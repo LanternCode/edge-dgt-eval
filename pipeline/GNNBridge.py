@@ -392,7 +392,6 @@ def _assemble_features_for_graph(
     X_b = X.unsqueeze(0)
     X_mask_b = nm_vec.view(1, N)
     X = FeatureRegistry.zscore_nodes_per_graph(X_b, mask=X_mask_b).squeeze(0)
-    X = X * nm_vec.view(N, 1).to(X.dtype)
 
     # Sanitise and per-graph z-score (edge-wise) combined
     E_local = None
@@ -402,8 +401,8 @@ def _assemble_features_for_graph(
 
         if extra_edge_mask is not None:
             xm_bool = extra_edge_mask.to(device=E.device, dtype=torch.bool)
-            flat = E_b.reshape(1, N * N, E.size(-1))
-            xm = xm_bool.reshape(1, N * N, 1).to(E.dtype)
+            flat = E_b.reshape(1, N * N, E.size(-1)).to(torch.float64)
+            xm = xm_bool.reshape(1, N * N, 1).to(flat.dtype)
 
             count = torch.clamp(xm.sum(dim=1, keepdim=True), min=1.0)
             mean = (flat * xm).sum(dim=1, keepdim=True) / count
@@ -411,12 +410,11 @@ def _assemble_features_for_graph(
             std = torch.clamp(var.sqrt(), min=1e-8)
 
             edge_ids = torch.nonzero(xm_bool.reshape(-1), as_tuple=False).view(-1)
-            edge_attr = (flat[0, edge_ids] - mean[0, 0]) / std[0, 0]
+            edge_attr = ((flat[0, edge_ids] - mean[0, 0]) / std[0, 0]).to(E.dtype)
             E_local = (edge_ids, edge_attr)
 
         E_mask_b = em_bool.unsqueeze(0)
         E = FeatureRegistry.zscore_edges_per_graph(E_b, mask=E_mask_b).squeeze(0)
-        E = E * em_bool.unsqueeze(-1).to(E.dtype)
 
     if extra_edge_mask is not None:
         return X, (E, E_local)
