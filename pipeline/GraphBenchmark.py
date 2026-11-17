@@ -45,15 +45,17 @@ class GraphBenchmark:
         shape_cycle_removal_prob: float = 0.30
     ):
         self.show_progress = show_progress
-        self.graph_types = graph_types or [
+        self._default_graph_types = [
             'erdos_renyi', 'barabasi_albert', 'watts_strogatz',
             'random_regular', 'stochastic_block', 'powerlaw_cluster',
             'random_geometric', 'balanced_tree', 'tree_plus_chords',
             'shape_cycle',
         ]
-        
+        self.graph_types = list(graph_types or self._default_graph_types)
+
         # Shape completion settings (used when graph_type == 'shape_cycle')
-        self.shape_cycle_shapes = shape_cycle_shapes or ["triangle", "square", "pentagon", "hexagon"]
+        self._shape_lengths = {'triangle': 3, 'square': 4, 'pentagon': 5, 'hexagon': 6}
+        self.shape_cycle_shapes = list(shape_cycle_shapes or self._shape_lengths)
         self.shape_cycle_removal_prob = float(shape_cycle_removal_prob)
 
         # Warning state tracking
@@ -234,20 +236,16 @@ class GraphBenchmark:
             return G
 
         elif graph_type == 'shape_cycle':
-            shape_to_len = {'triangle': 3, 'square': 4, 'pentagon': 5, 'hexagon': 6}
+            shape_to_len = self._shape_lengths
 
             # 1. Validation & Selection
             valid_shapes = []
             for s in self.shape_cycle_shapes:
-                if s in shape_to_len and shape_to_len[s] <= num_nodes:
+                if shape_to_len[s] <= num_nodes:
                     valid_shapes.append(s)
-                else:
-                    if s not in self._warned_shapes:
-                        if s in shape_to_len:
-                            print(f"[WARN] '{s}' requires {shape_to_len[s]} nodes but N={num_nodes}; skipping this shape.")
-                        else:
-                            print(f"[WARN] '{s}' is an undefined shape; skipping.")
-                        self._warned_shapes.add(s)
+                elif s not in self._warned_shapes:
+                    print(f"[WARN] '{s}' requires {shape_to_len[s]} nodes but N={num_nodes}; skipping this shape.")
+                    self._warned_shapes.add(s)
 
             if not valid_shapes:
                 raise ValueError(
@@ -343,6 +341,25 @@ class GraphBenchmark:
         min_nodes: int,
         max_nodes: int
     ) -> List[Tuple[str, int]]:
+        if (
+            type(self).sample_specs is GraphBenchmark.sample_specs
+            and type(self).generate_graph is GraphBenchmark.generate_graph
+            and type(self).generate_dataset is GraphBenchmark.generate_dataset
+        ):
+            for configured, allowed, kind in (
+                (self.graph_types, self._default_graph_types, "graph family"),
+                (self.shape_cycle_shapes, self._shape_lengths, "shape"),
+            ):
+                for name in configured[:]:
+                    if name not in allowed:
+                        print(f"[ERROR] Unknown {kind} '{name}'; skipping.")
+                        configured.remove(name)
+            if not self.shape_cycle_shapes and "shape_cycle" in self.graph_types:
+                print("[WARN] No recognised shape names remain; dropping 'shape_cycle'.")
+                self.graph_types = [name for name in self.graph_types if name != "shape_cycle"]
+            if not self.graph_types:
+                raise ValueError("[DATASET GENERATOR] No valid graph families remain.")
+
         sizes = np.random.randint(min_nodes, max_nodes + 1, size=num_graphs)
         return [(random.choice(self.graph_types), int(N)) for N in sizes]
 
