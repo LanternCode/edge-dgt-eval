@@ -483,7 +483,7 @@ class GraphBenchmark:
                 F_extra = {}
 
             F = {k: (v.astype(np.float32) if v is not None else None) for k, v in F_extra.items()}
-            L = fast_label_fn(A_obs, A_true, G_true).astype(np.float32, copy=False)
+            L = np.array(fast_label_fn(A_obs, A_true, G_true), copy=True)
             if L.shape != A_obs.shape:
                 raise ValueError(
                     f"[LABEL SHAPE] hooks.label_fn returned {L.shape} for graph {i}/{total} "
@@ -509,7 +509,7 @@ class GraphBenchmark:
         class _GBBuilt(Dataset):
             def __init__(self, Gs, Ls, Fs):
                 self.Gs = list(Gs)
-                self.Ls = [np.array(l, copy=True) for l in Ls]
+                self.Ls = list(Ls)
                 self.Fs = list(Fs)
 
             def __len__(self):
