@@ -149,6 +149,8 @@ class GraphBenchmark:
                         if rng.random() < p:
                             choices = [n for n in range(num_nodes) if n != u and not G.has_edge(u, n)]
                             if choices: v = rng.choice(choices)
+                        if G.has_edge(u, v):
+                            v = (u + 1) % num_nodes
                         G.add_edge(u, v)
                 return G
             k = rng.randint(2, min(num_nodes - 1, 6))
