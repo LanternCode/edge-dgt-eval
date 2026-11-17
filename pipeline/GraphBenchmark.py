@@ -476,20 +476,24 @@ class GraphBenchmark:
 
             # Lock in Ground Truth (Output of Phase 3)
             G.remove_edges_from(list(nx.selfloop_edges(G)))
+            node_order = list(G)
+            if set(node_order) == set(range(len(node_order))):
+                node_order = list(range(len(node_order)))
+
             if 'complete_adj' in G.graph:
-                A_obs = self._sanitise_adj(nx.to_numpy_array(G, dtype=np.float32), nx.is_directed(G))
+                A_obs = self._sanitise_adj(nx.to_numpy_array(G, nodelist=node_order, dtype=np.float32), nx.is_directed(G))
                 # Background-forest and stitched edges live only in G
                 A_true = np.maximum(G.graph['complete_adj'], A_obs)
                 G_true = nx.DiGraph() if is_dir else nx.Graph()
                 G_true.add_nodes_from(G.nodes(data=True))
                 G_true.graph.update(G.graph)
                 I, J = np.where(A_true > 0)
-                G_true.add_edges_from(zip(I.tolist(), J.tolist()))
+                G_true.add_edges_from((node_order[i], node_order[j]) for i, j in zip(I, J))
                 A_true = self._sanitise_adj(A_true, nx.is_directed(G_true))
             else:
                 G_true = G.copy()
                 A_true = self._sanitise_adj(
-                    nx.to_numpy_array(G_true, dtype=np.float32), nx.is_directed(G_true)
+                    nx.to_numpy_array(G_true, nodelist=node_order, dtype=np.float32), nx.is_directed(G_true)
                 )
                 A_obs = A_true.copy()
 
