@@ -403,10 +403,12 @@ def save_pipeline_checkpoint(model_key: str, state_dict: dict, task: Any, cfg: A
 
 
 def _pos_weight(y: torch.Tensor) -> torch.Tensor:
-    pos = y.sum().to(dtype=torch.float32)
-    neg = float(y.numel()) - pos
+    pos_count = torch.count_nonzero(y)
+    neg_count = y.numel() - pos_count
+    pos = pos_count.to(dtype=torch.float32)
+    neg = neg_count.to(dtype=torch.float32)
     w = neg / pos.clamp_min(1.0)
-    w = torch.where((pos > 0) & (neg > 0), w, torch.ones_like(w))
+    w = torch.where((pos_count > 0) & (neg_count > 0), w, torch.ones_like(w))
 
     # Clamp to prevent gradient explosion
     return torch.clamp(w, min=1e-3, max=1e3)
