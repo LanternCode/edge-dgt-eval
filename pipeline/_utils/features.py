@@ -32,6 +32,12 @@ UNDIRECTED_AUTO_FEATURES = (
 )
 
 
+def _prepare_numpy_array(value):
+    if isinstance(value, np.ndarray) and min(value.strides, default=0) < 0:
+        return value.copy()
+    return value
+
+
 @lru_cache(maxsize=512)
 def _shortest_path_cached(packed_adj: bytes, n: int, is_directed: bool) -> np.ndarray:
     A01 = np.unpackbits(

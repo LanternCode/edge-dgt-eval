@@ -111,7 +111,7 @@ import torch.nn.functional as F
 import networkx as nx
 import time
 from decimal import Decimal
-from ._utils.features import CANONICAL_FEATURES, DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES, pairwise_batch_from_adj, shortest_path_from_adj
+from ._utils.features import CANONICAL_FEATURES, DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES, _prepare_numpy_array, pairwise_batch_from_adj, shortest_path_from_adj
 from ._utils.run_lifecycle import begin_or_attach_run, get_active_run_checkpoint_timestamp
 from .GraphBenchmark import GraphBenchmark
 from types import SimpleNamespace
@@ -186,7 +186,7 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
         if isinstance(x, torch.Tensor):
             t = x
         else:
-            t = torch.from_numpy(np.asarray(x))
+            t = torch.from_numpy(_prepare_numpy_array(np.asarray(x)))
 
         if t.ndim != 2 or t.shape[0] != t.shape[1]:
             raise ValueError("First element must be an NxN adjacency/label matrix.")
@@ -228,7 +228,7 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
                 vv = np.asarray(v)
                 if np.issubdtype(vv.dtype, np.number) or np.issubdtype(vv.dtype, np.bool_):
                     # Only convert to a PyTorch tensor if the data is actually numeric
-                    feats_t[k] = torch.from_numpy(vv).float()
+                    feats_t[k] = torch.from_numpy(_prepare_numpy_array(vv)).float()
                 else:
                     # Safely pass strings, dicts, or custom objects through untouched
                     feats_t[k] = v
@@ -268,7 +268,7 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
         if M is None:
             M = torch.ones((N, N), dtype=torch.bool)
         else:
-            M = torch.as_tensor(M).bool()
+            M = torch.as_tensor(_prepare_numpy_array(M)).bool()
 
         A_list.append(A.float())
         L_list.append(L)
@@ -1003,7 +1003,7 @@ class ProvidedSplitsTask(TaskSpec):
             if isinstance(x, (list, tuple, dict, Dataset)):
                 return False
             try:
-                t = x if isinstance(x, torch.Tensor) else torch.as_tensor(np.asarray(x))
+                t = x if isinstance(x, torch.Tensor) else np.asarray(x)
             except Exception:
                 return False
             return (t.ndim == 2) and (t.shape[0] == t.shape[1])
@@ -1061,7 +1061,7 @@ class ProvidedSplitsTask(TaskSpec):
                     comps = list(item)
 
                     A0 = comps[0]
-                    A_t = A0 if isinstance(A0, torch.Tensor) else torch.as_tensor(np.asarray(A0))
+                    A_t = A0 if isinstance(A0, torch.Tensor) else np.asarray(A0)
                     if A_t.ndim != 2 or A_t.shape[0] != A_t.shape[1]:
                         raise ValueError("First element must be an NxN adjacency matrix.")
                     N = int(A_t.shape[0])
@@ -1333,7 +1333,7 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
     # A: accept numpy or torch; keep on CPU here, models will .to(DEVICE) later.
     A = bench.A
     if not isinstance(A, torch.Tensor):
-        A = torch.as_tensor(A, dtype=torch.float32)
+        A = torch.as_tensor(_prepare_numpy_array(A), dtype=torch.float32)
     else:
         A = A.to(dtype=torch.float32, device='cpu')
 
@@ -1343,7 +1343,7 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
         if k not in safe_splits:
             safe_splits[k] = torch.zeros_like(A, dtype=torch.bool)
 
-    splits = {k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(v)).bool()
+    splits = {k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(_prepare_numpy_array(v))).bool()
             for k, v in safe_splits.items()}
 
     # Normalise requested features and call your extractor on numpy

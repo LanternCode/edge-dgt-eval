@@ -6,7 +6,7 @@ import torch
 import random
 import networkx as nx
 import numpy as np
-from ._utils.features import pairwise_batch_from_adj
+from ._utils.features import _prepare_numpy_array, pairwise_batch_from_adj
 from collections import deque
 from time import perf_counter
 from collections.abc import Sized
@@ -683,7 +683,7 @@ class GraphBenchmark:
             if k in feature_list
         ]
         if pairwise_keys:
-            A_t = torch.as_tensor(adj, dtype=torch.float32)
+            A_t = torch.as_tensor(_prepare_numpy_array(adj), dtype=torch.float32)
             batch = pairwise_batch_from_adj(A_t, pairwise_keys, is_directed=directed)
             for k, v in batch.items():
                 feats[k] = v.cpu().numpy().astype(np.float32)
