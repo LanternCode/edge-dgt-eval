@@ -237,7 +237,7 @@ class GraphBenchmark:
             # 1. Validation & Selection
             valid_shapes = []
             for s in self.shape_cycle_shapes:
-                if shape_to_len.get(s, 999) <= num_nodes:
+                if s in shape_to_len and shape_to_len[s] <= num_nodes:
                     valid_shapes.append(s)
                 else:
                     if s not in self._warned_shapes:

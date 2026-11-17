@@ -3174,7 +3174,7 @@ def run_random_forest_for_task(
             probs = model.predict_proba(X)
             # Handle edge case where some classes might be missing in training
             if probs.shape[1] != num_classes:
-                full_probs = np.zeros((X.shape[0], num_classes), dtype=np.float32)
+                full_probs = np.zeros((X.shape[0], num_classes), dtype=probs.dtype)
                 for i, c in enumerate(model.classes_):
                     if c < num_classes:
                         full_probs[:, c] = probs[:, i]
