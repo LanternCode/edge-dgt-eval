@@ -147,12 +147,12 @@ def seed_everything(seed: int):
 # ============================================================
 # 1) Collate, masks, stacking, channel statistics
 # ============================================================
-def _extract_positional_matrices(comps, N: int) -> List[torch.Tensor]:
+def _extract_positional_matrices(comps, N: int) -> List[Union[np.ndarray, torch.Tensor]]:
     matrices = []
     for c in comps[1:]:
         if isinstance(c, dict):
             continue
-        arr = torch.from_numpy(np.asarray(c)) if not isinstance(c, torch.Tensor) else c
+        arr = c if isinstance(c, torch.Tensor) else np.asarray(c)
         if arr.ndim != 2 or tuple(arr.shape) != (N, N):
             raise ValueError(
                 f"[SAMPLE SHAPE] Sample contains a matrix component of shape {tuple(arr.shape)}; label "
@@ -243,25 +243,32 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
         # Standardise label matrix
         if L is None:
             L = torch.zeros((N, N), dtype=torch.float32)
-        elif L.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
-            L = L.float()
 
         if num_classes > 1:
-            if L.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
-                valid = (L >= 0) & (L < num_classes)
-            else:
+            if isinstance(L, np.ndarray):
+                valid = np.isfinite(L) & (L == np.rint(L)) & (L >= 0) & (L < num_classes)
+            elif L.is_floating_point():
                 valid = torch.isfinite(L) & (L == L.round()) & (L >= 0) & (L < num_classes)
+            else:
+                checked = L.to(dtype=torch.int64)
+                valid = (checked >= 0) & (checked < num_classes)
 
             if not bool(valid.all()):
-                raise ValueError(
-                    f"[INVALID MULTICLASS LABEL] Multiclass labels must be integer class IDs in [0, {num_classes - 1}]."
-                )
+                raise ValueError(f"[INVALID MULTICLASS LABEL] Multiclass labels must be integer class IDs in [0, {num_classes - 1}].")
+            
+            L = (torch.from_numpy(L.astype(np.int64)) if isinstance(L, np.ndarray) else L.to(dtype=torch.int64))
+
+        elif isinstance(L, np.ndarray):
+            L = torch.from_numpy(L.astype(np.float32))
+
+        elif L.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+            L = L.float()
 
         # Standardise evaluation mask
         if M is None:
             M = torch.ones((N, N), dtype=torch.bool)
         else:
-            M = M.bool()
+            M = torch.as_tensor(M).bool()
 
         A_list.append(A.float())
         L_list.append(L)
@@ -1175,7 +1182,7 @@ class ProvidedSplitsTask(TaskSpec):
 
 
 class _SingleGraphDataset(Dataset):
-    def __init__(self, A: torch.Tensor, feats: dict, L: torch.Tensor, mask: torch.Tensor):
+    def __init__(self, A: torch.Tensor, feats: dict, L: Union[np.ndarray, torch.Tensor], mask: torch.Tensor):
         self.A = A
         self.L = L
         self.mask = mask
@@ -1394,7 +1401,7 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
 
     fast_label_fn = GraphBenchmark._compile_label_fn(getattr(hooks, "label_fn", None))
     L_np = fast_label_fn(A_np, A_true_np, G_true)
-    L = torch.as_tensor(L_np, dtype=torch.long if np.issubdtype(L_np.dtype, np.integer) else torch.float32)
+    L = np.array(L_np, copy=True)
 
     # Datasets/loaders (single item each). Use our collate_fn_pad to keep the runner consistent.
     nw = int(num_workers)
@@ -1558,7 +1565,11 @@ def _resolve_loaders(task, cfg, batch_size=None):
             for i in range(len(loader.dataset)):
                 sample = loader.dataset[i]
                 matrices = _extract_positional_matrices(sample, sample[0].shape[0])
-                if matrices and bool(torch.isnan(matrices[0]).any()):
+                if matrices and bool(
+                    torch.isnan(matrices[0]).any()
+                    if isinstance(matrices[0], torch.Tensor)
+                    else np.isnan(matrices[0]).any()
+                ):
                     raise ValueError(
                         f"[INVALID LABEL] NaN detected in {split_name} sample {i} "
                         f"of task '{task.name}'. Exiting the framework."
