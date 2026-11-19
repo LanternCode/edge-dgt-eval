@@ -113,7 +113,7 @@ import time
 from decimal import Decimal
 from ._utils.features import (
     CANONICAL_FEATURES, DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES,
-    pairwise_batch_from_adj, shortest_path_from_adj
+    pairwise_batch_from_adj, shortest_path_from_adj, _prepare_numpy_array
 )
 from ._utils.run_lifecycle import begin_or_attach_run, get_active_run_checkpoint_timestamp
 from .GraphBenchmark import GraphBenchmark
@@ -2103,6 +2103,14 @@ class TNNTrainConfig:
     select_by: Literal["f1", "bacc", "auroc"] = "f1"
 
 
+def _format_training_metric(value: float, *, decimals: int, truncate: bool) -> str:
+    """Format a training metric to fixed precision, optionally truncating toward zero."""
+    if truncate and not math.isnan(value):
+        scale = 10 ** decimals
+        value = int(value * scale) / scale
+    return f"{value:.{decimals}f}"
+
+
 def _format_duration(seconds: float) -> str:
     """Render an elapsed duration as '1d 13h 47m 12s', adding ms under two minutes."""
     total_ms = int(round(float(seconds) * 1000.0))
@@ -2398,14 +2406,7 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
     weight_decay = float(cfg.weight_decay)
     max_grad_norm = float(cfg.grad_clip)
     edges_only = bool(getattr(task, "eval_on_existing_edges_only", False))
-    disp_dec = int(cfg.display_decimals)
-    disp_trunc = bool(cfg.display_truncate)
-
-    def _fmt(v):
-        if disp_trunc and not math.isnan(v):
-            p = 10 ** disp_dec
-            v = int(v * p) / p
-        return f"{v:.{disp_dec}f}"
+    _fmt = partial(_format_training_metric, decimals=int(cfg.display_decimals), truncate=bool(cfg.display_truncate))
 
     # ------------------------------------------------------------
     # 1) Resolve feature_keys for this task and fit registry fresh
@@ -2618,12 +2619,6 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         loss_sum, denom_sum = 0.0, 0
         for A, feats, L, mask in train_loader:
             optimizer.zero_grad(set_to_none=True)
-
-            # Select supervised training indices on the CPU
-            idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
-            if idx_cpu.numel() == 0:
-                continue
-
             with torch.amp.autocast(
                     "cuda",
                     dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -2810,13 +2805,14 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
     denom_sum = 0 if num_classes > 1 else None
     loss_sum = 0.0 if num_classes > 1 else None
 
+    # Skip batches with no supervised pairs before either scoring path runs.
+    idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
+    if idx_cpu.numel() == 0:
+        continue
+
     for A, feats, L, mask in loader:
         # MLP fast path: gather supervised pairs directly, skip full-grid forward
         if model_key in ("mlp", "deep_mlp"):
-            idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
-            if idx_cpu.numel() == 0:
-                continue
-
             b_idx, i_idx, j_idx = idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]
 
             # Build and standardize BCHW on device — same ops as forward_logits_common
@@ -2981,13 +2977,7 @@ def run_random_forest_for_task(
     """
     _t_model_start = time.monotonic()
     train_loader, val_loader, test_loader = loaders
-    d = display_decimals
-
-    def _fmt(v):
-        if display_truncate and not math.isnan(v):
-            p = 10 ** d
-            v = int(v * p) / p
-        return f"{v:.{d}f}"
+    _fmt = partial(_format_training_metric, decimals=display_decimals, truncate=display_truncate)
 
     num_classes = int(getattr(task, "num_classes", 1))
 

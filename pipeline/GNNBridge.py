@@ -1543,6 +1543,7 @@ def _gnn_eval_split(
         A_enc = _redact_supervised_edges(A, mask, zero_supervised)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
+            # Select supervised (batch, source, target) indices from the original adjacency and mask
             idx = _supervised_indices(mask, A, is_directed, edges_only)
             if idx.numel() == 0:
                 continue
@@ -1573,6 +1574,7 @@ def _gnn_eval_split(
                     nan=0.0, posinf=30.0, neginf=-30.0
                 )
 
+            # Move the selected indices to the CPU to gather their labels from L
             idx_cpu = idx.cpu()
             labels = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]]
             if num_classes > 1:
