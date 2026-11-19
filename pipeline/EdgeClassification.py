@@ -2805,12 +2805,12 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
     denom_sum = 0 if num_classes > 1 else None
     loss_sum = 0.0 if num_classes > 1 else None
 
-    # Skip batches with no supervised pairs before either scoring path runs.
-    idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
-    if idx_cpu.numel() == 0:
-        continue
-
     for A, feats, L, mask in loader:
+        # Skip batches with no supervised pairs before either scoring path runs.
+        idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
+        if idx_cpu.numel() == 0:
+            continue
+        
         # MLP fast path: gather supervised pairs directly, skip full-grid forward
         if model_key in ("mlp", "deep_mlp"):
             b_idx, i_idx, j_idx = idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]

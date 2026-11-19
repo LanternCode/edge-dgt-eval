@@ -975,6 +975,7 @@ The following are **not currently supported**. If you need one, open an issue an
 - **Optional label validation preflight.** Allow trusted datasets to skip the exhaustive NaN label scan across train/validation/test during loader resolution. The current mandatory scan can increase startup time and resource consumption for large or lazily generated datasets. Skipping it would remove the guarantee of detecting invalid labels before training.
 - **Per-feature strictness controls for dynamic padding.**
 - **Configurable RF edge cap.** The RF path uses a fixed maximum of 20,000,000 edges. Its capped training collector preallocates the reservoir at that maximum so replacement sampling remains one-pass and in-place. Small training splits reserve the corresponding array address space.
+- **Configurable shortest path cache limits.** The cache currently retains up to 512 entries. Allow users to choose the entry limit and set a byte budget for the packed adjacency keys and distance matrices.
 
 ---
 
