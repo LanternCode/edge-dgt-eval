@@ -113,7 +113,7 @@ import time
 from decimal import Decimal
 from ._utils.features import (
     CANONICAL_FEATURES, DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES,
-    pairwise_batch_from_adj, shortest_path_from_adj, _prepare_numpy_array
+    pairwise_batch_from_adj, shortest_path_from_adj, prepare_numpy_array
 )
 from ._utils.run_lifecycle import begin_or_attach_run, get_active_run_checkpoint_timestamp
 from .GraphBenchmark import GraphBenchmark
@@ -189,7 +189,7 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
         if isinstance(x, torch.Tensor):
             t = x
         else:
-            t = torch.from_numpy(_prepare_numpy_array(np.asarray(x)))
+            t = torch.from_numpy(prepare_numpy_array(np.asarray(x)))
 
         if t.ndim != 2 or t.shape[0] != t.shape[1]:
             raise ValueError("First element must be an NxN adjacency/label matrix.")
@@ -231,7 +231,7 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
                 vv = np.asarray(v)
                 if np.issubdtype(vv.dtype, np.number) or np.issubdtype(vv.dtype, np.bool_):
                     # Only convert to a PyTorch tensor if the data is actually numeric
-                    feats_t[k] = torch.from_numpy(_prepare_numpy_array(vv)).float()
+                    feats_t[k] = torch.from_numpy(prepare_numpy_array(vv)).float()
                 else:
                     # Safely pass strings, dicts, or custom objects through untouched
                     feats_t[k] = v
@@ -273,7 +273,7 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
         if M is None:
             M = torch.ones((N, N), dtype=torch.bool)
         else:
-            M = torch.as_tensor(_prepare_numpy_array(M)).bool()
+            M = torch.as_tensor(prepare_numpy_array(M)).bool()
 
         A_list.append(A.float())
         L_list.append(L)
@@ -1338,7 +1338,7 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
     # A: accept numpy or torch; keep on CPU here, models will .to(DEVICE) later.
     A = bench.A
     if not isinstance(A, torch.Tensor):
-        A = torch.as_tensor(_prepare_numpy_array(A), dtype=torch.float32)
+        A = torch.as_tensor(prepare_numpy_array(A), dtype=torch.float32)
     else:
         A = A.to(dtype=torch.float32, device='cpu')
 
@@ -1348,7 +1348,7 @@ def _build_single_graph_loaders_from_bench(bench, hooks, batch_size: int = 16, n
         if k not in safe_splits:
             safe_splits[k] = torch.zeros_like(A, dtype=torch.bool)
 
-    splits = {k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(_prepare_numpy_array(v))).bool()
+    splits = {k: (v if isinstance(v, torch.Tensor) else torch.as_tensor(prepare_numpy_array(v))).bool()
             for k, v in safe_splits.items()}
 
     # Normalise requested features and call your extractor on numpy
@@ -2619,6 +2619,10 @@ def train_and_eval_one_model(task, registry, loaders, model_key: str, cfg, runti
         loss_sum, denom_sum = 0.0, 0
         for A, feats, L, mask in train_loader:
             optimizer.zero_grad(set_to_none=True)
+            # Skip batches with no supervised pairs before BCHW assembly / model forward
+            idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
+            if idx_cpu.numel() == 0:
+                continue
             with torch.amp.autocast(
                     "cuda",
                     dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -2810,7 +2814,7 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
         idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
         if idx_cpu.numel() == 0:
             continue
-        
+
         # MLP fast path: gather supervised pairs directly, skip full-grid forward
         if model_key in ("mlp", "deep_mlp"):
             b_idx, i_idx, j_idx = idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]
@@ -2854,11 +2858,6 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
         # ------------------------------------------------------------
         # Full-grid path for spatial models (cnn, transformer)
         # ------------------------------------------------------------
-        # Skip batches with no supervised pairs before BCHW assembly / model forward
-        idx_cpu = _supervised_indices(mask, A, registry.directed, edges_only)
-        if idx_cpu.numel() == 0:
-            continue
-
         with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
                                 enabled=torch.cuda.is_available()):
             logits = forward_logits_common(

@@ -32,7 +32,8 @@ UNDIRECTED_AUTO_FEATURES = (
 )
 
 
-def _prepare_numpy_array(value):
+def prepare_numpy_array(value):
+    """Copy NumPy arrays with negative strides before tensor conversion."""
     if isinstance(value, np.ndarray) and min(value.strides, default=0) < 0:
         return value.copy()
     return value
