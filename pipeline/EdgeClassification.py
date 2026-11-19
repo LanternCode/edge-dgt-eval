@@ -1633,12 +1633,28 @@ def _task_to_meta_dict(task):
 # ============================================================
 class MatrixMLPBase(nn.Module):
     """
-    Base class for per-edge Matrix MLPs. Expects self.net to be defined by subclasses.
+    Base class that builds the network and scores selected pairs for both matrix MLPs.
 
     Each edge position is scored independently — there is no spatial coupling between (i, j) pairs.
     Supported training/evaluation paths gather only supervised pairs and score them through
     `_forward_flat`, skipping padding and non-supervised positions.
     """
+    def __init__(self, in_channels: int, hidden_dim: int, *, depth: int,
+                dropout: float, num_classes: int):
+        """Build at least one linear, ReLU and dropout block followed by the output layer."""
+        super().__init__()
+        layers: List[nn.Module] = []
+        in_dim = in_channels
+        for _ in range(max(1, depth)):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(p=dropout))
+            in_dim = hidden_dim
+
+        self.out_dim = num_classes
+        layers.append(nn.Linear(in_dim, self.out_dim))
+        self.net = nn.Sequential(*layers)
+
     def _forward_flat(self, x2d: torch.Tensor) -> torch.Tensor:
         """
         Returns logits on the same device as model parameters.
@@ -1655,37 +1671,16 @@ class MatrixFeatureMLP(MatrixMLPBase):
     """Channels-last MLP over per-edge features."""
 
     def __init__(self, in_channels: int, hidden_dim: int = 128, num_classes: int = 1, dropout: float = 0.1):
-        super().__init__()
-        self.out_dim = 1 if num_classes == 1 else num_classes
-        self.net = nn.Sequential(
-            nn.Linear(in_channels, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, self.out_dim),
-        )
+        """Build the standard per-edge MLP with two hidden layers."""
+        super().__init__(in_channels, hidden_dim, depth=2, dropout=dropout, num_classes=num_classes)
 
 
 class MatrixFeatureDeepMLP(MatrixMLPBase):
     """Deeper MLP with the same device-safe forward as MatrixFeatureMLP."""
     def __init__(self, in_channels: int, hidden_dim: int = 256, depth: int = 4,
                  dropout: float = 0.3, num_classes: int = 1):
-        super().__init__()
-        layers: List[nn.Module] = []
-        h = hidden_dim
-        in_dim = in_channels
-        for _ in range(max(1, depth)):
-            layers.append(nn.Linear(in_dim, h))
-            layers.append(nn.ReLU(inplace=True))
-            layers.append(nn.Dropout(p=dropout))
-            in_dim = h
-
-        self.out_dim = 1 if num_classes == 1 else num_classes
-        layers.append(nn.Linear(in_dim, self.out_dim))
-
-        self.net = nn.Sequential(*layers)
+        """Build the per-edge MLP with the configured hidden depth."""
+        super().__init__(in_channels, hidden_dim, depth=depth, dropout=dropout, num_classes=num_classes)
 
 
 class MatrixFeatureCNN(nn.Module):
@@ -2207,6 +2202,12 @@ def _binary_metrics(
         probs: np.ndarray, *,
         ignore_ranking_errors: bool = False
 ) -> Tuple[Dict[str, float], Dict[str, int]]:
+    """
+    Return binary scores and integer confusion counts for the supplied predictions.
+
+    A one-class split gets NaN for balanced accuracy, AUROC and average precision.
+    With ignore_ranking_errors=True, retain any ranking score computed before an error.
+    """
     tp = int(np.count_nonzero((labels == 1) & (predictions == 1)))
     tn = int(np.count_nonzero((labels == 0) & (predictions == 0)))
     fp = int(np.count_nonzero((labels == 0) & (predictions == 1)))
@@ -2244,6 +2245,13 @@ def _macro_metrics(
         probs: Optional[np.ndarray], *,
         skip_ap_on_auc_error: bool = False
 ) -> Dict[str, float]:
+    """
+    Return macro classification scores and mean one-vs-rest AUROC and average precision.
+
+    Rank only classes with both positive and negative examples. Missing probabilities
+    give NaN for both ranking metrics. With skip_ap_on_auc_error=True, an AUROC
+    error also skips average precision for that class.
+    """
     scores = {
         "F1_macro": f1_score(labels, predictions, average="macro", zero_division=0),
         "P_macro": precision_score(labels, predictions, average="macro", zero_division=0),
@@ -3237,7 +3245,7 @@ def run_random_forest_for_task(
             fixed_thr: Optional[float] = None,
             threshold_metric: str = "f1",
     ) -> Tuple[Optional[float], Dict[str, float]]:
-
+        """Return (threshold, metrics), with a threshold only for binary evaluation without a fixed one."""
         y = np.asarray(labels).astype(np.int32)
 
         # --- Multiclass Path ---
