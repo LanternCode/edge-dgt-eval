@@ -111,7 +111,10 @@ import torch.nn.functional as F
 import networkx as nx
 import time
 from decimal import Decimal
-from ._utils.features import CANONICAL_FEATURES, DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES, _prepare_numpy_array, pairwise_batch_from_adj, shortest_path_from_adj
+from ._utils.features import (
+    CANONICAL_FEATURES, DIRECTED_AUTO_FEATURES, UNDIRECTED_AUTO_FEATURES,
+    pairwise_batch_from_adj, shortest_path_from_adj
+)
 from ._utils.run_lifecycle import begin_or_attach_run, get_active_run_checkpoint_timestamp
 from .GraphBenchmark import GraphBenchmark
 from types import SimpleNamespace
@@ -245,7 +248,9 @@ def collate_fn_pad(batch, *, num_classes: int = 1):
             L = torch.zeros((N, N), dtype=torch.float32)
 
         if num_classes > 1:
-            if isinstance(L, np.ndarray):
+            if (np.iscomplexobj(L) if isinstance(L, np.ndarray) else L.is_complex()):
+                valid = np.array(False)
+            elif isinstance(L, np.ndarray):
                 valid = np.isfinite(L) & (L == np.rint(L)) & (L >= 0) & (L < num_classes)
             elif L.is_floating_point():
                 valid = torch.isfinite(L) & (L == L.round()) & (L >= 0) & (L < num_classes)
@@ -2196,6 +2201,77 @@ def _cuda_gc(tag: str = ""):
             )
 
 
+def _binary_metrics(
+        labels: np.ndarray,
+        predictions: np.ndarray,
+        probs: np.ndarray, *,
+        ignore_ranking_errors: bool = False
+) -> Tuple[Dict[str, float], Dict[str, int]]:
+    tp = int(np.count_nonzero((labels == 1) & (predictions == 1)))
+    tn = int(np.count_nonzero((labels == 0) & (predictions == 0)))
+    fp = int(np.count_nonzero((labels == 0) & (predictions == 1)))
+    fn = int(np.count_nonzero((labels == 1) & (predictions == 0)))
+    n_pos = tp + fn
+    n_neg = tn + fp
+
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, n_pos)
+    both_classes = n_pos > 0 and n_neg > 0
+    auroc = auprc = float("nan")
+    if both_classes:
+        try:
+            auroc = roc_auc_score(labels, probs)
+            auprc = average_precision_score(labels, probs)
+        except Exception:
+            if not ignore_ranking_errors:
+                raise
+
+    scores = {
+        "accuracy": (tp + tn) / max(1, n_pos + n_neg),
+        "precision": precision,
+        "recall": recall,
+        "f1": 2.0 * precision * recall / max(1e-12, precision + recall),
+        "bacc": 0.5 * (recall + tn / n_neg) if both_classes else float("nan"),
+        "auroc": auroc,
+        "auprc": auprc
+    }
+    return scores, {"TP": tp, "TN": tn, "FP": fp, "FN": fn}
+
+
+def _macro_metrics(
+        labels: np.ndarray,
+        predictions: np.ndarray,
+        probs: Optional[np.ndarray], *,
+        skip_ap_on_auc_error: bool = False
+) -> Dict[str, float]:
+    scores = {
+        "F1_macro": f1_score(labels, predictions, average="macro", zero_division=0),
+        "P_macro": precision_score(labels, predictions, average="macro", zero_division=0),
+        "R_macro": recall_score(labels, predictions, average="macro", zero_division=0),
+        "BAcc_macro": balanced_accuracy_score(labels, predictions) if np.unique(labels).size >= 2 else float("nan")
+    }
+    aucs, aps = [], []
+    if probs is not None:
+        for class_id, class_probs in enumerate(probs.T):
+            positive = labels == class_id
+            if not positive.any() or positive.all():
+                continue
+            try:
+                aucs.append(roc_auc_score(positive, class_probs))
+            except Exception:
+                if skip_ap_on_auc_error:
+                    continue
+            try:
+                aps.append(average_precision_score(positive, class_probs))
+            except Exception:
+                pass
+
+    scores["AUC_macro"] = float(np.mean(aucs)) if aucs else float("nan")
+    scores["AUPRC_macro"] = float(np.mean(aps)) if aps else float("nan")
+    scores["f1"] = scores["F1_macro"]
+    return scores
+
+
 def get_optimal_threshold(y_true: np.ndarray, y_prob: np.ndarray, metric: str = "f1", fallback_thr: float = 0.5) -> float:
     """
     Computes the optimal binary classification threshold based on the selected metric.
@@ -2850,83 +2926,25 @@ def _eval_split(model_key, model, loader, registry, edges_only, cfg, feature_key
         # 3) Final predictions at chosen threshold
         pred = (prob >= best_thr)
 
-        # 4) Basic metrics (safe with numpy)
-        tp = np.logical_and(pred == 1, y_all == 1).sum()
-        fp = np.logical_and(pred == 1, y_all == 0).sum()
-        tn = np.logical_and(pred == 0, y_all == 0).sum()
-        fn = np.logical_and(pred == 0, y_all == 1).sum()
-        acc = (tp + tn) / max(1, tp + tn + fp + fn)
-        prec = tp / max(1, tp + fp)
-        rec = tp / max(1, tp + fn)
-        f1 = (2 * prec * rec / max(1e-12, (prec + rec))) if (prec + rec) > 0 else 0.0
-        tnr = tn / max(1, tn + fp)  # specificity/TNR
-
-        # BAcc averages TPR and TNR; one is undefined when a class is absent
-        bacc = 0.5 * (rec + tnr) if ((y_all == 1).any() and (y_all == 0).any()) else float("nan")
-        auroc = float("nan")
-        auprc = float("nan")
-
-        # Need both positives and negatives
-        if (y_all == 1).any() and (y_all == 0).any():
-            try:
-                auroc = roc_auc_score(y_all, prob)
-                auprc = average_precision_score(y_all, prob)
-            except Exception:
-                pass
-
-        return {
-            "loss/edge": float(loss_avg),
-            "accuracy": float(acc), "precision": float(prec), "recall": float(rec), "f1": float(f1),
-            "auroc": auroc, "auprc": auprc, "thr": best_thr, "bacc": float(bacc),
-            "_prob": prob, "_y": y_all.astype(int)
-        }
+        # 4) Basic metrics
+        scores, _ = _binary_metrics(y_all, pred, prob, ignore_ranking_errors=True)
+        metric_keys = ("accuracy", "precision", "recall", "f1", "auroc", "auprc")
+        out = {"loss/edge": float(loss_avg)}
+        out.update((key, scores[key]) for key in metric_keys)
+        out.update(thr=best_thr, bacc=scores["bacc"], _prob=prob, _y=y_all.astype(int))
+        return out
 
     else:
         # Prob and preds
         loss_avg = loss_sum / max(1, denom_sum)
         prob = torch.cat(all_logits_sel, dim=0).numpy()
-        K = prob.shape[1]
-        pred = prob.argmax(axis=1)
-
-        # Metrics
-        acc = float(accuracy_score(y_all, pred))
-        P_macro = float(precision_score(y_all, pred, average="macro", zero_division=0))
-        R_macro = float(recall_score(y_all, pred, average="macro", zero_division=0))
-        F1_macro = float(f1_score(y_all, pred, average="macro", zero_division=0))
-
-        # Balanced accuracy = macro-average recall; guard degenerate splits
-        if len(np.unique(y_all)) >= 2:
-            BAcc_macro = float(balanced_accuracy_score(y_all, pred))
-        else:
-            BAcc_macro = float("nan")
-
-        AUC_macro = float("nan")
-        AUPRC_macro = float("nan")
-        aucs, aprs = [], []
-        for k in range(K):
-            y_bin = (y_all == k).astype(np.int32)
-            # Skip degenerate classes (no pos or no neg)
-            if y_bin.sum() == 0 or (y_bin.size - y_bin.sum()) == 0:
-                continue
-            pk = prob[:, k]
-            try:
-                aucs.append(roc_auc_score(y_bin, pk))
-                aprs.append(average_precision_score(y_bin, pk))
-            except Exception:
-                pass
-
-        if len(aucs):
-            AUC_macro = float(np.mean(aucs))
-
-        if len(aprs):
-            AUPRC_macro = float(np.mean(aprs))
-
-        return {
-            "loss/edge": float(loss_avg), "accuracy": float(acc),
-            "P_macro": P_macro, "R_macro": R_macro, "F1_macro": F1_macro, "f1": F1_macro,
-            "AUC_macro": AUC_macro, "AUPRC_macro": AUPRC_macro, "BAcc_macro": BAcc_macro,
-            "_prob": prob.astype(np.float32), "_y": y_all.astype(int)
-        }
+        predictions = prob.argmax(axis=1)
+        out = {"loss/edge": float(loss_avg), "accuracy": float(accuracy_score(y_all, predictions))}
+        scores = _macro_metrics(y_all, predictions, prob, skip_ap_on_auc_error=True)
+        metric_keys = ("P_macro", "R_macro", "F1_macro", "f1", "AUC_macro", "AUPRC_macro", "BAcc_macro")
+        out.update((key, float(scores[key])) for key in metric_keys)
+        out.update(_prob=prob.astype(np.float32), _y=y_all.astype(int))
+        return out
 
 
 def run_random_forest_for_task(
@@ -3224,39 +3242,12 @@ def run_random_forest_for_task(
 
         # --- Multiclass Path ---
         if num_classes > 1:
-            preds = probs.argmax(axis=1)
-            acc = float(np.mean(preds == y))
-            f1_mac = float(f1_score(y, preds, average="macro", zero_division=0))
-            p_mac = float(precision_score(y, preds, average="macro", zero_division=0))
-            r_mac = float(recall_score(y, preds, average="macro", zero_division=0))
-            bacc = float(balanced_accuracy_score(y, preds)) if len(np.unique(y)) >= 2 else float("nan")
-
-            # AUC/AP Macro (OvR); skip unrepresented classes
-            aucs, aprs = [], []
-            for k in range(num_classes):
-                y_bin = (y == k).astype(np.int32)
-                if y_bin.sum() == 0 or (y_bin.size - y_bin.sum()) == 0:
-                    continue
-                pk = probs[:, k]
-                try:
-                    aucs.append(roc_auc_score(y_bin, pk))
-                except Exception:
-                    pass
-                try:
-                    aprs.append(average_precision_score(y_bin, pk))
-                except Exception:
-                    pass
-            
-            auc_mac = float(np.mean(aucs)) if aucs else float("nan")
-            auprc_mac = float(np.mean(aprs)) if aprs else float("nan")
-
-            return None, {
-                "loss/edge": None,
-                "accuracy": acc, "BAcc_macro": bacc,
-                "F1_macro": f1_mac, "f1": f1_mac,
-                "P_macro": p_mac, "R_macro": r_mac,
-                "AUC_macro": auc_mac, "AUPRC_macro": auprc_mac
-            }
+            predictions = probs.argmax(axis=1)
+            metrics = {"loss/edge": None, "accuracy": float(np.mean(predictions == y))}
+            scores = _macro_metrics(y, predictions, probs)
+            metric_keys = ("BAcc_macro", "F1_macro", "f1", "P_macro", "R_macro", "AUC_macro", "AUPRC_macro")
+            metrics.update((key, float(scores[key])) for key in metric_keys)
+            return None, metrics
 
         # --- Binary Path ---
         pr = np.asarray(probs, dtype=np.float64)
@@ -3268,38 +3259,12 @@ def run_random_forest_for_task(
             thr = float(fixed_thr)
 
         p = (pr >= thr).astype(np.int32)
-        TP = int(np.count_nonzero((y == 1) & (p == 1)))
-        TN = int(np.count_nonzero((y == 0) & (p == 0)))
-        FP = int(np.count_nonzero((y == 0) & (p == 1)))
-        FN = int(np.count_nonzero((y == 1) & (p == 0)))
-
-        has_neg, has_pos = bool(np.any(y == 0)), bool(np.any(y == 1))
-        if has_neg and has_pos:
-            auc = float(roc_auc_score(y, pr))
-            auprc = float(average_precision_score(y, pr))
-        else:
-            auc, auprc = float("nan"), float("nan")
-
-        # Compute metrics manually in O(1) to avoid redundant O(N) array traversals by sklearn
-        prec = TP / max(1, TP + FP)
-        rec = TP / max(1, TP + FN)
-        f1 = (2.0 * prec * rec / max(1e-12, prec + rec)) if (prec + rec) > 0 else 0.0
-        acc = (TP + TN) / max(1, TP + TN + FP + FN)
-
-        # BAcc averages TPR and TNR; one is undefined when a class is absent
-        bacc = 0.5 * (rec + (TN / max(1, TN + FP))) if (has_pos and has_neg) else float("nan")
-
-        return (thr if fixed_thr is None else None), {
-            "loss/edge": None,
-            "precision": float(prec),
-            "recall": float(rec),
-            "f1": float(f1),
-            "accuracy": float(acc),
-            "bacc": float(bacc),
-            "auroc": float(auc),
-            "auprc": float(auprc),
-            "TP": TP, "TN": TN, "FP": FP, "FN": FN
-        }
+        scores, counts = _binary_metrics(y, p, pr)
+        metric_keys = ("precision", "recall", "f1", "accuracy", "bacc", "auroc", "auprc")
+        metrics = {"loss/edge": None}
+        metrics.update((key, float(scores[key])) for key in metric_keys)
+        metrics.update(counts)
+        return (thr if fixed_thr is None else None), metrics
 
     # --- Val/Test ---
     pv, yv = _predict_split(val_loader)

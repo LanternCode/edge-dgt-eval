@@ -31,16 +31,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 from .EdgeClassification import (
-    _cuda_gc, _cuda_peak_stats, _cuda_reset_peak_stats, _format_duration, _normalise_feature_spec, _supervised_indices,
+    _binary_metrics, _cuda_gc, _cuda_peak_stats, _cuda_reset_peak_stats, _format_duration, _macro_metrics, _normalise_feature_spec,
     FeatureRegistry, _task_to_meta_dict, finalise_summary, _resolve_loaders, _pos_weight, _pick_probe_loader,
-    get_optimal_threshold, save_pipeline_checkpoint, _reset_pipeline_runtime_state
+    get_optimal_threshold, save_pipeline_checkpoint, _reset_pipeline_runtime_state, _supervised_indices
 )
 from ._utils.features import pairwise_for_pairs, shortest_path_from_adj
 from ._utils.run_lifecycle import begin_or_attach_run
-from sklearn.metrics import (
-    precision_score, recall_score, f1_score, roc_auc_score,
-    average_precision_score, accuracy_score, balanced_accuracy_score
-)
+from sklearn.metrics import accuracy_score
 from typing import Dict, List, Optional, Sequence, Tuple, Any, Union
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -1622,39 +1619,7 @@ def _gnn_eval_split(
         y_prob = torch.cat(all_probs).numpy() if all_probs else None
 
         metrics["accuracy"] = accuracy_score(y_true, y_pred)
-        metrics["F1_macro"] = f1_score(y_true, y_pred, average="macro", zero_division=0)
-        metrics["P_macro"] = precision_score(y_true, y_pred, average="macro", zero_division=0)
-        metrics["R_macro"] = recall_score(y_true, y_pred, average="macro", zero_division=0)
-        metrics["BAcc_macro"] = balanced_accuracy_score(y_true, y_pred) if len(np.unique(y_true)) >= 2 else float("nan")
-
-        if y_prob is not None:
-            aucs, aprs = [], []
-            for k in range(num_classes):
-                y_bin = (y_true == k)
-                
-                # Skip degenerate classes
-                if not y_bin.any() or y_bin.all():
-                    continue
-                
-                pk = y_prob[:, k]
-                
-                try:
-                    aucs.append(roc_auc_score(y_bin, pk))
-                except Exception:
-                    pass
-                
-                try:
-                    aprs.append(average_precision_score(y_bin, pk))
-                except Exception:
-                    pass
-            
-            # Average the valid classes
-            metrics["AUC_macro"] = float(np.mean(aucs)) if aucs else float("nan")
-            metrics["AUPRC_macro"] = float(np.mean(aprs)) if aprs else float("nan")
-        else:
-            metrics["AUC_macro"], metrics["AUPRC_macro"] = float("nan"), float("nan")
-
-        metrics["f1"] = metrics["F1_macro"]
+        metrics.update(_macro_metrics(y_true, y_pred, y_prob))
         if y_prob is not None:
             metrics["_prob"] = y_prob
         metrics["_y"] = y_true.astype(int)
@@ -1689,27 +1654,8 @@ def _gnn_eval_split(
         yp = (p >= thr).astype(np.int32)
         y_i = y.astype(np.int32)
 
-        TP = int(np.count_nonzero((y_i == 1) & (yp == 1)))
-        TN = int(np.count_nonzero((y_i == 0) & (yp == 0)))
-        FP = int(np.count_nonzero((y_i == 0) & (yp == 1)))
-        FN = int(np.count_nonzero((y_i == 1) & (yp == 0)))
-
-        acc = (TP + TN) / max(1, TP + TN + FP + FN)
-        prec = TP / max(1, TP + FP)
-        rec = TP / max(1, TP + FN)
-        f1 = (2.0 * prec * rec / max(1e-12, prec + rec)) if (prec + rec) > 0 else 0.0
-
-        # BAcc averages TPR and TNR; one is undefined when a class is absent
-        _both = bool(np.any(y_i == 1)) and bool(np.any(y_i == 0))
-        bacc = 0.5 * (rec + (TN / max(1, TN + FP))) if _both else float("nan")
-
-        metrics.update({"accuracy": float(acc), "precision": float(prec), "recall": float(rec), "f1": float(f1), "bacc": float(bacc)})
-
-        if bool(np.any(y_i == 1)) and bool(np.any(y_i == 0)):
-            metrics["auroc"] = roc_auc_score(y_i, p)
-            metrics["auprc"] = average_precision_score(y_i, p)
-        else:
-            metrics["auroc"], metrics["auprc"] = float("nan"), float("nan")
+        scores, _ = _binary_metrics(y_i, yp, p)
+        metrics.update(scores)
 
         metrics["_prob"] = p
         metrics["_y"] = y_i.astype(int)

@@ -236,6 +236,7 @@ class GraphBenchmark:
             return G
 
         elif graph_type == 'shape_cycle':
+            self._filter_shape_names()
             shape_to_len = self._shape_lengths
 
             # 1. Validation & Selection
@@ -249,8 +250,8 @@ class GraphBenchmark:
 
             if not valid_shapes:
                 raise ValueError(
-                    f"[DATASET GENERATOR] Cannot generate 'shape_cycle' with N={num_nodes}. "
-                    f"The smallest configured shape requires more nodes."
+                    f"[DATASET GENERATOR] Cannot generate 'shape_cycle' with N={num_nodes}."
+                    + (" The smallest configured shape requires more nodes." if self.shape_cycle_shapes else "")
                 )
             else:
                 shape = rng.choice(valid_shapes)
@@ -335,6 +336,15 @@ class GraphBenchmark:
     # ------------------------------------------------------------------ #
     # 2) Sampling, dataset building, optional packaging (no redundancy)
     # ------------------------------------------------------------------ #
+    def _filter_shape_names(self) -> None:
+        for name in self.shape_cycle_shapes[:]:
+            if name not in self._shape_lengths:
+                print(f"[WARN] '{name}' is an undefined shape; skipping.")
+                self.shape_cycle_shapes.remove(name)
+        if not self.shape_cycle_shapes and "shape_cycle" in self.graph_types:
+            print("[WARN] No recognised shape names remain; dropping 'shape_cycle'.")
+            self.graph_types = [name for name in self.graph_types if name != "shape_cycle"]
+
     def sample_specs(
         self,
         num_graphs: int,
@@ -346,17 +356,11 @@ class GraphBenchmark:
             and type(self).generate_graph is GraphBenchmark.generate_graph
             and type(self).generate_dataset is GraphBenchmark.generate_dataset
         ):
-            for configured, allowed, kind in (
-                (self.graph_types, self._default_graph_types, "graph family"),
-                (self.shape_cycle_shapes, self._shape_lengths, "shape"),
-            ):
-                for name in configured[:]:
-                    if name not in allowed:
-                        print(f"[ERROR] Unknown {kind} '{name}'; skipping.")
-                        configured.remove(name)
-            if not self.shape_cycle_shapes and "shape_cycle" in self.graph_types:
-                print("[WARN] No recognised shape names remain; dropping 'shape_cycle'.")
-                self.graph_types = [name for name in self.graph_types if name != "shape_cycle"]
+            for name in self.graph_types[:]:
+                if name not in self._default_graph_types:
+                    print(f"[ERROR] Unknown graph family '{name}'; skipping.")
+                    self.graph_types.remove(name)
+            self._filter_shape_names()
             if not self.graph_types:
                 raise ValueError("[DATASET GENERATOR] No valid graph families remain.")
 
@@ -423,6 +427,8 @@ class GraphBenchmark:
                     G = candidate
                     break
                 except Exception as e:
+                    if not self.graph_types:
+                        raise
                     # Log the exact error only once per graph family
                     if gtype not in self._warned_generation_errors:
                         print(f"[WARN] Failed to generate '{gtype}' (N={N}): {e}. Re-rolling graph family.")

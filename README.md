@@ -563,7 +563,7 @@ Label validity contract on supported paths:
 - Collation pads the supervision mask with `False`, but `False` can also mean a valid, unsupervised graph pair. Padding validity is tracked separately using the original node counts (`_N`), not by a sentinel target such as `-1`.
 - `collate_fn_pad(...)` pads `L` with `0` and pads `mask` with `False`.
 - Label and evaluation-mask matrices must be `(N, N)`, matching the adjacency. Roles are assigned positionally, so a mis-shaped matrix is rejected during collation.
-- For multiclass tasks, label matrices must contain finite integer class IDs in `[0, num_classes - 1]`. Invalid values are rejected during collation.
+- For multiclass tasks, label matrices must contain finite integer class IDs in `[0, num_classes - 1]`. Complex dtypes and invalid values are rejected during collation.
 - All three dataset splits are validated during loader resolution, before model training begins, to reject NaN values in label matrices, including masked-out positions.
 
 ### (B) Transformer token-keep mask
@@ -759,7 +759,9 @@ Reproducibility follows the documented run sequence. Constructing a task seeds t
 The pipeline auto-detects CUDA availability:
 
 - **GPU present**: training and evaluation run on CUDA with automatic mixed precision (bfloat16 where supported, float16 otherwise) via `torch.amp`. DataLoader `pin_memory` is enabled by default.
-- **CPU only**: fully supported; mixed precision is disabled, all computation runs in float32.
+- **CPU only**: fully supported; mixed precision is disabled and neural layer computations use float32.
+
+Dense channel statistics and GNN per-graph feature statistics use float64 accumulation on both CPU and CUDA. Dense mean/std tensors are stored as float32; normalised GNN features, including GPS local-edge attributes, are converted back to their input dtype.
 
 No configuration is needed — hardware detection is automatic.
 
