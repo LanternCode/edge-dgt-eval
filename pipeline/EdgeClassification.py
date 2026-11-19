@@ -3021,15 +3021,15 @@ def run_random_forest_for_task(
             y_c = L[idx[:, 0], idx[:, 1], idx[:, 2]].numpy()
             yield X_c, y_c
 
-    # Collect the training split into a capped (E,C) reservoir and labels
     def _collect_split(loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
+        """Collect training feature rows and labels using global or class-specific reservoir sampling."""
         rng = np.random.default_rng(getattr(task, "seed", None))
         X_res, y_res = None, None
-        seen_pos, seen_neg, seen_multi, seen_bin = 0, 0, 0, 0
+        seen_pos, seen_neg, seen_global = 0, 0, 0
 
         cap = int(max_edges)
         is_capped_binary = num_classes == 1 and rf_neg_pos_ratio > 0
-        is_global_capped_binary = num_classes == 1 and rf_neg_pos_ratio <= 0
+        use_global_reservoir = num_classes > 1 or (num_classes == 1 and rf_neg_pos_ratio <= 0)
         max_pos = int(cap / (1.0 + rf_neg_pos_ratio)) if is_capped_binary else cap
         max_neg = cap - max_pos if is_capped_binary else cap
 
@@ -3042,36 +3042,23 @@ def run_random_forest_for_task(
                         dtype=np.int64 if num_classes > 1 else np.float32
                     )
 
-                if num_classes > 1:
-                    # Clamp: a full reservoir must start replacement at row 0
-                    n_fill = max(0, min(int(cap) - seen_multi, X_c.shape[0]))
-                    if n_fill > 0:
-                        X_res[seen_multi:seen_multi + n_fill] = X_c[:n_fill]
-                        y_res[seen_multi:seen_multi + n_fill] = y_c[:n_fill]
-                        seen_multi += n_fill
-
-                    for i in range(n_fill, X_c.shape[0]):
-                        j = rng.integers(0, seen_multi + 1)
-                        if j < cap:
-                            X_res[j], y_res[j] = X_c[i], y_c[i]
-                        seen_multi += 1
-                elif is_global_capped_binary:
+                if num_classes == 1:
                     y_c = (y_c > 0.5).astype(np.float32)
-                    # Clamp: a full reservoir must start replacement at row 0, never a negative index.
-                    n_fill = max(0, min(int(cap) - seen_bin, X_c.shape[0]))
-                    if n_fill > 0:
-                        X_res[seen_bin:seen_bin + n_fill] = X_c[:n_fill]
-                        y_res[seen_bin:seen_bin + n_fill] = y_c[:n_fill]
-                        seen_bin += n_fill
 
-                    for i in range(n_fill, X_c.shape[0]):
-                        j = rng.integers(0, seen_bin + 1)
-                        if j < cap:
-                            X_res[j], y_res[j] = X_c[i], y_c[i]
-                        seen_bin += 1
+                if use_global_reservoir:
+                    n_fill = max(0, min(cap - seen_global, X_c.shape[0]))
+                    if n_fill > 0:
+                        stop = seen_global + n_fill
+                        X_res[seen_global:stop] = X_c[:n_fill]
+                        y_res[seen_global:stop] = y_c[:n_fill]
+                        seen_global = stop
+
+                    for row in range(n_fill, X_c.shape[0]):
+                        slot = rng.integers(0, seen_global + 1)
+                        if slot < cap:
+                            X_res[slot], y_res[slot] = X_c[row], y_c[row]
+                        seen_global += 1
                 else:
-                    y_c = (y_c > 0.5).astype(np.float32)
-
                     # Fast path while both reservoirs are still filling: no random draw is made in that phase, so
                     # bulk copying retains the same rows in the same order and leaves the RNG stream untouched.
                     room_pos = int(max_pos) - seen_pos
@@ -3122,12 +3109,8 @@ def run_random_forest_for_task(
         if X_res is None:
             return np.empty((0, 0), np.float32), np.empty((0,), np.float32)
 
-        if num_classes > 1:
-            valid = min(seen_multi, int(cap))
-            return X_res[:valid], y_res[:valid]
-
-        if is_global_capped_binary:
-            valid = min(seen_bin, int(cap))
+        if use_global_reservoir:
+            valid = min(seen_global, cap)
             return X_res[:valid], y_res[:valid]
         
         valid_pos = min(seen_pos, int(max_pos))
