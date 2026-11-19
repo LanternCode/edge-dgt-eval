@@ -1543,11 +1543,11 @@ def _gnn_eval_split(
         A_enc = _redact_supervised_edges(A, mask, zero_supervised)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, enabled=torch.cuda.is_available()):
+            idx = _supervised_indices(mask, A, is_directed, edges_only)
+            if idx.numel() == 0:
+                continue
             # Path A: On-demand
             if getattr(model, "pairwise_on_demand", False):
-                idx = _supervised_indices(mask, A, is_directed, edges_only)
-                if idx.numel() == 0:
-                    continue
                 X_batch, _, node_mask = _prepare_features_batch(
                     A_enc, feats, mask, schema=getattr(model, "feature_schema", None),
                     lap_pe_k=model._effective_lap_pe_k(),
@@ -1559,11 +1559,6 @@ def _gnn_eval_split(
                 Z = model.encode_only(A_enc, X_batch, node_mask)
 
                 i_idx, j_idx = idx[:, 1], idx[:, 2]
-                idx_cpu = idx.cpu()
-                if num_classes > 1:
-                    y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]].long().to(device)
-                else:
-                    y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(torch.float32)
 
                 A_single = A_enc[0]
                 z_sel = torch.nan_to_num(
@@ -1573,21 +1568,17 @@ def _gnn_eval_split(
 
             # Path B: Full Matrix
             else:
-                idx = _supervised_indices(mask, A, is_directed, edges_only)
-                if idx.numel() == 0:
-                    continue
-
                 z_sel = torch.nan_to_num(
                     model.score_pairs_selected(A_enc, feats, mask, idx),
                     nan=0.0, posinf=30.0, neginf=-30.0
                 )
 
-                idx_cpu = idx.cpu()
-                if num_classes > 1:
-                    y_sel = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]].long().to(device)
-                else:
-                    y_sel = (L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]] > 0.5).to(torch.float32)
-
+            idx_cpu = idx.cpu()
+            labels = L[idx_cpu[:, 0], idx_cpu[:, 1], idx_cpu[:, 2]]
+            if num_classes > 1:
+                y_sel = labels.long().to(device)
+            else:
+                y_sel = (labels > 0.5).to(torch.float32)
 
         # Store Results
         if num_classes > 1:
